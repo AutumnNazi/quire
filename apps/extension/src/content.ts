@@ -1,30 +1,8 @@
-import Defuddle from "defuddle";
-
-/**
- * 把整篇文章连同元数据写进剪贴板,交给 Quire 桌面端。
- *
- * 为什么不直接发到桌面端:那需要在本机开一个监听端口,等于给同浏览器的
- * 恶意网页留了个可攻击面。剪贴板是操作系统本来就有的通道,用现成的
- * 链路不新增任何监听端口,也不用再弹一次权限框。
- *
- * **这个扩展是可选的。** 没装它,Quire 照常工作,只是拿不到整页正文和
- * 页面元数据,只能用用户划选的那一小块。
- */
-
-/** 与 Rust 侧 `EXTENSION_META` 一一对应。改这边必须同步改那边——
- *  两边键名对不上不会有任何编译错误,只会让用户装完发现"字段还是空的"。 */
-const META = {
-  version: "quire-version",
-  title: "quire-title",
-  site: "quire-site",
-  author: "quire-author",
-  excerpt: "quire-excerpt",
-  published: "quire-published",
-  image: "quire-image",
-} as const;
-
-/** 协议版本。桌面端靠 `quire-version` 判断"这份剪贴板是扩展写的"。 */
-const PROTOCOL_VERSION = "1";
+// 必须从 /full 入口导入。主入口("defuddle")没有接 Markdown 转换,
+// separateMarkdown 会静默失效、contentMarkdown 恒为 undefined,
+// 于是每一次剪藏都报"抽不出正文"。
+import Defuddle from "defuddle/full";
+import { buildPayload, type Extracted } from "./extract";
 
 interface ClipRequest {
   type: "quire-clip";
@@ -64,63 +42,17 @@ function clipCurrentPage(): ClipReply {
     return { ok: false, error: "这一页抽不出正文,可能是登录页或纯图片页" };
   }
 
-  const title = (result.title ?? "").trim() || document.title || location.hostname;
-  const author = (result.author ?? "").trim();
-  const pairs: Array<[string, string]> = [
-    [META.version, PROTOCOL_VERSION],
-    [META.title, title],
-    [META.site, pickSite(result.site, author, result.domain)],
-    [META.author, author],
-    // Defuddle 里摘要字段叫 description,不叫 excerpt
-    [META.excerpt, (result.description ?? "").trim()],
-    [META.published, (result.published ?? "").trim()],
-    [META.image, (result.image ?? "").trim()],
-  ];
-  // 空值一律不写。桌面端那边收到空字符串还得挨个判空,不如压根别发
-  const metas = pairs.filter(([, value]) => value.length > 0);
+  const payload = buildPayload(result as Extracted, {
+    content: result.content,
+    markdown,
+    url: location.href,
+    fallbackTitle: document.title || location.hostname,
+  });
 
-  const html = buildHtml(result.content, metas, location.href);
-  if (!writeToClipboard(html, markdown)) {
+  if (!writeToClipboard(payload.html, payload.markdown)) {
     return { ok: false, error: "浏览器拒绝了写入剪贴板" };
   }
-  return { ok: true, title };
-}
-
-/**
- * 挑一个能看的站点名。
- *
- * Defuddle 的 `site` 在页面缺 `og:site_name` 时会**退化成作者名**,直接用
- * 就会出现"站点:张三"。这种情况退回域名——至少是个真名字。
- */
-function pickSite(site: string | undefined, author: string, domain: string | undefined): string {
-  const name = (site ?? "").trim();
-  if (name && name !== author) return name;
-  return (domain ?? "").trim() || location.hostname;
-}
-
-function escapeAttr(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-/**
- * 拼一份 CF_HTML 风格的 context 段。
- *
- * 正文是给人看的那份干净 HTML;元数据挂在 `<meta>` 上,由桌面端读。
- * `source-url` 是桌面端认的四种取址位置之一——这里用的就是它。
- */
-function buildHtml(content: string, metas: Array<[string, string]>, url: string): string {
-  const tags = metas
-    .map(([name, value]) => `<meta name="${name}" content="${escapeAttr(value)}">`)
-    .join("");
-  const sourceUrl = `<meta name="source-url" content="${escapeAttr(url)}">`;
-  return (
-    `<html><head><meta charset="utf-8">${tags}${sourceUrl}</head>` +
-    `<body><!--StartFragment-->${content}<!--EndFragment--></body></html>`
-  );
+  return { ok: true, title: payload.metas.find(([k]) => k === "quire-title")?.[1] };
 }
 
 /**

@@ -1,6 +1,11 @@
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
-import Defuddle from "defuddle";
+// 必须从 /full 入口导入。主入口("defuddle")里根本没有接上 Markdown 转换——
+// 它的 defuddle.js 里 toMarkdown 一次都不出现。后果不是报错,是**静默失效**:
+// markdown: true 被无视,content 照旧是 HTML,于是剪藏存进 .md 的就是 HTML。
+// 扩展那条路更惨:separateMarkdown 在主入口下 contentMarkdown 恒为 undefined,
+// 直接判"抽不出正文",每次都失败。
+import Defuddle from "defuddle/full";
 import type { ClipboardCapture } from "./clipboard";
 
 /**
@@ -26,6 +31,11 @@ md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
 export function renderMarkdown(source: string): string {
   return DOMPurify.sanitize(md.render(source), {
     USE_PROFILES: { html: true },
+    // 默认的 html profile 会把 target 洗掉,于是 link_open 里加的
+    // target="_blank" 到不了最终 DOM,外链全在当前标签页开。得显式加回来。
+    // 安全性不受影响:markdown 侧 html:false 已经把外来 HTML 全转义了,
+    // 活到这里的标签只有 markdown-it 自己生成的,而 rel=noopener 也照样加。
+    ADD_ATTR: ["target"],
   });
 }
 
