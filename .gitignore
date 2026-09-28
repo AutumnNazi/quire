@@ -1,0 +1,28 @@
+# Rust / Tauri 构建产物
+target/
+**/target/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# 本地数据 —— 绝不入库,这是用户的剪藏库
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# 编辑器
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 编辑器会话产物,不属于项目
+.zcode/

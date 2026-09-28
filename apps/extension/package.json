@@ -1,0 +1,20 @@
+{
+  "name": "@quire/extension",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "可选的浏览器扩展:把整篇文章连同元数据放进剪贴板,交给 Quire 桌面端。",
+  "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "dev": "vite build --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "defuddle": "^0.19.4"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "typescript": "^5.9.0",
+    "vite": "^8.3.1"
+  }
+}

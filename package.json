@@ -1,0 +1,19 @@
+{
+  "name": "quire",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local-first read-later. Clippings are plain Markdown on your own disk.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @quire/desktop tauri dev",
+    "build": "pnpm --filter @quire/desktop tauri build",
+    "ext:build": "pnpm --filter @quire/extension build",
+    "test": "pnpm --filter @quire/desktop test:rust",
+    "clippy": "pnpm --filter @quire/desktop clippy",
+    "typecheck": "pnpm -r --parallel typecheck"
+  }
+}
