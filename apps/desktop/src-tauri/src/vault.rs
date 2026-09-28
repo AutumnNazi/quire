@@ -267,7 +267,8 @@ fn fresh_id() -> String {
     ids::new_id(Local::now().timestamp_millis(), salt)
 }
 
-fn summary_from(fm: Frontmatter, filename: String) -> ClipSummary {
+/// 由 frontmatter 拼出列表摘要。搜索模块也要用,所以是 pub。
+pub fn summary_from(fm: Frontmatter, filename: String) -> ClipSummary {
     ClipSummary {
         id: fm.id,
         filename,

@@ -462,13 +462,79 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+/// macOS:从 NSPasteboard 读。
+///
+/// 和 Windows 那边不是同一套东西,差别集中在两点:
+///
+/// 1. **格式名不一样。** Windows 是自定义的 `HTML Format` 加一段带字节偏移的
+///    头部;macOS 直接就是 UTI `public.html`,拿到的是干净的 HTML 片段,
+///    没有偏移要算。所以走的是 [`super::extract_meta`] 之外的路径——元数据
+///    仍然从 HTML 里的 `<meta name="quire-*">` 取,和扩展的约定保持一致。
+/// 2. **地址是独立的一份。** macOS 放在 `public.url` 这个 UTI 上,直接从
+///    剪贴板取,不用像 Windows 那样在 HTML 头部里翻 `SourceURL`。
+///
+/// ⚠️ **这段代码没有在 macOS 上编译或运行过**——写它的那台机器是 Windows。
+/// API 签名是对着 objc2-app-kit 0.3.2 的源码核过的,但"能编译"和"跑起来
+/// 对"是两件事,尤其是 NSPasteboard 在不同 macOS 版本上的行为差异。
+/// 发版前必须在真机上验证一遍,别直接信这段注释。
+#[cfg(target_os = "macos")]
+mod platform {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeHTML, NSPasteboardTypeString, NSPasteboardTypeURL};
+    use objc2_foundation::NSString;
+
+    pub fn capture() -> Option<super::ClipboardCapture> {
+        let board = NSPasteboard::generalPasteboard();
+
+        // 这三个格式常量是 extern static,不是普通 const,取值必须显式 unsafe。
+        // 编译器认这个:写漏了会直接报 E0133,不会等到运行时才炸。
+        let html_type = unsafe { NSPasteboardTypeHTML };
+        let string_type = unsafe { NSPasteboardTypeString };
+        let url_type = unsafe { NSPasteboardTypeURL };
+
+        let html: Option<String> = board.stringForType(html_type).map(|s| s.to_string());
+        // text 是必填字段,拿不到就留空串——is_empty() 会按"什么都没有"
+        // 处理掉,不会剪出一个空条目
+        let text: String = board
+            .stringForType(string_type)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        // public.url 存的是 URL 文本,两端可能带空白,直接存库会变成脏链接
+        let url: Option<String> = board
+            .stringForType(url_type)
+            .map(|s| s.to_string())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        if html.is_none() && text.trim().is_empty() {
+            return None;
+        }
+
+        // 和 Windows 保持同一个约定:meta 从 HTML 里取,所以复制粘贴网页
+        // (只有 HTML、没有扩展写的 quire-* 标记)一样能拿到地址和正文。
+        let meta = html
+            .as_deref()
+            .map(super::extract_meta)
+            .unwrap_or_default();
+
+        Some(super::ClipboardCapture {
+            url,
+            html,
+            text,
+            meta,
+            // 以后 ClipboardCapture 加字段时这里会编译报错,而不是悄悄
+            // 变成默认值——那种错在真机上才看得出来
+            ..Default::default()
+        })
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod platform {
     use super::ClipboardCapture;
 
-    /// 其他平台目前只给不出内容。macOS 的剪贴板 HTML 格式与 Windows 不同,
-    /// 值得单独做,但第一版先聚焦 Windows —— 与其给个半残的实现,不如
-    /// 在界面上明说"当前平台尚未支持"。
+    /// Linux 和别的平台目前给不出内容。与其给个半残的实现,不如在界面上
+    /// 明说"当前平台尚未支持"——Linux 上的剪贴板 HTML 得走 X11/Wayland
+    /// 两套完全不同的协议,值得单独做,但不跟 macOS 一起塞进来。
     pub fn capture() -> Option<ClipboardCapture> {
         None
     }

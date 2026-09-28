@@ -23,6 +23,14 @@ export interface ScanResult {
   unreadable: UnreadableFile[];
 }
 
+/** 检索命中的一条。字段名与 Rust 侧 `SearchHit` 一致。 */
+export interface SearchHit {
+  summary: ClipSummary;
+  /** 命中的正文片段,带前后省略号。 */
+  snippet: string;
+  score: number;
+}
+
 /** 详情 = 摘要 + 正文。Rust 侧用 `#[serde(flatten)]` 拍平的。 */
 export interface ClipContent extends ClipSummary {
   body: string;

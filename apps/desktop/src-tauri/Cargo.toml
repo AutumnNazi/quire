@@ -34,6 +34,13 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_Ole",
 ] }
 
+# macOS 从 NSPasteboard 读剪贴板。objc2-app-kit 提供 AppKit 绑定
+# (NSPasteboard 就在这儿),objc2-foundation 提供 NSString 这些基础类型。
+# 版本跟着 Tauri 传递依赖里那几个走,免得同一份 objc2 编两遍。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSObject"] }
+
 [dev-dependencies]
 tempfile = "3"
 

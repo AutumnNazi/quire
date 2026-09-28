@@ -4,7 +4,7 @@ import type {
   ClipInput,
   SavedClip,
 } from "./clipboard";
-import type { ClipContent, ScanResult, VaultInfo } from "./types";
+import type { ClipContent, ScanResult, SearchHit, VaultInfo } from "./types";
 
 /**
  * Tauri 命令的薄封装。
@@ -16,6 +16,8 @@ export const api = {
   vaultInfo: () => invoke<VaultInfo>("vault_info"),
   listClips: () => invoke<ScanResult>("list_clips"),
   readClip: (filename: string) => invoke<ClipContent>("read_clip", { filename }),
+  searchClips: (query: string, limit?: number) =>
+    invoke<SearchHit[]>("search_clips", { query, limit: limit ?? null }),
 
   captureClipboard: () => invoke<ClipboardCapture>("capture_clipboard"),
   saveClip: (input: ClipInput) => invoke<SavedClip>("save_clip", { input }),

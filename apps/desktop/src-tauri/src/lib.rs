@@ -11,6 +11,7 @@
 pub mod clipboard;
 pub mod frontmatter;
 pub mod ids;
+pub mod search;
 pub mod slug;
 pub mod vault;
 
@@ -25,6 +26,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use clipboard::ClipboardCapture;
+use search::SearchHit;
 use vault::{ClipInput, ClipContent, SavedClip, ScanResult, SharedVault, Vault};
 
 /// 剪贴板轮询间隔。开启监控后一直在读剪贴板,太密会白耗 CPU,
@@ -95,6 +97,19 @@ fn list_clips(state: State<AppState>) -> Result<ScanResult, String> {
 fn read_clip(filename: String, state: State<AppState>) -> Result<ClipContent, String> {
     let vault = current_vault(&state)?;
     vault.read_clip(&filename).map_err(|e| e.to_string())
+}
+
+/// 全文检索。返回摘要 + 命中片段,前端直接拿去渲染列表。
+#[tauri::command]
+fn search_clips(
+    query: String,
+    limit: Option<usize>,
+    state: State<AppState>,
+) -> Result<Vec<SearchHit>, String> {
+    let vault = current_vault(&state)?;
+    // 上限是防手滑的闸,不是业务规则。一次要一万条,界面也渲染不动。
+    let limit = limit.unwrap_or(200).min(1000);
+    search::search(&vault, &query, limit).map_err(|e| e.to_string())
 }
 
 /// 读一次剪贴板。前端拿到 HTML 后转成 Markdown,再调 [`save_clip`] 落盘。
@@ -244,6 +259,7 @@ pub fn run() {
             vault_info,
             list_clips,
             read_clip,
+            search_clips,
             capture_clipboard,
             save_clip,
             set_clipboard_watch,

@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { api } from "./api";
 import type { ClipboardCapture } from "./clipboard";
 import { clipToMarkdown, MARKDOWN_PLACEHOLDER, renderMarkdown } from "./markdown";
-import type { ClipContent, ClipSummary, VaultInfo } from "./types";
+import type { ClipContent, ClipSummary, SearchHit, VaultInfo } from "./types";
 
 const root = document.querySelector<HTMLDivElement>("#app");
 if (!root) throw new Error("页面缺少 #app 挂载点");
@@ -14,6 +14,15 @@ root.innerHTML = `
     <span class="brand">Quire</span>
     <span class="vault-path" id="vault-path" title="剪藏目录"></span>
     <span class="spacer"></span>
+    <input
+      class="search"
+      id="search"
+      type="search"
+      placeholder="搜索剪藏…"
+      autocomplete="off"
+      spellcheck="false"
+      title="搜标题和正文。中文两字就能搜(比如「苹果」)。"
+    />
     <label class="watch-toggle" title="开启后,你在别处复制文章时会自动提示存到 Quire。默认关闭。">
       <input type="checkbox" id="chk-watch" />
       <span>监控剪贴板</span>
@@ -52,12 +61,17 @@ const toastEl = el<HTMLDivElement>("toast");
 const toastTextEl = el<HTMLSpanElement>("toast-text");
 const toastActionsEl = el<HTMLSpanElement>("toast-actions");
 const watchEl = el<HTMLInputElement>("chk-watch");
+const searchEl = el<HTMLInputElement>("search");
 
 let clips: ClipSummary[] = [];
+/** 非空时列表显示的是检索结果,而不是全库。空数组和 null 要分清:
+ *  null = 没在搜,空数组 = 搜了但一条没中,两者界面不一样。 */
+let hits: SearchHit[] | null = null;
 let activeFilename: string | null = null;
 /** 监控弹出来的内容。等用户点"保存"时才真正落盘——自动存等于替他做决定。 */
 let pendingCapture: ClipboardCapture | null = null;
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
+let searchTimer: ReturnType<typeof setTimeout> | null = null;
 
 function showError(message: string): void {
   warnEl.textContent = message;
@@ -102,6 +116,18 @@ function formatWhen(iso: string): string {
 function renderList(): void {
   listEl.replaceChildren();
 
+  if (hits) {
+    if (hits.length === 0) {
+      const none = document.createElement("div");
+      none.className = "empty";
+      none.innerHTML = `<p class="empty-title">没找到</p><p>换个词试试。</p>`;
+      listEl.append(none);
+      return;
+    }
+    renderHitList(hits);
+    return;
+  }
+
   if (clips.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty";
@@ -114,34 +140,46 @@ function renderList(): void {
   }
 
   for (const clip of clips) {
-    const item = document.createElement("article");
-    item.className = "clip";
-    if (clip.filename === activeFilename) item.classList.add("active");
-
-    const title = document.createElement("h3");
-    title.className = "clip-title";
-    title.textContent = clip.title; // textContent 而非 innerHTML:标题来自网页,必须走转义
-
-    const meta = document.createElement("p");
-    meta.className = "clip-meta";
-    const site = document.createElement("span");
-    site.className = "clip-site";
-    site.textContent = clip.site;
-    const when = document.createElement("time");
-    when.textContent = formatWhen(clip.clippedAt);
-    meta.append(site, when);
-
-    item.append(title, meta);
-    if (clip.excerpt) {
-      const excerpt = document.createElement("p");
-      excerpt.className = "clip-excerpt";
-      excerpt.textContent = clip.excerpt;
-      item.append(excerpt);
-    }
-
-    item.addEventListener("click", () => void openDetail(clip.filename));
-    listEl.append(item);
+    listEl.append(clipItem(clip, clip.excerpt));
   }
+}
+
+/** 检索态下列表长这样:标题、站点时间,外加一段命中上下文。
+ *  正文摘要在这儿没用——用户搜的就是这几个字,得让他看见它们出现在哪儿。 */
+function renderHitList(results: SearchHit[]): void {
+  for (const hit of results) {
+    listEl.append(clipItem(hit.summary, hit.snippet));
+  }
+}
+
+function clipItem(clip: ClipSummary, sub: string | null): HTMLElement {
+  const item = document.createElement("article");
+  item.className = "clip";
+  if (clip.filename === activeFilename) item.classList.add("active");
+
+  const title = document.createElement("h3");
+  title.className = "clip-title";
+  title.textContent = clip.title; // textContent 而非 innerHTML:标题来自网页,必须走转义
+
+  const meta = document.createElement("p");
+  meta.className = "clip-meta";
+  const site = document.createElement("span");
+  site.className = "clip-site";
+  site.textContent = clip.site;
+  const when = document.createElement("time");
+  when.textContent = formatWhen(clip.clippedAt);
+  meta.append(site, when);
+
+  item.append(title, meta);
+  if (sub) {
+    const excerpt = document.createElement("p");
+    excerpt.className = "clip-excerpt";
+    excerpt.textContent = sub;
+    item.append(excerpt);
+  }
+
+  item.addEventListener("click", () => void openDetail(clip.filename));
+  return item;
 }
 
 function renderDetail(clip: ClipContent): void {
@@ -249,6 +287,32 @@ async function pasteNow(): Promise<void> {
     showError(String(err));
   }
 }
+
+async function runSearch(query: string): Promise<void> {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    // 清空搜索框 = 回到全库列表,不是"搜了个空词"
+    hits = null;
+    renderList();
+    return;
+  }
+  try {
+    const results = await api.searchClips(trimmed);
+    // 用户可能已经改词或清空了。这次的返回值过期,丢掉
+    if (searchEl.value.trim() !== trimmed) return;
+    hits = results;
+    renderList();
+  } catch (err) {
+    showError(`搜不了:${String(err)}`);
+  }
+}
+
+// 每敲一下就全库扫一遍,剪藏多了会跟着手抖。去抖 200ms 是体感不明显的下限。
+searchEl.addEventListener("input", () => {
+  if (searchTimer) clearTimeout(searchTimer);
+  const value = searchEl.value;
+  searchTimer = setTimeout(() => void runSearch(value), 200);
+});
 
 async function refreshList(): Promise<void> {
   try {
