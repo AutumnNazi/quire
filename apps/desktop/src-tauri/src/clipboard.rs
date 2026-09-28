@@ -495,8 +495,10 @@ mod platform {
 /// 发版前必须在真机上验证一遍,别直接信这段注释。
 #[cfg(target_os = "macos")]
 mod platform {
+    // NSString 不用单独引:`stringForType` 返回 `Retained<NSString>`,而
+    // `to_string()` 走的是 Display 实现,那部分不需要这个名字在作用域里。
+    // 之前多引了一个,clippy 在 macOS 上直接报 unused import。
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypeHTML, NSPasteboardTypeString, NSPasteboardTypeURL};
-    use objc2_foundation::NSString;
 
     pub fn capture() -> Option<super::ClipboardCapture> {
         let board = NSPasteboard::generalPasteboard();
@@ -532,15 +534,11 @@ mod platform {
             .map(super::extract_meta)
             .unwrap_or_default();
 
-        Some(super::ClipboardCapture {
-            url,
-            html,
-            text,
-            meta,
-            // 以后 ClipboardCapture 加字段时这里会编译报错,而不是悄悄
-            // 变成默认值——那种错在真机上才看得出来
-            ..Default::default()
-        })
+        // 刻意不写 `..Default::default()`:字段全列出来了,那玩意儿是个空操作,
+        // clippy 会报 "struct update has no effect"。而少写字段本来就是编译错误,
+        // 以后 `ClipboardCapture` 加了字段,这里会当场编不过——想要的安全网
+        // 本来就不需要它。
+        Some(super::ClipboardCapture { url, html, text, meta })
     }
 }
 

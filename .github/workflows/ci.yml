@@ -37,6 +37,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Tauri 在 Linux 上要 GTK / WebKitGTK 的开发头文件,runner 镜像里没有,
+      # 不装的话 `glib-sys` 的 build script 直接失败,clippy 根本编不到我们的
+      # 代码。这是 Tauri 官方文档里 Linux 那节的依赖清单。
+      - name: 装 Linux 系统依赖(Tauri 需要)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
       # corepack 必须在 setup-node **之前**启用。`cache: pnpm` 会让 setup-node
       # 自己调一次 pnpm 去定位依赖目录,那时 pnpm 还没进 PATH,三个平台全部报
       # "Unable to locate executable file: pnpm"。顺序不能换。
