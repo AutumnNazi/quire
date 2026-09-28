@@ -37,13 +37,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # corepack 必须在 setup-node **之前**启用。`cache: pnpm` 会让 setup-node
+      # 自己调一次 pnpm 去定位依赖目录,那时 pnpm 还没进 PATH,三个平台全部报
+      # "Unable to locate executable file: pnpm"。顺序不能换。
+      - name: 装 pnpm
+        run: corepack enable
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: pnpm
-
-      - name: 装 pnpm
-        run: corepack enable
 
       - uses: dtolnay/rust-toolchain@stable
         with:
