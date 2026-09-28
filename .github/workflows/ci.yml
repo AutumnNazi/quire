@@ -1,0 +1,76 @@
+# CI 只做一件事:挡住"本机全绿、推上去就红"的改动。
+#
+# 刻意不做的:
+# - 不跑 `pnpm build`。打包要 tauri 全家桶(几十分钟),而它验的是"能不能出
+#   安装包",不是"代码对不对"。真要验打包,交给 release 流程。
+# - 不跑 macOS 剪贴板测试。那段代码在 Windows 上写的,而且 README 里已经
+#   标了未在真机验证;在这儿假装验了,比不验更糟。
+#
+# 剪贴板那两条往返测试在 CI 上多半会跳过(无人值守会话拿不到剪贴板),输出里
+# 会有一行「跳过 ——」。那不是绿灯,是**没有覆盖**。要真跑,见
+# docs/architecture.md「测试分层」。
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# 同一个 PR 连续推多次时,只留最后一次,省 runner
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # 矩阵跑 Windows + macOS + Linux。跨平台编译错误(clippy 能编到哪就编到哪,
+    # typecheck 走不到 Rust,但 cfg 分支写错会在这里现形)是最容易漏的一类。
+    # 真正跑测试的只有 Windows:剪贴板那段只有它有实现。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: 装 pnpm
+        run: corepack enable
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      - name: 装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 前端类型检查
+        run: pnpm typecheck
+
+      - name: 前端测试
+        run: pnpm test:web
+
+      # clippy 跨平台跑,`--all-targets` 会把测试代码也编一遍——cfg 写错、
+      # 测试里引了不存在的符号,都在这一步现形。
+      - name: clippy
+        run: pnpm clippy
+
+      # 测试只在 Windows 跑。macOS/Linux 上的剪贴板模块是 cfg 掉的,
+      # 跑不出有意义的结果,只会让"这条命令执行了"看起来像真的。
+      # 顺带在 release 下跑:debug 和 release 的性能差一个数量级,
+      # 搜索那条 perf 测试在 debug 下没有参考价值。
+      - name: Rust 测试(仅 Windows,release)
+        if: matrix.os == 'windows-latest'
+        run: cargo test --release --manifest-path apps/desktop/src-tauri/Cargo.toml

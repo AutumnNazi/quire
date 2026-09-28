@@ -177,7 +177,15 @@ archived: false
 | 前端 | Defuddle 调用、两条路径分流、降级链、DOMPurify | 13 条 vitest(jsdom) |
 | 扩展 | payload 构造、站点名退化、属性转义、meta 省略规则 | 13 条 vitest |
 
-Rust 侧一共 76 条,`pnpm test` 全跑。两条真实剪贴板往返测试**要求独占系统剪贴板**:别的程序正占着时 `OpenClipboard` 会连续失败,读到的就是空。碰到这种红,先关掉可能读剪贴板的程序再跑,别急着改代码。
+Rust 侧一共 76 条,`pnpm test` 全跑。两条真实剪贴板往返测试**要求独占系统剪贴板**:别的程序正占着时 `OpenClipboard` 会连续失败,读到的就是空。它们会先探一下可用性,不可用就**带原因跳过**(输出里有一行「跳过 ——」),设 `QUIRE_REQUIRE_CLIPBOARD=1` 可以要求它必须可用。别把跳过当成绿灯——那是**没有覆盖**。
+
+## CI
+
+`.github/workflows/ci.yml`,三个平台矩阵(Windows / macOS / Linux)跑类型检查、前端测试、clippy;**Rust 测试只在 Windows 跑**,因为剪贴板那两个平台之外没有实现,跑出来没有意义。
+
+四步都配了 `fail-fast: false`,一个平台红不影响别的平台报结果。刻意不跑 `pnpm build`——打包验的是"能不能出安装包",不是"代码对不对",那个交给 release。
+
+顺带一提:clippy 走**三个平台**是有意义的。`clipboard.rs` 里的 `#[cfg(windows)]` / `#[cfg(target_os = "macos")]` 分支写错、或者测试代码引了某个平台不存在的符号,只有跨平台编译才现形。
 
 那两条往返测试是整个 `platform` 模块唯一的覆盖。纯函数测试全绿也证明不了 `RegisterClipboardFormatW` 的格式名没拼错、句柄类型没搞混——这类错误在真实调用里才会暴露。两点值得记:
 

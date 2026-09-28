@@ -8,11 +8,13 @@
   "engines": {
     "node": ">=20"
   },
+  "packageManager": "pnpm@10.33.4",
   "scripts": {
     "dev": "pnpm --filter @quire/desktop tauri dev",
     "build": "pnpm --filter @quire/desktop tauri build",
     "ext:build": "pnpm --filter @quire/extension build",
     "test": "pnpm --filter @quire/desktop test:rust",
+    "test:web": "pnpm -r --parallel test",
     "clippy": "pnpm --filter @quire/desktop clippy",
     "typecheck": "pnpm -r --parallel typecheck"
   }

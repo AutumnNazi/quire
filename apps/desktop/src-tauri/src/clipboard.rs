@@ -243,6 +243,22 @@ mod platform {
     #[cfg(test)]
     use windows_sys::Win32::System::DataExchange::SetClipboardData;
 
+    /// 这台机器的剪贴板现在能不能打开。只给测试用。
+    ///
+    /// 放这里的理由:`OpenClipboard` 是本模块的私有 import,测试那边拿不到;
+    /// 与其把 import 改成 `pub use`(等于把 unsafe 边界扩散出去),
+    /// 不如把这一个判断收在这里。
+    #[cfg(test)]
+    pub fn is_available() -> bool {
+        unsafe {
+            if OpenClipboard(ptr::null_mut()) == 0 {
+                return false;
+            }
+            CloseClipboard();
+            true
+        }
+    }
+
     /// 打开剪贴板并取走需要的两种格式。
     ///
     /// 剪贴板是全局共享资源,打开失败是常态(别的程序正占着),
@@ -585,6 +601,41 @@ mod tests {
 
     const CONTEXT: &str = "<html><body><!--StartFragment--><h1>标题</h1><p>正文内容</p><!--EndFragment--></body></html>";
 
+    /// 这台机器的剪贴板现在能不能用。
+    ///
+    /// 下面两条往返测试**要求独占系统剪贴板**。CI 的 runner、锁屏的桌面、
+    /// 或者任何正占着剪贴板的程序,都会让 `OpenClipboard` 连续失败。这时候
+    /// 测试红,但红的原因和代码无关——`clipboard.rs` 一个字都没错。
+    ///
+    /// 所以要先探一下,分清「环境不给用」和「读回来的数据不对」。混在一起
+    /// 报,时间久了就没人看红灯是哪个原因了。
+    ///
+    /// 真要在本机强制要求它可用(不想让 CI 悄悄跳过),设
+    /// `QUIRE_REQUIRE_CLIPBOARD=1`,不可用就直接失败。
+    #[cfg(windows)]
+    fn clipboard_available() -> bool {
+        platform::is_available()
+    }
+
+    /// 剪贴板不可用就跳过,并把原因打在输出里。**不静默跳过**——
+    /// 静默跳过等于假装这条测试跑过了,那是比红灯更糟的失败。
+    #[cfg(windows)]
+    fn require_clipboard(test_name: &str) -> bool {
+        if clipboard_available() {
+            return true;
+        }
+        let forced = std::env::var("QUIRE_REQUIRE_CLIPBOARD").is_ok();
+        let reason = format!(
+            "{test_name}:本机剪贴板当前不可用(多半是别的程序占着,或 CI 的无人值守会话),\
+             这不是代码问题。设 QUIRE_REQUIRE_CLIPBOARD=1 可要求它必须可用。"
+        );
+        if forced {
+            panic!("{reason}");
+        }
+        eprintln!("跳过 —— {reason}");
+        false
+    }
+
     #[test]
     fn 切出context并保留StartFragment标记() {
         let raw = build_cf_html(&[], CONTEXT);
@@ -805,6 +856,10 @@ mod tests {
     fn 真实剪贴板往返() {
         use super::platform;
 
+        if !require_clipboard("真实剪贴板往返") {
+            return;
+        }
+
         let _serial = lock_clipboard();
         let guard = ClipboardGuard(Some(platform::Snapshot::take()));
 
@@ -838,6 +893,10 @@ mod tests {
     #[test]
     fn 扩展载荷经真实剪贴板仍完整() {
         use super::platform;
+
+        if !require_clipboard("扩展载荷经真实剪贴板仍完整") {
+            return;
+        }
 
         let _serial = lock_clipboard();
         let guard = ClipboardGuard(Some(platform::Snapshot::take()));
