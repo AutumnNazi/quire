@@ -586,9 +586,10 @@ mod platform {
     }
 }
 
-pub fn capture_clipboard() -> Result<ClipboardCapture, String> {
-    platform::capture()
-        .ok_or_else(|| "读不到剪贴板内容(可能被其他程序占用,或当前平台尚未支持)".to_string())
+/// 读不到就是读不到,**不编一句中文给界面**——界面自己查 `clipboard.unavailable`
+/// 那条文案,英文用户看见的也该是英文。
+pub fn capture_clipboard() -> Result<ClipboardCapture, crate::vault::WireError> {
+    platform::capture().ok_or_else(|| crate::vault::WireError::new("clipboard.unavailable"))
 }
 
 #[cfg(test)]

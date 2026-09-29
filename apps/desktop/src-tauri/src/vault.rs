@@ -4,6 +4,7 @@
 //! 都必须满足一个前提:**任何时候删掉这个目录,用户的数据一个字节都不会丢**。
 //! 所以没有数据库、没有后台同步,搜索是每次现扫文件算出来的。
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -39,10 +40,14 @@ pub enum VaultError {
     AlreadyExists(String),
     #[error("回收站里挤不下了,请自己清一清: {0}")]
     TrashFull(String),
-    /// 导入时这一篇被跳过了。**不是故障**——用户导进一个存过一堆旧文的
+    /// 导入的目标就是剪藏库自己。**不是故障**——用户点"导入剪藏目录"
+    /// 以为能去重,那是个陷阱,反复导库会滚成好几倍。得说清楚为什么不做。
+    #[error("这就是剪藏库自己,不用导")]
+    ImportSkippedSelf,
+    /// 这一篇已经在库里了。**不是故障**——用户导进一个存过一堆旧文的
     /// 文件夹,里面有一半是重复的,那是正常情况。但理由要说给用户听。
-    #[error("已跳过:{0}")]
-    ImportSkipped(String),
+    #[error("已经在库里了:{0}")]
+    ImportSkippedDuplicate(String),
     /// 文件搬回去了但元数据解析失败。**文件已经回到库里了**——撤销是让用户
     /// 拿回东西的,不能因为读不出元数据就反悔把它留在回收站里。
     #[error("剪藏已放回,但读不出元数据: {0}({1})")]
@@ -51,6 +56,67 @@ pub enum VaultError {
     /// 宁可直接报错让用户重启,也不要拿着半可信状态继续读写用户的文件。
     #[error("内部状态异常,请重启 Quire")]
     Poisoned,
+}
+
+/// 错误穿过 Tauri 边界时带的**稳定代号**。
+///
+/// 后端只送代号和参数,不送现成的句子:界面是多语言的,后端说一句中文,
+/// 英文用户看见的就是一堆看不懂的汉字。代号必须和界面词典里的键一一
+/// 对上,少一条的话那个错误在界面上就只会甩一个 `vault.notFound`。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireError {
+    pub code: String,
+    /// 文案里的具名占位符。**用具名而不是按下标**:改文案时调一下参数
+    /// 顺序,按下标取的就全错位了,而那种错不会报错,只是句子读不通。
+    #[serde(default)]
+    pub args: BTreeMap<String, String>,
+}
+
+impl WireError {
+    pub fn new(code: &str) -> Self {
+        Self {
+            code: code.to_string(),
+            args: BTreeMap::new(),
+        }
+    }
+
+    pub fn with(mut self, key: &str, value: impl Into<String>) -> Self {
+        self.args.insert(key.to_string(), value.into());
+        self
+    }
+
+    /// 内部出了岔子,原因未知。**只有真的没有更具体的代号时才用它**——
+    /// 一律往这儿塞,界面就永远只能说"出了点岔子",等于没有错误提示。
+    pub fn internal(detail: impl Into<String>) -> Self {
+        Self::new("app.internal").with("detail", detail)
+    }
+}
+
+impl VaultError {
+    /// 过界时用的代号 + 参数。**一个变体一条,漏写就编译不过**——
+    /// 这正是要的效果:新增错误类型时,不可能忘了给它配文案。
+    pub fn wire(&self) -> WireError {
+        match self {
+            Self::Io(e) => WireError::new("vault.io").with("detail", e.to_string()),
+            Self::UnsafeFilename(name) => {
+                WireError::new("vault.unsafeFilename").with("detail", name)
+            }
+            Self::EmptyContent => WireError::new("vault.emptyContent"),
+            Self::NotFound(name) => WireError::new("vault.notFound").with("detail", name),
+            Self::AlreadyExists(name) => {
+                WireError::new("vault.alreadyExists").with("detail", name)
+            }
+            Self::TrashFull(name) => WireError::new("vault.trashFull").with("detail", name),
+            Self::ImportSkippedSelf => WireError::new("vault.importSkippedSelf"),
+            Self::ImportSkippedDuplicate(title) => WireError::new("vault.importSkippedDuplicate")
+                .with("detail", title),
+            Self::Unreadable(name, reason) => WireError::new("vault.unreadable")
+                .with("name", name)
+                .with("detail", reason),
+            Self::Poisoned => WireError::new("vault.poisoned"),
+        }
+    }
 }
 
 /// 扩展 POST 过来的剪藏请求体。
@@ -179,7 +245,9 @@ pub struct ImportReport {
 #[serde(rename_all = "camelCase")]
 pub struct PurgeFailure {
     pub filename: String,
-    pub reason: String,
+    /// 失败理由。**送代号不送句子**,理由和上面一样:这句话最终要显示
+    /// 给用户看,而用户用的是哪种语言,不归写盘的文件名管。
+    pub reason: WireError,
 }
 
 pub struct Vault {
@@ -717,7 +785,7 @@ impl Vault {
         // 剪藏目录"以为能去重,实际得到一堆换了新 id 的副本,原来的还在原地。
         // 更糟的是对着同一个目录反复导,库会越滚越大
         if dir == self.clips_dir() || dir.starts_with(self.clips_dir()) {
-            return Err(VaultError::ImportSkipped("这就是剪藏库自己,不用导".into()));
+            return Err(VaultError::ImportSkippedSelf);
         }
         let mut report = BatchReport::default();
         let mut imported = Vec::new();
@@ -736,7 +804,7 @@ impl Vault {
                 }
                 Err(e) => report.failed.push(PurgeFailure {
                     filename: name,
-                    reason: e.to_string(),
+                    reason: e.wire(),
                 }),
             }
         }
@@ -763,10 +831,7 @@ impl Vault {
         // 拿空串去比对就是"第二段永远导不进来"
         if !fm.url.trim().is_empty() {
             if let Some(existing) = self.find_by_url(&fm.url)? {
-                return Err(VaultError::ImportSkipped(format!(
-                    "已经在库里了:{}",
-                    existing.title
-                )));
+                return Err(VaultError::ImportSkippedDuplicate(existing.title));
             }
         }
 
@@ -873,7 +938,7 @@ impl Vault {
             Ok(()) => report.succeeded.push(filename.to_string()),
             Err(e) => report.failed.push(PurgeFailure {
                 filename: filename.to_string(),
-                reason: e.to_string(),
+                reason: e.wire(),
             }),
         }
     }
@@ -2199,7 +2264,17 @@ mod tests {
         );
         assert_eq!(report.failed.len(), 1);
         assert_eq!(report.failed[0].filename, "不存在的剪藏.md");
-        assert!(!report.failed[0].reason.is_empty(), "失败必须带原因");
+        // 断言**代号**而不是那句中文:代号是界面查文案的钥匙,
+        // 送空代号的话界面上只会甩一个 `vault.unsafeFilename` 出来。
+        // 这条报的不是"不存在"而是"不合法"——文件名带中文,而
+        // `is_safe_filename` 只收 ASCII,Quire 自己生成的文件名不会是中文。
+        // 顺序也是对的:名字不合法时先说名字有问题,别让人去找一篇不存在的剪藏
+        assert_eq!(report.failed[0].reason.code, "vault.unsafeFilename");
+        assert_eq!(
+            report.failed[0].reason.args.get("detail").map(String::as_str),
+            Some("不存在的剪藏.md"),
+            "参数里得带上那个文件名,不然界面不知道该说哪个名字不合法"
+        );
 
         let clips = v.scan().unwrap().clips;
         assert!(clips.iter().all(|c| c.read), "两篇真的都改了");
@@ -2583,10 +2658,12 @@ url: https://a.com/post
         let report = v.import_markdown(src.path()).unwrap().report;
         assert!(report.succeeded.is_empty());
         assert_eq!(report.failed.len(), 1);
-        assert!(
-            report.failed[0].reason.contains("已经在库里"),
-            "原因要说人话:{}",
-            report.failed[0].reason
+        assert_eq!(report.failed[0].reason.code, "vault.importSkippedDuplicate");
+        assert_eq!(
+            report.failed[0].reason.args.get("detail").map(String::as_str),
+            // 上面存进去的那篇就叫「已经在库里」,这里得对得上它
+            Some("已经在库里"),
+            "参数里得带上库里那篇的标题,不然用户不知道跳过去看的是哪篇"
         );
         assert_eq!(v.scan().unwrap().clips.len(), 1);
         drop(dir);
@@ -2690,7 +2767,7 @@ url: https://a.com/1
         assert_eq!(v.scan().unwrap().clips.len(), 1, "前提:库里确实有东西");
 
         let err = v.import_markdown(&v.clips_dir()).unwrap_err();
-        assert!(matches!(err, VaultError::ImportSkipped(_)), "实际: {err}");
+        assert_eq!(err.wire().code, "vault.importSkippedSelf");
         assert_eq!(v.scan().unwrap().clips.len(), 1, "一篇都不能多出来");
         drop(dir);
     }

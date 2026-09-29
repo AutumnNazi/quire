@@ -32,7 +32,7 @@ use search::SearchHit;
 use tauri_plugin_dialog::DialogExt;
 use vault::{
     BatchReport, ClipContent, ClipInput, ClipSummary, ImportReport, SaveOutcome, ScanResult,
-    SharedVault, TrashListing, Vault,
+    SharedVault, TrashListing, Vault, WireError,
 };
 
 /// 剪贴板轮询间隔。开启监控后一直在读剪贴板,太密会白耗 CPU,
@@ -73,13 +73,13 @@ struct ClipSavedNotice {
     pub filename: String,
 }
 
-fn current_vault(state: &State<AppState>) -> Result<Arc<Vault>, String> {
+fn current_vault(state: &State<AppState>) -> Result<Arc<Vault>, WireError> {
     // 锁中毒说明别的线程 panic 过,此时 vault 状态不可信,直接报错让用户重启
     state
         .vault
         .read()
         .map(|g| g.clone())
-        .map_err(|e| e.to_string())
+        .map_err(|_| WireError::new("vault.poisoned"))
 }
 
 fn info_of(state: &State<AppState>) -> VaultInfo {
@@ -105,15 +105,15 @@ fn vault_info(state: State<AppState>) -> VaultInfo {
 }
 
 #[tauri::command]
-fn list_clips(state: State<AppState>) -> Result<ScanResult, String> {
+fn list_clips(state: State<AppState>) -> Result<ScanResult, WireError> {
     let vault = current_vault(&state)?;
-    vault.scan().map_err(|e| e.to_string())
+    vault.scan().map_err(|e| e.wire())
 }
 
 #[tauri::command]
-fn read_clip(filename: String, state: State<AppState>) -> Result<ClipContent, String> {
+fn read_clip(filename: String, state: State<AppState>) -> Result<ClipContent, WireError> {
     let vault = current_vault(&state)?;
-    vault.read_clip(&filename).map_err(|e| e.to_string())
+    vault.read_clip(&filename).map_err(|e| e.wire())
 }
 
 /// 全文检索。返回摘要 + 命中片段,前端直接拿去渲染列表。
@@ -122,11 +122,11 @@ fn search_clips(
     query: String,
     limit: Option<usize>,
     state: State<AppState>,
-) -> Result<Vec<SearchHit>, String> {
+) -> Result<Vec<SearchHit>, WireError> {
     let vault = current_vault(&state)?;
     // 上限是防手滑的闸,不是业务规则。一次要一万条,界面也渲染不动。
     let limit = limit.unwrap_or(200).min(1000);
-    search::search(&vault, &query, limit).map_err(|e| e.to_string())
+    search::search(&vault, &query, limit).map_err(|e| e.wire())
 }
 
 /// 搜回收站。界面上回收站是独立视图,搜索框跟着它走。
@@ -135,10 +135,10 @@ fn search_trash(
     query: String,
     limit: Option<usize>,
     state: State<AppState>,
-) -> Result<Vec<SearchHit>, String> {
+) -> Result<Vec<SearchHit>, WireError> {
     let vault = current_vault(&state)?;
     let limit = limit.unwrap_or(200).min(1000);
-    search::search_trash(&vault, &query, limit).map_err(|e| e.to_string())
+    search::search_trash(&vault, &query, limit).map_err(|e| e.wire())
 }
 
 /// 改已读 / 归档标志。传 `None` 表示这一项不动。
@@ -148,11 +148,11 @@ fn set_clip_flags(
     read: Option<bool>,
     archived: Option<bool>,
     state: State<AppState>,
-) -> Result<ClipSummary, String> {
+) -> Result<ClipSummary, WireError> {
     let vault = current_vault(&state)?;
     vault
         .set_flags(&filename, read, archived)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.wire())
 }
 
 /// 导入一个文件夹里的 Markdown。**只读源目录**,源文件一个字节都不动。
@@ -163,7 +163,7 @@ fn set_clip_flags(
 async fn import_markdown(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<ImportReport, String> {
+) -> Result<ImportReport, WireError> {
     use tauri_plugin_dialog::DialogExt;
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -174,20 +174,20 @@ async fn import_markdown(
     // 线程,单线程 runtime 下就是彻底死锁
     let received = tauri::async_runtime::spawn_blocking(move || rx.recv())
         .await
-        .map_err(|e| e.to_string())?
-        .map_err(|_| "选择器没有返回结果".to_string())?;
+        .map_err(|e| WireError::internal(e.to_string()))?
+        .map_err(|_| WireError::new("app.pickerFailed"))?;
     let Some(picked) = received else {
-        return Err("已取消".to_string());
+        return Err(WireError::new("app.cancelled"));
     };
-    let path = picked.into_path().map_err(|e| e.to_string())?;
+    let path = picked.into_path().map_err(|e| WireError::internal(e.to_string()))?;
 
     // 一次可能导几百篇,读文件和写盘都不轻。挡在命令前面的话界面会假死
     let vault = current_vault(&state)?;
     let importer = vault.clone();
     let result = tauri::async_runtime::spawn_blocking(move || importer.import_markdown(&path))
         .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| WireError::internal(e.to_string()))?
+        .map_err(|e| e.wire())?;
 
     // 导入的剪藏也得把图下到本地,否则它们会永远指着原站。
     // **Quire 说自己剪藏时会存图,导入也是剪藏**,不存的话这批文章就成了一
@@ -206,11 +206,11 @@ fn set_clip_progress(
     filename: String,
     progress: f32,
     state: State<AppState>,
-) -> Result<ClipSummary, String> {
+) -> Result<ClipSummary, WireError> {
     let vault = current_vault(&state)?;
     vault
         .set_progress(&filename, progress)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.wire())
 }
 
 /// 移进回收站。**不真删**——剪藏工具里唯一能把用户东西弄没的操作,
@@ -219,9 +219,9 @@ fn set_clip_progress(
 /// 一篇就是一批里只有一篇,走同一条路:批量最容易出的事就是"悄悄少做了一半",
 /// 返回值必须能说出到底做了几篇、哪几篇没做成。
 #[tauri::command]
-fn trash_clips(filenames: Vec<String>, state: State<AppState>) -> Result<BatchReport, String> {
+fn trash_clips(filenames: Vec<String>, state: State<AppState>) -> Result<BatchReport, WireError> {
     let vault = current_vault(&state)?;
-    vault.trash_batch(&filenames).map_err(|e| e.to_string())
+    vault.trash_batch(&filenames).map_err(|e| e.wire())
 }
 
 /// 一次改多篇的已读 / 归档。
@@ -231,47 +231,47 @@ fn set_clip_flags_batch(
     read: Option<bool>,
     archived: Option<bool>,
     state: State<AppState>,
-) -> Result<BatchReport, String> {
+) -> Result<BatchReport, WireError> {
     let vault = current_vault(&state)?;
     vault
         .set_flags_batch(&filenames, read, archived)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.wire())
 }
 
 /// 从回收站放回原位。
 #[tauri::command]
-fn restore_clip(filename: String, state: State<AppState>) -> Result<ClipSummary, String> {
+fn restore_clip(filename: String, state: State<AppState>) -> Result<ClipSummary, WireError> {
     let vault = current_vault(&state)?;
-    vault.restore(&filename).map_err(|e| e.to_string())
+    vault.restore(&filename).map_err(|e| e.wire())
 }
 
 /// 回收站里剩下什么。**读不出元数据的也在列表里**,只是没有标题——
 /// 那正是最该被看见、也最该能被清掉的一批。
 #[tauri::command]
-fn list_trash(state: State<AppState>) -> Result<TrashListing, String> {
+fn list_trash(state: State<AppState>) -> Result<TrashListing, WireError> {
     let vault = current_vault(&state)?;
-    vault.scan_trash().map_err(|e| e.to_string())
+    vault.scan_trash().map_err(|e| e.wire())
 }
 
 /// 预览回收站里某一篇的正文。看不到内容就没法判断该不该永久删。
 #[tauri::command]
-fn read_trash_clip(filename: String, state: State<AppState>) -> Result<ClipContent, String> {
+fn read_trash_clip(filename: String, state: State<AppState>) -> Result<ClipContent, WireError> {
     let vault = current_vault(&state)?;
-    vault.read_trash_clip(&filename).map_err(|e| e.to_string())
+    vault.read_trash_clip(&filename).map_err(|e| e.wire())
 }
 
 /// 彻底删除一篇。**没有撤销**,所以只作用于回收站里的文件。
 #[tauri::command]
-fn purge_clip(filename: String, state: State<AppState>) -> Result<(), String> {
+fn purge_clip(filename: String, state: State<AppState>) -> Result<(), WireError> {
     let vault = current_vault(&state)?;
-    vault.purge(&filename).map_err(|e| e.to_string())
+    vault.purge(&filename).map_err(|e| e.wire())
 }
 
 /// 清空回收站。返回里带着清不掉的那些——"清空"没能清干净必须说出来。
 #[tauri::command]
-fn empty_trash(state: State<AppState>) -> Result<BatchReport, String> {
+fn empty_trash(state: State<AppState>) -> Result<BatchReport, WireError> {
     let vault = current_vault(&state)?;
-    vault.empty_trash().map_err(|e| e.to_string())
+    vault.empty_trash().map_err(|e| e.wire())
 }
 
 /// 把整个剪藏库拼成单个 Markdown,写到用户选的位置。
@@ -279,9 +279,9 @@ fn empty_trash(state: State<AppState>) -> Result<BatchReport, String> {
 /// 走对话框让用户自己定存哪、叫什么名——导出是用户的动作,
 /// 替他在某个目录里造个文件等于替他做决定。
 #[tauri::command]
-fn export_vault(app: AppHandle, state: State<AppState>) -> Result<Option<String>, String> {
+fn export_vault(app: AppHandle, state: State<AppState>) -> Result<Option<String>, WireError> {
     let vault = current_vault(&state)?;
-    let markdown = vault.export_markdown().map_err(|e| e.to_string())?;
+    let markdown = vault.export_markdown().map_err(|e| e.wire())?;
 
     let picked = app
         .dialog()
@@ -293,9 +293,10 @@ fn export_vault(app: AppHandle, state: State<AppState>) -> Result<Option<String>
         return Ok(None); // 用户点了取消,不是故障
     };
     let Some(path) = picked.into_path().ok() else {
-        return Err("选中的不是一个可写的文件位置".into());
+        return Err(WireError::new("export.badPath"));
     };
-    std::fs::write(&path, markdown).map_err(|e| format!("写入失败: {e}"))?;
+    std::fs::write(&path, markdown)
+        .map_err(|e| WireError::new("export.writeFailed").with("detail", e.to_string()))?;
     Ok(Some(path.display().to_string()))
 }
 
@@ -309,7 +310,7 @@ fn default_export_name() -> String {
 ///
 /// 拆成两步是因为 HTML→Markdown 需要 DOM,而 DOM 只存在于 webview 里。
 #[tauri::command]
-fn capture_clipboard() -> Result<ClipboardCapture, String> {
+fn capture_clipboard() -> Result<ClipboardCapture, WireError> {
     clipboard::capture_clipboard()
 }
 
@@ -319,13 +320,13 @@ fn save_clip(
     input: ClipInput,
     force: Option<bool>,
     state: State<AppState>,
-) -> Result<SaveOutcome, String> {
+) -> Result<SaveOutcome, WireError> {
     let vault = current_vault(&state)?;
     // 判重放在真正落盘之前。同一篇文章存两遍,列表里就多一条一模一样的,
     // 用户得自己认出哪条是新的——那是在替软件擦屁股。
     let outcome = vault
         .save_checked(&input, force.unwrap_or(false))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.wire())?;
     if let SaveOutcome::Saved { id, filename } = &outcome {
         let _ = app.emit(
             "clip-saved",
@@ -389,7 +390,7 @@ fn spawn_image_localization(app: AppHandle, vault: Arc<Vault>, filename: String)
 /// 开关剪贴板监控。默认关闭:被动监听会连你复制的密码、验证码、快递单号
 /// 一起捕获,当默认行为太吵,得由用户自己决定要不要。
 #[tauri::command]
-fn set_clipboard_watch(enabled: bool, state: State<AppState>) -> Result<VaultInfo, String> {
+fn set_clipboard_watch(enabled: bool, state: State<AppState>) -> Result<VaultInfo, WireError> {
     if enabled {
         // 开启的瞬间把剪贴板里现有的内容记成"已见"。否则用户刚打开开关,
         // 就会被自己几分钟前复制的东西弹一次提示,平白觉得这东西在窥探。
@@ -409,7 +410,7 @@ fn set_clipboard_watch(enabled: bool, state: State<AppState>) -> Result<VaultInf
 async fn pick_vault(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<Option<VaultInfo>, String> {
+) -> Result<Option<VaultInfo>, WireError> {
     use tauri_plugin_dialog::DialogExt;
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -422,18 +423,18 @@ async fn pick_vault(
     // 挪进阻塞线程池去等,async 这边只管 await 一次。
     let received = tauri::async_runtime::spawn_blocking(move || rx.recv())
         .await
-        .map_err(|e| e.to_string())?
-        .map_err(|_| "选择器没有返回结果".to_string())?;
+        .map_err(|e| WireError::internal(e.to_string()))?
+        .map_err(|_| WireError::new("app.pickerFailed"))?;
 
     let Some(picked) = received else {
         return Ok(None); // 用户取消,保持原目录
     };
-    let path = picked.into_path().map_err(|e| e.to_string())?;
+    let path = picked.into_path().map_err(|e| WireError::internal(e.to_string()))?;
 
     let vault = Vault::new(&path);
-    vault.ensure_dirs().map_err(|e| e.to_string())?;
+    vault.ensure_dirs().map_err(|e| e.wire())?;
     {
-        let mut guard = state.vault.write().map_err(|e| e.to_string())?;
+        let mut guard = state.vault.write().map_err(|_| WireError::new("vault.poisoned"))?;
         *guard = Arc::new(vault);
     }
     let info = info_of(&state);
@@ -444,9 +445,9 @@ async fn pick_vault(
 /// 在系统文件管理器里打开剪藏目录——这是"数据在你手上"最直观的一次兑现,
 /// 用户随时能看见、随时能拷走。
 #[tauri::command]
-fn open_vault_folder(state: State<AppState>) -> Result<(), String> {
+fn open_vault_folder(state: State<AppState>) -> Result<(), WireError> {
     let vault = current_vault(&state)?;
-    vault.ensure_dirs().map_err(|e| e.to_string())?;
+    vault.ensure_dirs().map_err(|e| e.wire())?;
 
     #[cfg(target_os = "windows")]
     let mut cmd = std::process::Command::new("explorer");
@@ -458,7 +459,7 @@ fn open_vault_folder(state: State<AppState>) -> Result<(), String> {
     cmd.arg(vault.root())
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("打开剪藏目录失败: {e}"))
+        .map_err(|e| WireError::new("export.openFolderFailed").with("detail", e.to_string()))
 }
 
 fn default_vault_dir() -> PathBuf {

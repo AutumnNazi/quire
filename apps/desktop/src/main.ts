@@ -2,6 +2,15 @@ import "./style.css";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "./api";
 import type { ClipboardCapture } from "./clipboard";
+import {
+  applyI18n,
+  isWireError,
+  localeName,
+  otherLocale,
+  setLocale,
+  t,
+  wireText,
+} from "./i18n";
 import { clipToMarkdown, MARKDOWN_PLACEHOLDER, renderMarkdown } from "./markdown";
 import {
   groupByWeek,
@@ -25,44 +34,44 @@ import type {
   VaultInfo,
 } from "./types";
 
-const root = document.querySelector<HTMLDivElement>("#app");
-if (!root) throw new Error("页面缺少 #app 挂载点");
+const mount = document.querySelector<HTMLDivElement>("#app");
+if (!mount) throw new Error("页面缺少 #app 挂载点");
+/** 挂载点。**提成 const 是为了让 TS 保留非空收窄**——收窄只写在
+ *  顶层那一行,函数体里再引用 `root` 的话 TS 又当成可能是 null。 */
+const root: HTMLDivElement = mount;
 
 root.innerHTML = `
   <header class="toolbar">
-    <button class="btn primary" id="btn-paste" title="把剪贴板里的内容存成 Markdown(Ctrl+V)">粘贴剪藏</button>
+    <button class="btn primary" id="btn-paste" data-i18n="toolbar.paste" data-i18n-title="toolbar.paste.title"></button>
     <span class="brand">Quire</span>
-    <span class="vault-path" id="vault-path" title="剪藏目录"></span>
+    <span class="vault-path" id="vault-path" data-i18n-title="toolbar.vaultPath.title"></span>
     <span class="spacer"></span>
     <input
       class="search"
       id="search"
       type="search"
-      placeholder="搜索剪藏…"
       autocomplete="off"
       spellcheck="false"
-      title="搜标题和正文。中文两字就能搜(比如「苹果」)。"
+      data-i18n-placeholder="toolbar.search.placeholder"
+      data-i18n-title="toolbar.search.title"
     />
-    <div class="filters" role="tablist" aria-label="剪藏筛选">
-      <button class="filter active" id="filter-all" role="tab" aria-selected="true">全部</button>
-      <button class="filter" id="filter-unread" role="tab" aria-selected="false" title="没读过、也没归档的">未读</button>
-      <button class="filter" id="filter-week" role="tab" aria-selected="false" title="按自然周分组,一眼看出这周积了多少">每周</button>
-      <button class="filter" id="filter-archived" role="tab" aria-selected="false" title="归档过的剪藏。归档是挪到一边,不是删掉,随时能翻回来。">归档</button>
-      <button class="filter" id="filter-trash" role="tab" aria-selected="false" title="删掉的剪藏。放回来随时能翻回原位,彻底删除就没有了。">回收站</button>
+    <div class="filters" role="tablist" data-i18n-aria="toolbar.filters.aria">
+      <button class="filter active" id="filter-all" role="tab" aria-selected="true" data-i18n="filter.all"></button>
+      <button class="filter" id="filter-unread" role="tab" aria-selected="false" data-i18n="filter.unread" data-i18n-title="filter.unread.title"></button>
+      <button class="filter" id="filter-week" role="tab" aria-selected="false" data-i18n="filter.week" data-i18n-title="filter.week.title"></button>
+      <button class="filter" id="filter-archived" role="tab" aria-selected="false" data-i18n="filter.archived" data-i18n-title="filter.archived.title"></button>
+      <button class="filter" id="filter-trash" role="tab" aria-selected="false" data-i18n="filter.trash" data-i18n-title="filter.trash.title"></button>
     </div>
-    <label class="watch-toggle" title="开启后,你在别处复制文章时会自动提示存到 Quire。默认关闭。">
+    <label class="watch-toggle" data-i18n-title="watch.title">
       <input type="checkbox" id="chk-watch" />
-      <span>监控剪贴板</span>
+      <span data-i18n="watch.label"></span>
     </label>
-    <button class="btn" id="btn-import" title="把一个文件夹里的 Markdown 导入剪藏库。只读源文件,不会改动它们。">导入</button>
-    <button class="btn" id="btn-export" title="把整个剪藏库导出成一个 Markdown 文件,Obsidian / Logseq 都能直接打开">导出</button>
-    <button class="btn" id="btn-open">打开剪藏目录</button>
-    <button class="btn" id="btn-pick">更换目录</button>
-    <span
-      class="shortcut-hint"
-      title="↑↓ 上下翻 · r 标已读 · a 归档 · / 搜索 · Ctrl+V 剪藏"
-      ><kbd>↑</kbd><kbd>↓</kbd> 翻 <kbd>r</kbd> 读完 <kbd>a</kbd> 归档 <kbd>/</kbd> 搜</span
-    >
+    <button class="btn" id="btn-import" data-i18n="toolbar.import" data-i18n-title="toolbar.import.title"></button>
+    <button class="btn" id="btn-export" data-i18n="toolbar.export" data-i18n-title="toolbar.export.title"></button>
+    <button class="btn" id="btn-open" data-i18n="toolbar.open"></button>
+    <button class="btn" id="btn-pick" data-i18n="toolbar.pick"></button>
+    <button class="btn ghost lang" id="btn-lang" data-i18n="lang.name" data-i18n-title="lang.switch"></button>
+    <span class="shortcut-hint" data-i18n-title="toolbar.shortcut.title" data-i18n-html="toolbar.shortcut.text"></span>
   </header>
   <main class="split">
     <aside class="list-pane">
@@ -70,11 +79,11 @@ root.innerHTML = `
       <div class="list" id="list"></div>
       <div class="batch-bar" id="batch-bar" hidden>
         <span class="count" id="batch-count"></span>
-        <button class="btn" id="batch-read">标已读</button>
-        <button class="btn" id="batch-unread">标未读</button>
-        <button class="btn" id="batch-archive">归档</button>
-        <button class="btn danger" id="batch-delete">删除</button>
-        <button class="btn ghost" id="batch-clear">取消</button>
+        <button class="btn" id="batch-read" data-i18n="batch.read"></button>
+        <button class="btn" id="batch-unread" data-i18n="batch.unread"></button>
+        <button class="btn" id="batch-archive" data-i18n="batch.archive"></button>
+        <button class="btn danger" id="batch-delete" data-i18n="batch.delete"></button>
+        <button class="btn ghost" id="batch-clear" data-i18n="batch.clear"></button>
       </div>
     </aside>
     <section class="detail-pane" id="detail"></section>
@@ -82,9 +91,13 @@ root.innerHTML = `
   <div class="toast" id="toast" hidden>
     <span class="toast-text" id="toast-text"></span>
     <span class="toast-actions" id="toast-actions" hidden></span>
-    <button class="btn close" id="toast-close" aria-label="关闭">×</button>
+    <button class="btn close" id="toast-close" data-i18n-aria="toast.close">×</button>
   </div>
 `;
+
+// 文案在这一步填进去。**不是把文案插进上面的模板**:模板里写死中文的话,
+// 换语言就得重画整个骨架,而骨架里还散着一堆 id 引用,重画一次错一个
+applyI18n(root);
 
 const el = <T extends HTMLElement>(id: string): T => {
   const node = document.getElementById(id);
@@ -108,6 +121,7 @@ const filterUnreadEl = el<HTMLButtonElement>("filter-unread");
 const filterWeekEl = el<HTMLButtonElement>("filter-week");
 const filterArchivedEl = el<HTMLButtonElement>("filter-archived");
 const filterTrashEl = el<HTMLButtonElement>("filter-trash");
+const langBtn = el<HTMLButtonElement>("btn-lang");
 
 let clips: ClipSummary[] = [];
 /** 回收站里的东西。**进回收站视图时才去拉**,平时不占着一次 IPC 往返。 */
@@ -139,6 +153,20 @@ let searchTimer: ReturnType<typeof setTimeout> | null = null;
 function showError(message: string): void {
   warnEl.textContent = message;
   warnEl.hidden = false;
+}
+
+/** 把后端送回来的错误翻成当前语言的句子,再挂到红条上。
+ *
+ *  所有 `catch` 都走这里,不再各自 `String(err)`——那写法对新的错误类型
+ *  会打出 `[object Object]`,对字符串错误又没法加上下文,两头都不对。 */
+function showBackendError(
+  key: string,
+  err: unknown,
+  extra: Record<string, string | number> = {},
+): void {
+  // 不是后端的错误(比如 `invoke` 本身失败)时 `wireText` 会退回一句字符串,
+  // 所以这一处不用再分叉
+  showError(t(key, { ...extra, detail: wireText(err) }));
 }
 
 function clearError(): void {
@@ -228,7 +256,7 @@ function renderListInner(): void {
     if (hits.length === 0) {
       const none = document.createElement("div");
       none.className = "empty";
-      none.innerHTML = `<p class="empty-title">没找到</p><p>换个词试试。</p>`;
+      none.innerHTML = `<p class="empty-title">${t("list.searchNone.title")}</p><p>${t("list.searchNone.body")}</p>`;
       listEl.append(none);
       return;
     }
@@ -240,8 +268,8 @@ function renderListInner(): void {
     const empty = document.createElement("div");
     empty.className = "empty";
     empty.innerHTML = `
-      <p class="empty-title">剪藏库还是空的</p>
-      <p>在任意文章页里选中正文,按 <kbd>Ctrl</kbd>+<kbd>C</kbd> 复制,<br />再回到 Quire 按 <kbd>Ctrl</kbd>+<kbd>V</kbd> 就能存进来。</p>
+      <p class="empty-title">${t("list.empty.title")}</p>
+      <p>${t("list.empty.body")}</p>
     `;
     listEl.append(empty);
     return;
@@ -260,10 +288,10 @@ function renderListInner(): void {
     // 三种空态三种说法。「没有内容」这种话等于让用户以为剪藏丢了。
     none.innerHTML =
       filter === "unread"
-        ? `<p class="empty-title">没有未读了</p><p>都读过了。要看全部,点「全部」。</p>`
+        ? `<p class="empty-title">${t("list.unreadEmpty.title")}</p><p>${t("list.unreadEmpty.body")}</p>`
         : filter === "archived"
-          ? `<p class="empty-title">还没有归档</p><p>看完不打算再看的,在正文页点「归档」挪到这儿。</p>`
-          : `<p class="empty-title">没有剪藏</p>`;
+          ? `<p class="empty-title">${t("list.archivedEmpty.title")}</p><p>${t("list.archivedEmpty.body")}</p>`
+          : `<p class="empty-title">${t("list.none.title")}</p>`;
     listEl.append(none);
     return;
   }
@@ -280,7 +308,7 @@ function renderWeekList(): void {
   if (groups.length === 0) {
     const none = document.createElement("div");
     none.className = "empty";
-    none.innerHTML = `<p class="empty-title">没有可回顾的剪藏</p>`;
+    none.innerHTML = `<p class="empty-title">${t("list.weekEmpty.title")}</p>`;
     listEl.append(none);
     return;
   }
@@ -289,8 +317,13 @@ function renderWeekList(): void {
     header.className = "week-header";
     const unread = group.clips.filter((c) => !c.read && !c.archived).length;
     // 整组都读完了就别再报未读,挂个 0 只会让人多看一眼
-    const suffix = unread > 0 ? ` · 还有 ${unread} 篇没读` : " · 都读完了";
-    header.textContent = `${group.isoYear} 年第 ${group.isoWeek} 周 — ${group.clips.length} 篇${suffix}`;
+    const suffix = unread > 0 ? t("list.weekUnread", { n: unread }) : t("list.weekAllRead");
+    header.textContent = t("list.weekHeader", {
+      year: group.isoYear,
+      week: group.isoWeek,
+      count: group.clips.length,
+      suffix,
+    });
     listEl.append(header);
     for (const clip of selectClips(group.clips, "all")) {
       listEl.append(clipItem(clip, clip.excerpt));
@@ -315,7 +348,7 @@ function renderTrashList(): void {
   if (trash.length === 0) {
     const none = document.createElement("div");
     none.className = "empty";
-    none.innerHTML = `<p class="empty-title">回收站是空的</p>`;
+    none.innerHTML = `<p class="empty-title">${t("trash.empty.title")}</p>`;
     listEl.append(none);
     return;
   }
@@ -323,13 +356,13 @@ function renderTrashList(): void {
   const header = document.createElement("div");
   header.className = "week-header trash-header";
   const label = document.createElement("span");
-  label.textContent = `${trash.length} 篇 · 共 ${formatBytes(total)}`;
+  label.textContent = t("trash.header", { count: trash.length, size: formatBytes(total) });
   // 清空摆在**它作用的东西旁边**,不占工具栏。工具栏是全局的,
   // 在那儿长期摆一个红按钮,用户会怕点错,也把工具栏挤不下了
   const empty = document.createElement("button");
   empty.className = "btn danger";
-  empty.textContent = "清空";
-  empty.title = "把回收站里的全删掉,删了就找不回来了";
+  empty.textContent = t("trash.emptyTrash");
+  empty.title = t("trash.emptyTrash.title");
   empty.addEventListener("click", () => askEmptyTrash());
   header.append(label, empty);
   listEl.append(header);
@@ -345,7 +378,7 @@ function trashItem(item: TrashItem): HTMLElement {
 
   const title = document.createElement("h3");
   title.className = "clip-title";
-  title.textContent = item.summary?.title ?? "读不出标题的剪藏";
+  title.textContent = item.summary?.title ?? t("trash.untitled");
   el.append(title);
 
   const meta = document.createElement("p");
@@ -426,8 +459,8 @@ function clipItem(
   const toggle = document.createElement("button");
   toggle.className = "read-toggle";
   const done = clip.read || clip.archived;
-  toggle.textContent = done ? "已读" : "标已读";
-  toggle.title = done ? "点一下标回未读" : "读完了,点一下标已读";
+  toggle.textContent = done ? t("clip.read") : t("clip.markRead");
+  toggle.title = done ? t("clip.markUnread.title") : t("clip.markRead.title");
   toggle.setAttribute("aria-pressed", String(done));
   toggle.addEventListener("click", (event) => {
     // 不冒泡:不然会连带触发下面的 openDetail,读一篇却把列表刷没了
@@ -467,7 +500,7 @@ function renderBatchBar(): void {
   const on = selected.size > 0 && filter !== "trash";
   batchBarEl.hidden = !on;
   if (!on) return;
-  batchCountEl.textContent = `已选 ${selected.size} 篇`;
+  batchCountEl.textContent = t("batch.count", { n: selected.size });
 }
 
 /** 改已读标志。失败要说出来——静默失败的代价是用户以为标上了,
@@ -485,7 +518,7 @@ async function toggleRead(clip: ClipSummary, next: boolean): Promise<void> {
     }
     renderList();
   } catch (err) {
-    showError(`标已读失败:${String(err)}`);
+    showBackendError("error.markReadFailed", err);
   }
 }
 
@@ -508,7 +541,10 @@ async function toggleArchive(filename: string): Promise<void> {
     if (activeFilename === filename) await refreshOpenDetail();
     renderList();
   } catch (err) {
-    showError(`${before.archived ? "取消归档" : "归档"}失败:${String(err)}`);
+    showBackendError(
+      before.archived ? "error.unarchiveFailed" : "error.archiveFailed",
+      err,
+    );
   }
 }
 
@@ -527,7 +563,7 @@ async function refreshOpenDetail(): Promise<void> {
     renderDetail(clip);
     detailEl.scrollTop = scroll;
   } catch (err) {
-    showError(`读不出来:${String(err)}`);
+    showBackendError("error.readFailed", err);
   }
 }
 
@@ -537,12 +573,12 @@ async function refreshOpenDetail(): Promise<void> {
 async function trashClip(filename: string): Promise<void> {
   const report = await trashMany([filename]);
   if (report.failed.length > 0) {
-    showError(`删除失败:${report.failed[0].reason}`);
+    showError(t("error.trashFailed", { detail: wireText(report.failed[0].reason) }));
     return;
   }
-  showToast("已移到回收站", [
-    { label: "撤销", primary: true, onClick: () => void undoTrash(filename) },
-    { label: "关闭", onClick: hideToast },
+  showToast(t("toast.movedToTrash"), [
+    { label: t("toast.undo"), primary: true, onClick: () => void undoTrash(filename) },
+    { label: t("toast.close"), onClick: hideToast },
   ]);
 }
 
@@ -571,21 +607,21 @@ async function undoTrash(filename: string): Promise<void> {
     // 顶到列表最前面的话,撤销一次顺序就乱一次
     clips = upsertClip(clips, back);
     renderList();
-    showToast("放回来了");
+    showToast(t("toast.restored"));
   } catch (err) {
     // 放不回来是真出了岔子,不能当成没事发生——用户会以为东西回来了
-    showError(`撤销失败,文件还在回收站里:${String(err)}`);
+    showBackendError("error.undoFailed", err);
   }
 }
 
 function syncArchiveButton(clip: ClipContent): void {
   if (!archiveBtn) return;
-  archiveBtn.textContent = clip.archived ? "取消归档" : "归档";
+  archiveBtn.textContent = clip.archived ? t("detail.unarchive") : t("detail.archive");
   archiveBtn.classList.toggle("active", clip.archived);
   archiveBtn.setAttribute("aria-pressed", String(clip.archived));
   archiveBtn.title = clip.archived
-    ? "放回全部列表"
-    : "看完不打算再看的,挪到「归档」里去";
+    ? t("detail.unarchive.title")
+    : t("detail.archive.title");
 }
 
 function renderDetail(clip: ClipContent): void {
@@ -613,7 +649,7 @@ function renderDetail(clip: ClipContent): void {
     link.href = clip.url;
     link.target = "_blank";
     link.rel = "noopener noreferrer";
-    link.textContent = "打开原文";
+    link.textContent = t("detail.openOriginal");
     meta.prepend(link);
   }
 
@@ -621,7 +657,7 @@ function renderDetail(clip: ClipContent): void {
   // 得在滚动时一眼看见,而不是滚到底才知道
   const progress = document.createElement("div");
   progress.className = "read-progress";
-  progress.title = "读到哪儿了";
+  progress.title = t("detail.progress.title");
   const bar = document.createElement("i");
   progress.append(bar);
 
@@ -650,8 +686,8 @@ function renderDetail(clip: ClipContent): void {
   archive.addEventListener("click", () => void toggleArchive(clip.filename));
   const remove = document.createElement("button");
   remove.className = "btn danger";
-  remove.textContent = "删除";
-  remove.title = "移到回收站,不是真删——放回收站里随时能捞回来";
+  remove.textContent = t("detail.delete");
+  remove.title = t("detail.delete.title");
   remove.addEventListener("click", () => void trashClip(clip.filename));
   actions.append(archive, remove);
   syncArchiveButton(clip);
@@ -737,7 +773,7 @@ function renderEmptyDetail(): void {
   archiveBtn = null; // 上一篇的按钮节点已经脱离文档,留着只会改空气
   const hint = document.createElement("div");
   hint.className = "empty";
-  hint.innerHTML = `<p class="empty-title">从左边选一篇</p>`;
+  hint.innerHTML = `<p class="empty-title">${t("detail.pickOne")}</p>`;
   detailEl.append(hint);
 }
 
@@ -749,7 +785,7 @@ async function openDetail(filename: string): Promise<void> {
     if (activeFilename !== filename) return; // 用户点得比读得快,丢弃过期结果
     renderDetail(clip);
   } catch (err) {
-    showError(`读不出来:${String(err)}`);
+    showBackendError("error.readFailed", err);
   }
 }
 
@@ -770,10 +806,10 @@ async function openTrashDetail(filename: string): Promise<void> {
     // 只说清实情,再把两个按钮摆出来
     if (activeFilename !== filename) return;
     const fallback = document.createElement("h1");
-    fallback.textContent = "读不出内容的剪藏";
+    fallback.textContent = t("trash.unreadable.title");
     const note = document.createElement("p");
     note.className = "detail-meta";
-    note.textContent = "这个文件的 frontmatter 坏了,可能被你手动改过。它还在回收站里,也能删掉。";
+    note.textContent = t("trash.unreadable.body");
     detailEl.replaceChildren(fallback, note, trashActions(filename, null));
   }
 }
@@ -814,17 +850,17 @@ function trashActions(filename: string, sizeBytes: number | null): HTMLElement {
 
   const back = document.createElement("button");
   back.className = "btn primary";
-  back.textContent = "放回来";
-  back.title = "放回剪藏库的原位置,文件名和图片都跟着回来";
+  back.textContent = t("trash.restore");
+  back.title = t("trash.restore.title");
   back.addEventListener("click", () => void restoreFromTrash(filename));
 
   const purge = document.createElement("button");
   purge.className = "btn danger";
-  purge.textContent = "彻底删除";
+  purge.textContent = t("trash.purge");
   // 措辞要说清楚后果:没有撤销、没有回收站第二层
   purge.title = sizeBytes === null
-    ? "删掉就找不回来了,没有撤销"
-    : `删掉就找不回来了,没有撤销(能腾出 ${formatBytes(sizeBytes)})`;
+    ? t("trash.purge.title")
+    : t("trash.purge.titleWithSize", { size: formatBytes(sizeBytes) });
   purge.addEventListener("click", () => void purgeFromTrash(filename));
 
   actions.append(back, purge);
@@ -848,10 +884,10 @@ async function restoreFromTrash(filename: string): Promise<void> {
     } else {
       renderTrashList();
     }
-    showToast("放回来了");
+    showToast(t("toast.restored"));
   } catch (err) {
     // 放不回来是真出了岔子,不能当成没事发生——用户会以为东西回来了
-    showError(`放回失败:${String(err)}`);
+    showBackendError("error.restoreFailed", err);
   }
 }
 
@@ -866,9 +902,9 @@ async function purgeFromTrash(filename: string): Promise<void> {
     const next = reanchorAfterRemoval(visibleFilenames(), at);
     if (next) void openTrashDetail(next);
     else renderEmptyDetail();
-    showToast("彻底删除了");
+    showToast(t("toast.purged"));
   } catch (err) {
-    showError(`彻底删除失败:${String(err)}`);
+    showBackendError("error.purgeFailed", err);
   }
 }
 
@@ -886,7 +922,7 @@ async function saveCapture(
 ): Promise<string | null> {
   const { markdown, title, excerpt, meta } = clipToMarkdown(capture);
   if (!markdown.trim()) {
-    showError("剪贴板里没有可保存的内容");
+    showError(t("error.clipboardNoContent"));
     return null;
   }
   const outcome = await api.saveClip(
@@ -917,22 +953,22 @@ async function saveCapture(
  *  用户就只剩"自己去剪藏目录里改文件名"这一条路——那不是防重复,
  *  那是把活推给用户。 */
 function announceDuplicate(filename: string, capture: ClipboardCapture): void {
-  showToast("这篇之前剪过了", [
-    { label: "打开它", primary: true, onClick: () => void openDetail(filename) },
+  showToast(t("toast.duplicate"), [
+    { label: t("toast.duplicateOpen"), primary: true, onClick: () => void openDetail(filename) },
     {
-      label: "仍然存一份",
+      label: t("toast.duplicateForce"),
       onClick: () => {
         hideToast();
         void saveCapture(capture, true)
           .then((again) => {
             // 判重是后端说了算,带着 force 仍被判重说明中间有人动过库
             if (again) announceDuplicate(again, capture);
-            else showToast("已剪藏");
+            else showToast(t("toast.saved"));
           })
-          .catch((err) => showError(String(err)));
+          .catch((err) => showError(wireText(err)));
       },
     },
-    { label: "关闭", onClick: hideToast },
+    { label: t("toast.close"), onClick: hideToast },
   ]);
 }
 
@@ -940,14 +976,14 @@ async function pasteNow(): Promise<void> {
   try {
     const capture = await api.captureClipboard();
     if (!capture.html?.trim() && !capture.text.trim()) {
-      showError("剪贴板是空的,先在别处复制点内容");
+      showError(t("error.clipboardEmpty"));
       return;
     }
     const duplicate = await saveCapture(capture);
     if (duplicate) announceDuplicate(duplicate, capture);
-    else showToast("已剪藏");
+    else showToast(t("toast.saved"));
   } catch (err) {
-    showError(String(err));
+    showError(wireText(err));
   }
 }
 
@@ -971,7 +1007,7 @@ async function runSearch(query: string): Promise<void> {
     hits = results;
     renderList();
   } catch (err) {
-    showError(`搜不了:${String(err)}`);
+    showBackendError("error.searchFailed", err);
   }
 }
 
@@ -998,8 +1034,10 @@ async function refreshList(): Promise<void> {
       // 这些文件确实存在但读不出元数据。藏起来等于骗用户"剪藏丢了",
       // 摆出来用户自己能看到是哪个文件出了问题
       showError(
-        `有 ${result.unreadable.length} 个文件读不出元数据:` +
-          result.unreadable.map((f) => f.filename).join("、"),
+        t("error.unreadableFiles", {
+          n: result.unreadable.length,
+          names: result.unreadable.map((f) => f.filename).join("、"),
+        }),
       );
     } else {
       clearError();
@@ -1010,7 +1048,7 @@ async function refreshList(): Promise<void> {
     if (filter === "trash") await refreshTrash();
     renderList();
   } catch (err) {
-    showError(`列不出剪藏:${String(err)}`);
+    showBackendError("error.listFailed", err);
   }
 }
 
@@ -1021,14 +1059,16 @@ async function loadVaultInfo(): Promise<void> {
     vaultPathEl.title = info.path;
     watchEl.checked = info.watching;
   } catch {
-    vaultPathEl.textContent = "剪藏目录未知";
+    vaultPathEl.textContent = t("error.vaultUnknown");
   }
 }
 
 el<HTMLButtonElement>("btn-paste").addEventListener("click", () => void pasteNow());
 
 el<HTMLButtonElement>("btn-open").addEventListener("click", () => {
-  void api.openVaultFolder().catch((e) => showError(String(e)));
+  void api
+    .openVaultFolder()
+    .catch((e) => showError(wireText(e)));
 });
 
 /** 切筛选。搜索态下不切——搜出来的结果和自己的筛选无关,
@@ -1056,7 +1096,7 @@ async function setFilter(next: ListMode | "trash"): Promise<void> {
     try {
       await refreshTrash();
     } catch (err) {
-      showError(`回收站读不出来:${String(err)}`);
+      showBackendError("error.trashUnreadable", err);
     }
   }
   renderList();
@@ -1077,9 +1117,9 @@ filterTrashEl.addEventListener("click", () => void setFilter("trash"));
  * 要用户多点一下才够得到那个红色的,总比反过来安全。 */
 function askEmptyTrash(): void {
   if (trash.length === 0) return;
-  showToast(`彻底删掉回收站里的 ${trash.length} 篇?删了就找不回来了`, [
-    { label: "取消", primary: true, onClick: hideToast },
-    { label: "彻底删除", onClick: () => void doEmptyTrash() },
+  showToast(t("confirm.emptyTrash", { n: trash.length }), [
+    { label: t("batch.clear"), primary: true, onClick: hideToast },
+    { label: t("confirm.emptyTrashAction"), onClick: () => void doEmptyTrash() },
   ]);
 }
 
@@ -1096,14 +1136,17 @@ async function doEmptyTrash(): Promise<void> {
     if (report.failed.length > 0) {
       // "清空"没清干净必须说出来。报一句成功了,用户会以为磁盘已经腾干净了
       showError(
-        `清掉了 ${report.succeeded.length} 篇,但有 ${report.failed.length} 篇没删掉:` +
-          report.failed.map((f) => f.filename).join("、"),
+        t("error.emptyTrashPartial", {
+          ok: report.succeeded.length,
+          n: report.failed.length,
+          names: report.failed.map((f) => f.filename).join("、"),
+        }),
       );
     } else {
-      showToast(`清掉了 ${report.succeeded.length} 篇`);
+      showToast(t("toast.clearedTrash", { n: report.succeeded.length }));
     }
   } catch (err) {
-    showError(`清空回收站失败:${String(err)}`);
+    showBackendError("error.emptyTrashFailed", err);
   }
 }
 
@@ -1128,9 +1171,9 @@ async function batchFlags(read: boolean | undefined, archived: boolean | undefin
     // (拼错了就是"界面说已读、文件里还是未读"),不如老实重扫一遍磁盘
     await refreshList();
     if (activeFilename) await refreshOpenDetail();
-    reportBatch(report, `${what}了 ${report.succeeded.length} 篇`);
+    reportBatch(report, t("batch.count", { n: report.succeeded.length }));
   } catch (err) {
-    showError(`${what}失败:${String(err)}`);
+    showBackendError("error.batchFailed", err, { action: what });
   }
 }
 
@@ -1141,12 +1184,24 @@ function reportBatch(report: BatchReport, done: string): void {
   }
   // 批量最容易出的事就是"悄悄少做了一半"。只报成功那几条的话,
   // 用户会以为没做的那几篇也做了
-  showError(`${done},但有 ${report.failed.length} 篇没成功:${report.failed[0].reason}`);
+  showError(
+    t("error.batchPartial", {
+      done,
+      n: report.failed.length,
+      reason: wireText(report.failed[0].reason),
+    }),
+  );
 }
 
-el<HTMLButtonElement>("batch-read").addEventListener("click", () => void batchFlags(true, undefined, "标已读"));
-el<HTMLButtonElement>("batch-unread").addEventListener("click", () => void batchFlags(false, undefined, "标未读"));
-el<HTMLButtonElement>("batch-archive").addEventListener("click", () => void batchFlags(undefined, true, "归档"));
+el<HTMLButtonElement>("batch-read").addEventListener("click", () =>
+  void batchFlags(true, undefined, t("batch.read")),
+);
+el<HTMLButtonElement>("batch-unread").addEventListener("click", () =>
+  void batchFlags(false, undefined, t("batch.unread")),
+);
+el<HTMLButtonElement>("batch-archive").addEventListener("click", () =>
+  void batchFlags(undefined, true, t("batch.archive")),
+);
 el<HTMLButtonElement>("batch-clear").addEventListener("click", () => {
   selected = new Set();
   selectionAnchor = null;
@@ -1157,15 +1212,17 @@ el<HTMLButtonElement>("batch-delete").addEventListener("click", () => {
   const names = selectedFiles();
   // 删除是不可逆的(要进回收站才能撤销),而且一次动的是全部——
   // 主按钮写成"取消",要用户多点一下才够得到那个红色的
-  showToast(`把选中的 ${names.length} 篇移到回收站?`, [
-    { label: "取消", primary: true, onClick: hideToast },
+  showToast(t("confirm.batchDelete", { n: names.length }), [
+    { label: t("batch.clear"), primary: true, onClick: hideToast },
     {
-      label: "移到回收站",
+      label: t("confirm.batchDeleteAction"),
       onClick: () => {
         hideToast();
         void trashMany(names)
-          .then((report) => reportBatch(report, `已移到回收站 ${report.succeeded.length} 篇`))
-          .catch((err) => showError(`删除失败:${String(err)}`));
+          .then((report) =>
+            reportBatch(report, t("toast.movedMany", { n: report.succeeded.length })),
+          )
+          .catch((err) => showError(wireText(err)));
       },
     },
   ]);
@@ -1177,9 +1234,11 @@ el<HTMLButtonElement>("btn-import").addEventListener("click", async () => {
     await refreshList();
     reportImport(report);
   } catch (err) {
-    // 用户在目录选择器上点了取消,那不是故障
-    if (String(err).includes("已取消")) return;
-    showError(`导入失败:${String(err)}`);
+    // 用户在目录选择器上点了取消,那不是故障。**按代号判,不按中文句子判**:
+    // 拿 `String(err).includes("已取消")` 判,文案一改就失效,
+    // 而且英文界面下那句中文压根不会出现,取消会被当成真错误弹红字
+    if (isWireError(err) && err.code === "app.cancelled") return;
+    showBackendError("error.importFailed", err);
   }
 });
 
@@ -1190,23 +1249,29 @@ function reportImport(report: BatchReport): void {
   if (n === 0) {
     showError(
       report.failed.length > 0
-        ? `一篇都没导进来。${report.failed.length} 个文件被跳过,` +
-            `比如 ${report.failed[0].filename}:${report.failed[0].reason}`
-        : "那个文件夹里没有 .md 文件",
+        ? t("error.importNone", {
+            n: report.failed.length,
+            name: report.failed[0].filename,
+            reason: wireText(report.failed[0].reason),
+          })
+        : t("error.importNoneEmpty"),
     );
     return;
   }
   if (report.failed.length === 0) {
-    showToast(`导入了 ${n} 篇`);
+    showToast(t("toast.imported", { n }));
     return;
   }
   showError(
-    `导入了 ${n} 篇,跳过 ${report.failed.length} 个:` +
-      report.failed
-        .slice(0, 3)
-        .map((f) => `${f.filename}(${f.reason})`)
-        .join("、") +
-      (report.failed.length > 3 ? ` 等 ${report.failed.length} 个` : ""),
+    t("error.importPartial", {
+      ok: n,
+      n: report.failed.length,
+      names:
+        report.failed
+          .slice(0, 3)
+          .map((f) => `${f.filename}(${wireText(f.reason)})`)
+          .join("、") + (report.failed.length > 3 ? ` 等 ${report.failed.length} 个` : ""),
+    }),
   );
 }
 
@@ -1214,9 +1279,9 @@ el<HTMLButtonElement>("btn-export").addEventListener("click", async () => {
   try {
     // 返回 null 是用户在保存对话框点了取消,那不是故障,别弹红字
     const path = await api.exportVault();
-    if (path) showToast("已导出");
+    if (path) showToast(t("toast.exported"));
   } catch (err) {
-    showError(`导出失败:${String(err)}`);
+    showBackendError("error.exportFailed", err);
   }
 });
 
@@ -1228,7 +1293,7 @@ el<HTMLButtonElement>("btn-pick").addEventListener("click", async () => {
       await refreshList();
     }
   } catch (err) {
-    showError(`更换目录失败:${String(err)}`);
+    showBackendError("error.pickVaultFailed", err);
   }
 });
 
@@ -1238,14 +1303,14 @@ watchEl.addEventListener("change", () => {
     .then((info) => {
       watchEl.checked = info.watching;
       if (info.watching) {
-        showToast("已开启监控:复制文章后会提示保存");
+        showToast(t("toast.watchOn"));
       } else {
         hideToast();
       }
     })
     .catch((err) => {
       watchEl.checked = !watchEl.checked; // 状态没改成,把开关拨回去
-      showError(String(err));
+      showError(wireText(err));
     });
 });
 
@@ -1349,6 +1414,47 @@ document.addEventListener("keydown", (e) => {
 });
 
 el<HTMLButtonElement>("toast-close").addEventListener("click", hideToast);
+
+/** 换语言。**不是刷新一遍**:正开着的那篇正文得留着,滚动位置也得留着——
+ *  为了改个语言把用户读到的位置弹回顶部,下次他就不切了。 */
+function applyLocale(): void {
+  applyI18n(root);
+  langBtn.textContent = localeName();
+  langBtn.title = t("lang.switch");
+  langBtn.setAttribute("aria-label", t("lang.switch"));
+  hideToast();
+  clearError();
+  void reloadAfterLocale();
+}
+
+async function reloadAfterLocale(): Promise<void> {
+  if (filter === "trash") {
+    try {
+      await refreshTrash();
+    } catch (err) {
+      showBackendError("error.trashUnreadable", err);
+    }
+  }
+  renderList();
+  if (activeFilename) {
+    try {
+      const clip = await (filter === "trash"
+        ? api.readTrashClip(activeFilename)
+        : api.readClip(activeFilename));
+      // 换语言要花一会儿,用户可能已经点走别的了
+      if (!activeFilename) return;
+      if (filter === "trash") renderTrashDetail(clip);
+      else renderDetail(clip);
+    } catch (err) {
+      if (filter !== "trash") showBackendError("error.readFailed", err);
+    }
+  }
+}
+
+el<HTMLButtonElement>("btn-lang").addEventListener("click", () => {
+  setLocale(otherLocale());
+  applyLocale();
+});
 async function boot(): Promise<void> {
   // 先挂监听再拉列表。反过来的话,在这两步之间发生的剪藏不会触发任何事件,
   // 用户会看到"扩展显示剪藏成功,列表里却没有"
@@ -1358,15 +1464,16 @@ async function boot(): Promise<void> {
   // Quire 一直说自己不联网,现在剪藏这一刻会真的去连图片服务器,
   // 悄悄做和写在脸上是两回事
   await listen<{ filename: string; count: number }>("clip-saved-images", (e) => {
-    showToast(`已剪藏,${e.payload.count} 张图片也存到本地了`);
+    showToast(t("toast.savedImages", { count: e.payload.count }));
   });
   await listen<ClipboardCapture>("clipboard-changed", (event) => {
     pendingCapture = event.payload;
     const preview =
-      event.payload.text?.trim().split("\n").find((l) => l.trim())?.slice(0, 40) || "剪贴板内容";
-    showToast(`检测到:${preview}`, [
+      event.payload.text?.trim().split("\n").find((l) => l.trim())?.slice(0, 40) ||
+      t("toast.detectedFallback");
+    showToast(t("toast.detected", { preview }), [
       {
-        label: "保存",
+        label: t("toast.save"),
         primary: true,
         onClick: () => {
           const capture = pendingCapture;
@@ -1375,12 +1482,12 @@ async function boot(): Promise<void> {
           void saveCapture(capture)
             .then((duplicate) => {
               if (duplicate) announceDuplicate(duplicate, capture);
-              else showToast("已剪藏");
+              else showToast(t("toast.saved"));
             })
-            .catch((err) => showError(String(err)));
+            .catch((err) => showError(wireText(err)));
         },
       },
-      { label: "忽略", onClick: hideToast },
+      { label: t("toast.ignore"), onClick: hideToast },
     ]);
   });
 

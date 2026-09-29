@@ -1,3 +1,14 @@
+/**
+ * 后端送回来的错误。**只有代号和参数,没有现成的句子**——
+ * 界面自己拿代号去查词典,英文用户看见的才也是英文。
+ * 字段名与 Rust 侧 `WireError` 一致。
+ */
+export interface WireError {
+  code: string;
+  /** 文案里的具名占位符。 */
+  args: Record<string, string>;
+}
+
 /** 剪藏摘要。字段名与 Rust 侧的 `ClipSummary` 一一对应(那边是 camelCase 序列化)。 */
 export interface ClipSummary {
   id: string;
@@ -64,7 +75,7 @@ export interface TrashListing {
  *  所以 `failed` 非空就必须显示出来,不能只报成功那几条。 */
 export interface BatchReport {
   succeeded: string[];
-  failed: Array<{ filename: string; reason: string }>;
+  failed: Array<{ filename: string; reason: WireError }>;
 }
 
 /** 导入结果。两边的文件名**不是一回事**:`report` 里是用户源文件夹里的原名
