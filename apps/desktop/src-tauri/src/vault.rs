@@ -40,6 +40,10 @@ pub enum VaultError {
     AlreadyExists(String),
     #[error("回收站里挤不下了,请自己清一清: {0}")]
     TrashFull(String),
+    /// 标签给多了。**不是"多就截断"而是直接拒**:悄悄丢掉用户敲的第 31 个
+    /// 标签,用户回头找不到,会以为软件把标签吃了。
+    #[error("标签太多了,一篇最多 {0} 个")]
+    TooManyTags(usize),
     /// 导入的目标就是剪藏库自己。**不是故障**——用户点"导入剪藏目录"
     /// 以为能去重,那是个陷阱,反复导库会滚成好几倍。得说清楚为什么不做。
     #[error("这就是剪藏库自己,不用导")]
@@ -108,6 +112,9 @@ impl VaultError {
                 WireError::new("vault.alreadyExists").with("detail", name)
             }
             Self::TrashFull(name) => WireError::new("vault.trashFull").with("detail", name),
+            Self::TooManyTags(limit) => {
+                WireError::new("vault.tooManyTags").with("detail", limit.to_string())
+            }
             Self::ImportSkippedSelf => WireError::new("vault.importSkippedSelf"),
             Self::ImportSkippedDuplicate(title) => WireError::new("vault.importSkippedDuplicate")
                 .with("detail", title),
@@ -234,6 +241,18 @@ pub struct BatchReport {
 /// 导入的结果。两边的文件名**不是一回事**,所以分开两个字段:
 /// `report` 里是用户源文件夹里的原名(报错要指得准),
 /// `imported` 里是落进剪藏库之后的新文件名(图片本地化按它找文件)。
+/// 标签栏上的一项:标签本身 + 有几篇用它。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagCount {
+    pub tag: String,
+    pub count: usize,
+}
+
+/// 一篇剪藏最多几个标签。列表上一行放不下十几个,而真正常用的标签
+/// 一个人也超不过十个——超了基本是在乱敲。
+pub const MAX_TAGS: usize = 20;
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportReport {
@@ -503,6 +522,66 @@ impl Vault {
         out = format!("---{newline}{out}---{newline}{body}");
         write_atomic(&path, out.as_bytes())?;
         Ok(summary_from(fm, filename.to_string()))
+    }
+
+    /// 改一篇的标签。走的是和 `set_flags` 完全一样的路子:只重新序列化
+    /// frontmatter,正文原样拼回去,用户的字段和换行风格都不动。
+    ///
+    /// **入库前先洗一遍标签。** 标签是用户随手敲的,敲个引号进去
+    /// `tags: ["a"b"]`,整个 frontmatter 当场解析不出来,这篇剪藏从此打不开。
+    /// 与其指望用户不敲引号,不如在门口挡住。
+    pub fn set_tags(&self, filename: &str, tags: &[String]) -> Result<ClipSummary, VaultError> {
+        if !slug::is_safe_filename(filename) {
+            return Err(VaultError::UnsafeFilename(filename.to_string()));
+        }
+        let cleaned = clean_tags(tags);
+        if cleaned.len() > MAX_TAGS {
+            return Err(VaultError::TooManyTags(MAX_TAGS));
+        }
+
+        let path = self.clips_dir().join(filename);
+        let original =
+            fs::read_to_string(&path).map_err(|_| VaultError::NotFound(filename.to_string()))?;
+        let (block, body) = frontmatter::split(&original)
+            .ok_or_else(|| VaultError::NotFound(filename.to_string()))?;
+        let newline = if block.contains("\r\n") { "\r\n" } else { "\n" };
+
+        let mut fm = Frontmatter::parse(block);
+        // 顺序不同算不同:用户在界面上把「待读」拖到「重要」前面,
+        // 那是他自己排的序,不该被悄悄按字母重排
+        if fm.tags == cleaned {
+            return Ok(summary_from(fm, filename.to_string()));
+        }
+        fm.tags = cleaned;
+
+        let mut out = fm.render().replace('\n', newline);
+        out = format!("---{newline}{out}---{newline}{body}");
+        write_atomic(&path, out.as_bytes())?;
+        Ok(summary_from(fm, filename.to_string()))
+    }
+
+    /// 标签栏的数据:每个标签 + 有几篇在用,按篇数倒序。
+    ///
+    /// **只算没归档的。** 标签栏是给「还打算看的那些」用的,一堆归档了的
+    /// 老标签混在里面,用户点着点着就以为标签乱了。同名再算一遍会变成
+    /// 「重要 7」而实际只有 3 篇还活着,那比不显示更糟。
+    pub fn tag_index(&self) -> Result<Vec<TagCount>, VaultError> {
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for clip in self.scan()?.clips {
+            if clip.archived {
+                continue;
+            }
+            for tag in clip.tags {
+                *counts.entry(tag).or_insert(0) += 1;
+            }
+        }
+        let mut out: Vec<TagCount> = counts
+            .into_iter()
+            .map(|(tag, count)| TagCount { tag, count })
+            .collect();
+        // 篇数多的在前;一样多时按标签名排,免得每次打开顺序都在跳
+        out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.tag.cmp(&b.tag)));
+        Ok(out)
     }
 
     /// 把整个剪藏库拼成**一个** Markdown 文件。
@@ -1078,6 +1157,30 @@ pub fn summary_from(fm: Frontmatter, filename: String) -> ClipSummary {
         progress: fm.progress,
         tags: fm.tags,
     }
+}
+
+/// 把用户敲的标签洗成能安全存进 frontmatter 的样子。
+///
+/// 洗三样:**首尾空白**(「 rust 」和「rust」在标签栏上是两个标签)、
+/// **重复**(同一个词敲两遍,标签栏上出现两个「待读」)、
+/// **会撑坏 YAML 的字符**(引号、反斜杠、换行、控制字符)。
+///
+/// 空的洗完直接扔掉,不留一个空标签占位置。
+fn clean_tags(tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(tags.len());
+    for raw in tags {
+        let cleaned: String = raw
+            .trim()
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\\' | '\n' | '\r' | '\t') && !c.is_control())
+            .collect();
+        let cleaned = cleaned.trim().to_string();
+        if cleaned.is_empty() || out.contains(&cleaned) {
+            continue;
+        }
+        out.push(cleaned);
+    }
+    out
 }
 
 /// 收集要导入的 `.md`。**只挖一层的子目录**,再深就该让用户自己挑了——
@@ -2769,6 +2872,142 @@ url: https://a.com/1
         let err = v.import_markdown(&v.clips_dir()).unwrap_err();
         assert_eq!(err.wire().code, "vault.importSkippedSelf");
         assert_eq!(v.scan().unwrap().clips.len(), 1, "一篇都不能多出来");
+        drop(dir);
+    }
+
+    // ── 标签 ──
+
+    #[test]
+    fn 改标签只动frontmatter不碰正文() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v
+            .save(&input("https://a.com", "标题", "第一段\n\n第二段"))
+            .unwrap();
+        let path = dir.path().join("clips").join(&saved.filename);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        v.set_tags(&saved.filename, &["rust".into(), "待读".into()])
+            .unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let body_of = |t: &str| {
+            t.split_once("\n\n").map(|(_, b)| b.to_string()).unwrap()
+        };
+        assert_eq!(body_of(&before), body_of(&after), "正文一个字节都不能动");
+        assert!(after.contains("tags: [\"rust\", \"待读\"]"), "实际: {after}");
+        assert_eq!(v.scan().unwrap().clips[0].tags, vec!["rust", "待读"]);
+        drop(dir);
+    }
+
+    /// 值没变就不写盘。改标签会在界面上连点好几下,每次都换掉整个文件
+    /// 会白白吵醒文件监控,也会让用户的硬盘多一笔无意义的元数据变更。
+    #[test]
+    fn 标签没变不重写文件() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com", "标题", "正文")).unwrap();
+        v.set_tags(&saved.filename, &["rust".into()]).unwrap();
+        let path = dir.path().join("clips").join(&saved.filename);
+        let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        v.set_tags(&saved.filename, &["rust".into()]).unwrap();
+
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(stamp, after, "标签没变却动了文件");
+        drop(dir);
+    }
+
+    /// 标签是用户敲的,什么都能敲进来。**带引号或换行的标签存下去会让
+    ///  整个 frontmatter 解析不出来**,那篇剪藏就此打不开——所以入库前
+    ///  必须先洗一遍。
+    #[test]
+    fn 标签里的引号和换行被洗掉() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com", "标题", "正文")).unwrap();
+
+        let updated = v
+            .set_tags(
+                &saved.filename,
+                &["a\"b".into(), "c\nd".into(), "正常".into()],
+            )
+            .unwrap();
+
+        assert_eq!(updated.tags, vec!["ab", "cd", "正常"]);
+        // 洗过之后必须还能原样读回来
+        assert_eq!(v.scan().unwrap().clips[0].tags, vec!["ab", "cd", "正常"]);
+        drop(dir);
+    }
+
+    #[test]
+    fn 标签去重去空白() {
+        let cleaned = clean_tags(&[
+            "  rust  ".into(),
+            "rust".into(),
+            "".into(),
+            "   ".into(),
+            "待读".into(),
+        ]);
+        assert_eq!(cleaned, vec!["rust", "待读"]);
+    }
+
+    /// 标签太多的话,列表上根本排不下,而且多半是在误操作。
+    #[test]
+    fn 标签太多被拒() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com", "标题", "正文")).unwrap();
+        let many: Vec<String> = (0..30).map(|i| format!("t{i}")).collect();
+        assert_eq!(
+            v.set_tags(&saved.filename, &many).unwrap_err().wire().code,
+            "vault.tooManyTags"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn 改标签会校验文件名() {
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        assert_eq!(
+            v.set_tags("../逃逸.md", &["x".into()]).unwrap_err().wire().code,
+            "vault.unsafeFilename"
+        );
+    }
+
+    /// 标签栏要按篇数倒序排,不然用户建的第一个标签永远排最前,
+    /// 后来加的那些(往往是当下真正在用的)要往后面找。
+    #[test]
+    fn 标签清单按篇数倒序() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let a = v.save(&input("https://a.com/1", "甲", "正文")).unwrap();
+        let b = v.save(&input("https://a.com/2", "乙", "正文")).unwrap();
+        let c = v.save(&input("https://a.com/3", "丙", "正文")).unwrap();
+        v.set_tags(&a.filename, &["常用".into(), "少".into()]).unwrap();
+        v.set_tags(&b.filename, &["常用".into()]).unwrap();
+        v.set_tags(&c.filename, &["常用".into()]).unwrap();
+
+        let tags = v.tag_index().unwrap();
+        assert_eq!(tags[0], TagCount { tag: "常用".into(), count: 3 });
+        assert_eq!(tags[1], TagCount { tag: "少".into(), count: 1 });
+        drop(dir);
+    }
+
+    /// 归档和删掉的剪藏不该占着标签栏。标签栏是给「还打算看的那些」用的,
+    /// 一堆已归档的老标签混在里面,用户点着点着就以为标签乱了。
+    #[test]
+    fn 标签栏不含已归档的剪藏() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let a = v.save(&input("https://a.com/1", "甲", "正文")).unwrap();
+        v.save(&input("https://a.com/2", "乙", "正文")).unwrap();
+        v.set_tags(&a.filename, &["活".into()]).unwrap();
+        v.set_flags(&a.filename, None, Some(true)).unwrap();
+
+        assert!(v.tag_index().unwrap().is_empty(), "归档了的不该占标签栏");
         drop(dir);
     }
 }

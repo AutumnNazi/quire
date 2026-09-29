@@ -185,3 +185,30 @@ export function pruneSelection(selected: Selection, visible: string[]): Set<stri
   }
   return next;
 }
+
+/** 标签筛选。**正交于 `selectClips`**——能叠着用:「未读」里只看
+ * 「待读」是最常见的用法,两个筛子各管各的。
+ *
+ *  `tag` 为 `null` 表示没筛,原样返回。**别把空串也当成"没有标签"**:
+ *  空串是用户真敲进去过的标签名,和"不筛"是两回事。 */
+export function selectByTag<T extends { tags: string[] }>(clips: T[], tag: string | null): T[] {
+  if (tag === null) return clips;
+  return clips.filter((c) => c.tags.includes(tag));
+}
+
+/** 界面上敲的标签入库存之前先洗一遍。跟后端 `clean_tags` 同一套规矩,
+ *  但前端也得洗一遍:芯片要立刻长得对,不用等一次 IPC 往返回来才变。
+ *
+ *  **重复的不加。** 加两次同一个标签,标签栏上会出现两个「待读」,
+ *  用户点其中一个只看到一半的文章,还以为是软件按标签筛错了。 */
+export function withTag(current: string[], tag: string): string[] {
+  const trimmed = tag.trim();
+  if (!trimmed || current.includes(trimmed)) return current;
+  return [...current, trimmed];
+}
+
+/** 摘掉一个标签。**一个标签只摘一次**:重名摘光的话,用户只是想改个名,
+ *  结果标签整个没了。 */
+export function withoutTag(current: string[], tag: string): string[] {
+  return current.filter((t) => t !== tag);
+}

@@ -20,8 +20,11 @@ import {
   selectAll,
   selectClips,
   selectRange,
+  selectByTag,
   toggleSelected,
   upsertClip,
+  withTag,
+  withoutTag,
   type ListMode,
   type Selection,
 } from "./list";
@@ -32,6 +35,7 @@ import type {
   SearchHit,
   TrashItem,
   VaultInfo,
+  TagCount,
 } from "./types";
 
 const mount = document.querySelector<HTMLDivElement>("#app");
@@ -76,6 +80,7 @@ root.innerHTML = `
   <main class="split">
     <aside class="list-pane">
       <div class="warn" id="warn" hidden></div>
+      <div class="tag-bar" id="tag-bar" hidden></div>
       <div class="list" id="list"></div>
       <div class="batch-bar" id="batch-bar" hidden>
         <span class="count" id="batch-count"></span>
@@ -110,6 +115,7 @@ const batchBarEl = el<HTMLDivElement>("batch-bar");
 const batchCountEl = el<HTMLSpanElement>("batch-count");
 const detailEl = el<HTMLElement>("detail");
 const warnEl = el<HTMLDivElement>("warn");
+const tagBarEl = el<HTMLDivElement>("tag-bar");
 const vaultPathEl = el<HTMLSpanElement>("vault-path");
 const toastEl = el<HTMLDivElement>("toast");
 const toastTextEl = el<HTMLSpanElement>("toast-text");
@@ -281,17 +287,35 @@ function renderListInner(): void {
     return;
   }
 
-  const shown = selectClips(clips, filter);
+  // 标签筛选跟「全部 / 未读 / 每周 / 归档」是**正交**的:能叠着用,
+  // 「未读」里只看「待读」正是最常见的用法。搜出来的结果不过这道筛——
+  // 搜到了却看不见,用户只会当成搜索坏了
+  const shown = selectByTag(selectClips(clips, filter), tagFilter);
   if (shown.length === 0) {
     const none = document.createElement("div");
     none.className = "empty";
     // 三种空态三种说法。「没有内容」这种话等于让用户以为剪藏丢了。
-    none.innerHTML =
-      filter === "unread"
-        ? `<p class="empty-title">${t("list.unreadEmpty.title")}</p><p>${t("list.unreadEmpty.body")}</p>`
-        : filter === "archived"
-          ? `<p class="empty-title">${t("list.archivedEmpty.title")}</p><p>${t("list.archivedEmpty.body")}</p>`
-          : `<p class="empty-title">${t("list.none.title")}</p>`;
+    if (tagFilter !== null) {
+      // 单独一种说法。这时的空不是"库里没有",是"这一类下暂时没有",
+      // 混进「没有未读了」那种话里,用户会以为剪藏全没了
+      // **走 textContent 不走 innerHTML**:标签是用户自己起的,也可能来自
+      // 导入的 .md,一个 `<img onerror=…>` 塞进去就执行了
+      const title = document.createElement("p");
+      title.className = "empty-title";
+      title.textContent = t("list.tagEmpty.title", { tag: tagFilter });
+      const body = document.createElement("p");
+      body.textContent = t("list.tagEmpty.body");
+      none.replaceChildren(title, body);
+      listEl.append(none);
+      return;
+    } else {
+      none.innerHTML =
+        filter === "unread"
+          ? `<p class="empty-title">${t("list.unreadEmpty.title")}</p><p>${t("list.unreadEmpty.body")}</p>`
+          : filter === "archived"
+            ? `<p class="empty-title">${t("list.archivedEmpty.title")}</p><p>${t("list.archivedEmpty.body")}</p>`
+            : `<p class="empty-title">${t("list.none.title")}</p>`;
+    }
     listEl.append(none);
     return;
   }
@@ -693,9 +717,159 @@ function renderDetail(clip: ClipContent): void {
   syncArchiveButton(clip);
 
   header.append(title, meta, actions);
-  detailEl.append(header, progress, body);
+  detailEl.append(header, progress, tagEditor(clip), body);
   detailEl.scrollTop = 0;
   trackReadingProgress(clip.filename, clip.progress, bar);
+}
+
+/* ── 标签 ── */
+
+/** 当前按哪个标签筛着。`null` = 没筛。跟 `filter` 是**两回事**:
+ *  筛选切的是"库里还有什么",标签筛的是"带这个标签的还有哪些",
+ *  两个是正交的,能叠在一起用(「未读」里只看「待读」)。 */
+let tagFilter: string | null = null;
+/** 标签栏的数据。改了标签、增删了剪藏之后都得重拉,不然标签栏上
+ *  那个数字会一直停在旧值,用户点进去发现对不上。 */
+let tags: TagCount[] = [];
+/** 标签栏最多摆几个。**多出来的折叠成「还有 N 个」**:标签栏横向占位,
+ *  摆满一屏的话列表本身就被挤到看不见了,而列表才是主菜。 */
+const TAG_BAR_LIMIT = 12;
+
+/** 详情页里的标签编辑器。已有的标签是可点的芯片(点了就摘掉),
+ *  底下是一个输入框,敲完回车就加。
+ *
+ *  **加完标签不重画整篇正文**——那会把滚动位置弹回顶部、还要再解析一遍
+ *  Markdown。就地重画这一小块。 */
+function tagEditor(clip: ClipContent): HTMLElement {
+  const box = document.createElement("div");
+  box.className = "tag-editor";
+
+  const chips = document.createElement("div");
+  chips.className = "tag-chips";
+  chips.append(...clip.tags.map((tag) => tagChip(tag, () => void applyTags(clip, withoutTag(clip.tags, tag)))));
+
+  const form = document.createElement("form");
+  form.className = "tag-add";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.placeholder = t("tag.edit.placeholder");
+  input.setAttribute("aria-label", t("tag.edit.add"));
+  const add = document.createElement("button");
+  add.className = "btn";
+  add.type = "submit";
+  add.textContent = t("tag.edit.add");
+  form.append(input, add);
+  form.addEventListener("submit", (e) => {
+    // 不拦住的话回车会把整个详情页刷新掉
+    e.preventDefault();
+    const value = input.value.trim();
+    if (!value) return;
+    input.value = "";
+    void applyTags(clip, withTag(clip.tags, value));
+  });
+
+  const hint = document.createElement("p");
+  hint.className = "tag-hint";
+  hint.textContent = t("tag.edit.hint");
+
+  box.append(chips, form, hint);
+  return box;
+}
+
+function tagChip(tag: string, onRemove: () => void): HTMLButtonElement {
+  const chip = document.createElement("button");
+  chip.className = "tag-chip removable";
+  chip.type = "button";
+  chip.textContent = tag;
+  chip.title = t("tag.edit.remove", { tag });
+  chip.setAttribute("aria-label", t("tag.edit.remove", { tag }));
+  chip.addEventListener("click", onRemove);
+  return chip;
+}
+
+/** 改标签然后把受影响的界面都更新一遍。**失败要说出来**:
+ *  标签没存上而界面显示存上了,用户回头按标签找,那批文章不在,
+ *  他只会觉得标签功能坏了。 */
+async function applyTags(clip: ClipContent, next: string[]): Promise<void> {
+  try {
+    const updated = await api.setClipTags(clip.filename, next);
+    clips = upsertClip(clips, updated);
+    if (hits) {
+      for (const hit of hits) {
+        if (hit.summary.filename === updated.filename) hit.summary = updated;
+      }
+    }
+    if (activeFilename === updated.filename) {
+      // 就地重画编辑器这一块,别碰正文——重画正文会把滚动位置弹回顶部
+      const box = detailEl.querySelector(".tag-editor");
+      if (box) box.replaceWith(tagEditor({ ...clip, tags: updated.tags }));
+    }
+    tags = await api.listTags();
+    renderTagBar();
+    renderList();
+  } catch (err) {
+    showBackendError("error.tagFailed", err);
+  }
+}
+
+/** 列表上方的标签栏。**归档的不算**(后端 `tag_index` 已经滤掉了):
+ *  标签栏是给「还打算看的那些」用的,一堆归档标签混在里面,用户点着
+ *  点着就以为标签乱了。 */
+function renderTagBar(): void {
+  if (!tagBarEl) return;
+  // 回收站里没有标签这回事,摆一条空栏只会让人以为能按标签找删掉的东西
+  tagBarEl.hidden = filter === "trash";
+  if (tagBarEl.hidden) return;
+  // 光有一排圆角小片,没人知道那是干什么的。鼠标停上去和读屏都要说清楚
+  tagBarEl.title = t("tag.bar.title");
+  tagBarEl.setAttribute("aria-label", t("tag.bar.title"));
+
+  if (tags.length === 0) {
+    const none = document.createElement("p");
+    none.className = "tag-bar-empty";
+    none.textContent = t("tag.bar.empty");
+    tagBarEl.replaceChildren(none);
+    return;
+  }
+
+  const shown = tags.slice(0, TAG_BAR_LIMIT);
+  const rest = tags.length - shown.length;
+  tagBarEl.replaceChildren(
+    ...shown.map((item) => {
+      const on = tagFilter === item.tag;
+      const chip = document.createElement("button");
+      chip.className = on ? "tag-chip filter active" : "tag-chip filter";
+      chip.type = "button";
+      chip.setAttribute("aria-pressed", String(on));
+      chip.textContent = item.tag;
+      // 数字比"归档的不算"更说明问题:点了才发现是 0,不如先摆着
+      chip.title = on
+        ? t("tag.filter.active", { tag: item.tag })
+        : t("tag.count", { n: item.count });
+      chip.addEventListener("click", () => {
+        // 再点一下同一个 = 取消筛选。这是最基本的可逆操作,
+        // 找不着出口的话用户会以为标签筛进去就出不来了
+        tagFilter = on ? null : item.tag;
+        renderTagBar();
+        renderList();
+      });
+      return chip;
+    }),
+    ...(rest > 0
+      ? [
+          (() => {
+            const more = document.createElement("span");
+            more.className = "tag-bar-more";
+            more.textContent = t("tag.bar.more", { n: rest });
+            more.title = tags
+              .slice(TAG_BAR_LIMIT)
+              .map((i) => i.tag)
+              .join("、");
+            return more;
+          })(),
+        ]
+      : []),
+  );
 }
 
 /* ── 阅读进度 ── */
@@ -912,6 +1086,17 @@ async function refreshTrash(): Promise<void> {
   trash = (await api.listTrash()).items;
 }
 
+/** 重拉标签栏。**拉不到就清空**:留着上一次的数据等于告诉用户
+ *  「这些标签现在还是这样」,而实际上已经变了——宁可空着让他重新点。 */
+async function refreshTags(): Promise<void> {
+  if (filter === "trash") return;
+  try {
+    tags = await api.listTags();
+  } catch {
+    tags = [];
+  }
+}
+
 /** 存一篇剪藏。返回 `null` 表示存成了,返回文件名表示"已经剪过了"。
  *
  *  判重交给后端做——地址来自剪贴板,前端那份和库里那份没法保证同源。
@@ -1046,6 +1231,7 @@ async function refreshList(): Promise<void> {
     // 回收站开着的时候,库的变化也得让回收站跟着重算一遍——
     // 撤销、别的窗口删东西,都走这条路
     if (filter === "trash") await refreshTrash();
+    await refreshTags();
     renderList();
   } catch (err) {
     showBackendError("error.listFailed", err);
@@ -1093,12 +1279,16 @@ async function setFilter(next: ListMode | "trash"): Promise<void> {
     button.setAttribute("aria-selected", String(on));
   }
   if (next === "trash") {
+    // 回收站里没有标签这回事,带着标签筛选进去的话,出来之后列表是空的,
+    // 用户会以为标签把剪藏弄丢了
+    tagFilter = null;
     try {
       await refreshTrash();
     } catch (err) {
       showBackendError("error.trashUnreadable", err);
     }
   }
+  renderTagBar();
   renderList();
   // 换视图之后原来那篇多半不在新列表里了,详情页得跟着换,
   // 否则会停在一篇"看得见却不在列表中"的文章上
@@ -1493,6 +1683,7 @@ async function boot(): Promise<void> {
 
   await loadVaultInfo();
   await refreshList();
+  renderTagBar();
   renderEmptyDetail();
 }
 

@@ -7,10 +7,13 @@ import {
   pruneSelection,
   reanchorAfterRemoval,
   selectAll,
+  selectByTag,
   selectClips,
   selectRange,
   toggleSelected,
   upsertClip,
+  withTag,
+  withoutTag,
   type ClipLike,
 } from "./list";
 
@@ -285,5 +288,59 @@ describe("多选", () => {
     // 用户对着一堆看不见的条目按删除,那是制造事故
     const next = pruneSelection(new Set(["a", "z"]), list);
     expect([...next]).toEqual(["a"]);
+  });
+});
+
+describe("标签筛选", () => {
+  const clips = [
+    { filename: "a", tags: ["待读", "rust"] },
+    { filename: "b", tags: ["已读"] },
+    { filename: "c", tags: [] },
+  ];
+
+  it("没筛标签时原样返回", () => {
+    expect(selectByTag(clips, null)).toHaveLength(3);
+  });
+
+  it("只留带那个标签的", () => {
+    expect(selectByTag(clips, "待读").map((c) => c.filename)).toEqual(["a"]);
+  });
+
+  it("空标签数组的选不中", () => {
+    // 空串是用户真敲进去过的标签名,不是"没有标签"。混为一谈的话
+    // 用户起了个空标签就会把整库筛空,而他以为自己没在筛
+    expect(selectByTag(clips, "")).toEqual([]);
+  });
+
+  it("没有的标签选出来是空的,不是全部", () => {
+    expect(selectByTag(clips, "压根没有")).toEqual([]);
+  });
+});
+
+describe("增删标签", () => {
+  it("加上去", () => {
+    expect(withTag(["a"], "b")).toEqual(["a", "b"]);
+  });
+
+  it("重复的不加,返回原数组", () => {
+    const before = ["a"];
+    expect(withTag(before, "a")).toBe(before);
+  });
+
+  it("空白的加不进去", () => {
+    expect(withTag(["a"], "   ")).toEqual(["a"]);
+    expect(withTag(["a"], "")).toEqual(["a"]);
+  });
+
+  it("首尾空白先去掉再存", () => {
+    expect(withTag([], "  rust  ")).toEqual(["rust"]);
+  });
+
+  it("摘掉一个", () => {
+    expect(withoutTag(["a", "b", "c"], "b")).toEqual(["a", "c"]);
+  });
+
+  it("摘不存在的标签不动它", () => {
+    expect(withoutTag(["a"], "z")).toEqual(["a"]);
   });
 });

@@ -32,7 +32,7 @@ use search::SearchHit;
 use tauri_plugin_dialog::DialogExt;
 use vault::{
     BatchReport, ClipContent, ClipInput, ClipSummary, ImportReport, SaveOutcome, ScanResult,
-    SharedVault, TrashListing, Vault, WireError,
+    SharedVault, TagCount, TrashListing, Vault, WireError,
 };
 
 /// 剪贴板轮询间隔。开启监控后一直在读剪贴板,太密会白耗 CPU,
@@ -211,6 +211,20 @@ fn set_clip_progress(
     vault
         .set_progress(&filename, progress)
         .map_err(|e| e.wire())
+}
+
+/// 改一篇的标签。走 `set_flags` 同一条落盘路径,只重写 frontmatter。
+#[tauri::command]
+fn set_clip_tags(filename: String, tags: Vec<String>, state: State<AppState>) -> Result<ClipSummary, WireError> {
+    let vault = current_vault(&state)?;
+    vault.set_tags(&filename, &tags).map_err(|e| e.wire())
+}
+
+/// 标签栏的数据:每个标签 + 有几篇在用,按篇数倒序。
+#[tauri::command]
+fn list_tags(state: State<AppState>) -> Result<Vec<TagCount>, WireError> {
+    let vault = current_vault(&state)?;
+    vault.tag_index().map_err(|e| e.wire())
 }
 
 /// 移进回收站。**不真删**——剪藏工具里唯一能把用户东西弄没的操作,
@@ -516,6 +530,8 @@ pub fn run() {
             set_clip_flags,
             import_markdown,
             set_clip_progress,
+            set_clip_tags,
+            list_tags,
             trash_clips,
             set_clip_flags_batch,
             list_trash,

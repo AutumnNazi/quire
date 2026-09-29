@@ -56,6 +56,102 @@ body {
   flex-direction: column;
 }
 
+/* ── 标签 ── */
+
+/* 标签栏。横向排、可以换行,顶在列表上面。**不占工具栏**:
+   工具栏是全局动作,标签是"往哪看",混在一起两边都变挤。 */
+.tag-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tag-bar-empty,
+.tag-bar-more {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.tag-chip {
+  display: inline-block;
+  max-width: 160px;
+  padding: 2px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-sunken);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.6;
+  /* 标签可能很长(CJK 一长,或用户起了个整句),截断比撑破布局强。
+     完整内容在 title 里,鼠标停上去能看到 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.tag-chip.filter,
+.tag-chip.removable {
+  cursor: pointer;
+}
+
+.tag-chip.filter:hover,
+.tag-chip.removable:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.tag-chip.filter.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 详情页里的标签编辑器。**放在正文上面而不是下面**:打标签是读完一篇
+   顺手做的事,放下面的话每次都要滚到底。 */
+.tag-editor {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 4px;
+}
+
+.tag-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tag-add {
+  display: flex;
+  gap: 6px;
+  flex: 1 1 200px;
+}
+
+.tag-add input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+
+.tag-hint {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
 /* ── 工具栏 ── */
 .toolbar {
   display: flex;

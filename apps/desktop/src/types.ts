@@ -78,6 +78,12 @@ export interface BatchReport {
   failed: Array<{ filename: string; reason: WireError }>;
 }
 
+/** 标签栏上的一项。字段名与 Rust 侧 `TagCount` 一致。 */
+export interface TagCount {
+  tag: string;
+  count: number;
+}
+
 /** 导入结果。两边的文件名**不是一回事**:`report` 里是用户源文件夹里的原名
  *  (报错要指得准),`imported` 里是落进剪藏库之后的新文件名。 */
 export interface ImportReport {

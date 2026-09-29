@@ -48,6 +48,9 @@ pub struct SearchHit {
 /// 而不是想读某个长文里提到它的那一段。
 const TITLE_WEIGHT: i64 = 3;
 const BODY_WEIGHT: i64 = 1;
+/// 标签比正文重,比标题轻。用户主动打的标签是明确的意图,
+/// 正文里碰巧出现同一个词可能只是顺带一提。
+const TAG_WEIGHT: i64 = 2;
 
 impl SearchHit {
     pub fn filename(&self) -> &str {
@@ -112,14 +115,20 @@ fn search_dir(dir: &Path, query: &str, limit: usize) -> Result<Vec<SearchHit>, V
         // 这是搜索的主要开销:每个文件原本要转两次小写。
         let body_lower = body.to_lowercase();
         let title_lower = fm.title.to_lowercase();
+        // 标签拼成一份检索文本,和标题正文一样转小写后一起判。
+        // 没有标签的剪藏绝大多数,这条会是空串,`has_token` 对空串直接否
+        let tags_lower = if fm.tags.is_empty() {
+            String::new()
+        } else {
+            fm.tags.join(" ").to_lowercase()
+        };
 
         // 便宜的预筛:词条里只要有一个在原文里压根没出现,这份文档就绝无可能
         // 命中。先用子串查一遍,把绝大多数文件挡在分词之前——不然每次按键都要
         // 把整个库重新切一遍词,输入框会明显发涩。
-        if !wanted
-            .iter()
-            .any(|t| title_lower.contains(*t) || body_lower.contains(*t))
-        {
+        if !wanted.iter().any(|t| {
+            title_lower.contains(*t) || body_lower.contains(*t) || tags_lower.contains(*t)
+        }) {
             continue;
         }
 
@@ -133,6 +142,9 @@ fn search_dir(dir: &Path, query: &str, limit: usize) -> Result<Vec<SearchHit>, V
             }
             if has_token(&body_lower, token) {
                 score += BODY_WEIGHT;
+            }
+            if has_token(&tags_lower, token) {
+                score += TAG_WEIGHT;
             }
         }
         if score == 0 {
@@ -443,6 +455,47 @@ mod tests {
     fn 搜不到就老实返回空() {
         let (_d, v) = vault_with(&[("https://a.com/1", "标题", "正文")]);
         assert!(search(&v, "量子力学", 10).unwrap().is_empty());
+    }
+
+    /// 标签也是能搜的。用户打了「待读」,心里想的是"把待读的那些找出来",
+    /// 不是"找出正文里恰好写了待读两个字的那些"。搜不到标签的话,标签栏
+    /// 就只剩一个筛子,搜框这一半功能是废的。
+    #[test]
+    fn 搜得到标签() {
+        let (dir, v) = vault_with(&[("https://a.com/1", "标题一", "正文一")]);
+        v.set_tags("2026-09-29-1-1-a-com.md", &["待读".into()])
+            .ok();
+        // 文件名带 id,上面那句多半对不上,换个稳的写法重来
+        let _ = dir;
+        let (d2, v2) = vault_with(&[("https://b.com/1", "标题二", "正文二")]);
+        let name = v2.scan().unwrap().clips[0].filename.clone();
+        v2.set_tags(&name, &["待读".into()]).unwrap();
+
+        let hits = search(&v2, "待读", 10).unwrap();
+        assert_eq!(hits.len(), 1, "标签命中了就得出来");
+        assert_eq!(hits[0].summary.title, "标题二");
+        drop(d2);
+    }
+
+    /// **标题和正文里一个字都不许出现那个词**,只有标签上有——不然这条
+    /// 测的就是标题命中,标签压根没参与也照样绿,等于什么都没测。
+    #[test]
+    fn 只标签不标题不正文也能搜到() {
+        let (dir, v) = vault_with(&[("https://c.com/1", "另一篇文章", "完全无关的内容")]);
+        let name = v.scan().unwrap().clips[0].filename.clone();
+        v.set_tags(&name, &["量子".into()]).unwrap();
+
+        // 先确认它真的搜不到——不然下面的断言可能是别的原因过的
+        v.set_tags(&name, &[]).unwrap();
+        assert!(
+            search(&v, "量子", 10).unwrap().is_empty(),
+            "前提:去掉标签之后就该搜不到"
+        );
+
+        v.set_tags(&name, &["量子".into()]).unwrap();
+        let hits = search(&v, "量子", 10).unwrap();
+        assert_eq!(hits.len(), 1, "标题正文都没有,只能靠标签命中");
+        drop(dir);
     }
 
     #[test]

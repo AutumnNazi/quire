@@ -64,7 +64,7 @@ function usedKeys(): Set<string> {
   // 前缀写全了:少写一个,那个命名空间下的键就整体漏扫。
   // **点号后面不许只收 ASCII**——收窄了的话,有人打错一个中文字,
   // 这个键会被整个漏掉,测试照样绿,而运行时界面上只会甩出那串字
-  const key = '"(toolbar|filter|list|clip|trash|detail|toast|confirm|error|watch|batch|lang)\\.[^"]+"';
+  const key = '"(toolbar|filter|list|clip|trash|detail|toast|confirm|error|watch|batch|lang|tag)\\.[^"]+"';
   // 两头的引号是匹配的一部分,键本身不带
   for (const m of main.matchAll(new RegExp(key, "g"))) used.add(m[0].slice(1, -1));
   for (const m of main.matchAll(/data-i18n(?:-html|-title|-aria|-placeholder)?="([^"]+)"/g)) {

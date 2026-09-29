@@ -13,6 +13,7 @@ import type {
   SearchHit,
   TrashListing,
   VaultInfo,
+  TagCount,
 } from "./types";
 
 /**
@@ -40,6 +41,9 @@ export const api = {
   trashClips: (filenames: string[]) => invoke<BatchReport>("trash_clips", { filenames }),
   setClipProgress: (filename: string, progress: number) =>
     invoke<ClipSummary>("set_clip_progress", { filename, progress }),
+  setClipTags: (filename: string, tags: string[]) =>
+    invoke<ClipSummary>("set_clip_tags", { filename, tags }),
+  listTags: () => invoke<TagCount[]>("list_tags"),
   setClipFlagsBatch: (filenames: string[], read?: boolean, archived?: boolean) =>
     invoke<BatchReport>("set_clip_flags_batch", {
       filenames,
