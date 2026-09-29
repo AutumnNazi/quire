@@ -20,6 +20,11 @@ use crate::slug;
 /// 是为了以后放附件、导出包时不跟用户的其他文件混在一起。
 pub const CLIPS_DIR: &str = "clips";
 
+/// 回收站。藏在 clips/ 下面而不是 vault 根部,是因为 `scan()` 只读 clips/ 一层,
+/// 点开头的目录 Obsidian 之类也会自动隐藏——用户平时看不见它,要用的时候找得到。
+/// `scan()` 靠的是"扩展名不是 .md 就跳过",目录天然落选,不需要额外判断。
+pub const TRASH_DIR: &str = ".trash";
+
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
     #[error("读写剪藏文件失败: {0}")]
@@ -32,6 +37,14 @@ pub enum VaultError {
     MissingUrl,
     #[error("剪藏不存在: {0}")]
     NotFound(String),
+    #[error("已经有同名剪藏了,没敢放回去: {0}")]
+    AlreadyExists(String),
+    #[error("回收站里挤不下了,请自己清一清: {0}")]
+    TrashFull(String),
+    /// 文件搬回去了但元数据解析失败。**文件已经回到库里了**——撤销是让用户
+    /// 拿回东西的,不能因为读不出元数据就反悔把它留在回收站里。
+    #[error("剪藏已放回,但读不出元数据: {0}({1})")]
+    Unreadable(String, String),
     /// 内部锁在别的线程 panic 时被毒化。此时 vault 状态不可信,
     /// 宁可直接报错让用户重启,也不要拿着半可信状态继续读写用户的文件。
     #[error("内部状态异常,请重启 Quire")]
@@ -357,6 +370,65 @@ impl Vault {
         Ok(out)
     }
 
+    /// 回收站。**点错了不该找不回来**,这是剪藏工具里唯一一个能把用户东西
+    /// 弄没的操作,所以它不删文件,只搬到 `clips/.trash/`。用户后悔了可以
+    /// 撤销,没撤销也还能自己去剪藏目录里把文件捞出来。
+    pub fn trash_dir(&self) -> PathBuf {
+        self.clips_dir().join(TRASH_DIR)
+    }
+
+    /// 把一篇剪藏移进回收站。文件**搬走**而不是复制,搬完原位置就没了。
+    pub fn trash(&self, filename: &str) -> Result<(), VaultError> {
+        if !slug::is_safe_filename(filename) {
+            return Err(VaultError::UnsafeFilename(filename.to_string()));
+        }
+        let from = self.clips_dir().join(filename);
+        if !from.is_file() {
+            return Err(VaultError::NotFound(filename.to_string()));
+        }
+        fs::create_dir_all(self.trash_dir())?;
+        // 回收站里重名不能覆盖。剪藏文件名是时间+随机 id 撞上的概率极低,
+        // 但"极低"不是"不会"——悄悄覆盖掉用户的东西是最不能忍的一类错。
+        fs::rename(&from, self.free_trash_slot(filename)?)?;
+        Ok(())
+    }
+
+    /// 把回收站里的剪藏放回原位。返回放回去之后的摘要,省得前端再全量扫一次盘。
+    pub fn restore(&self, filename: &str) -> Result<ClipSummary, VaultError> {
+        if !slug::is_safe_filename(filename) {
+            return Err(VaultError::UnsafeFilename(filename.to_string()));
+        }
+        let from = self.trash_dir().join(filename);
+        if !from.is_file() {
+            return Err(VaultError::NotFound(filename.to_string()));
+        }
+        let to = self.clips_dir().join(filename);
+        // 原位已经有同名的(用户手工放回来过),那就别动它,报冲突
+        if to.exists() {
+            return Err(VaultError::AlreadyExists(filename.to_string()));
+        }
+        fs::create_dir_all(self.clips_dir())?;
+        fs::rename(&from, &to)?;
+        read_summary(&to, filename)
+            .map_err(|reason| VaultError::Unreadable(filename.to_string(), reason))
+    }
+
+    /// 在回收站里给 `filename` 找一个没人占的坑位,最多试 100 次。
+    fn free_trash_slot(&self, filename: &str) -> Result<PathBuf, VaultError> {
+        let dir = self.trash_dir();
+        let candidate = dir.join(filename);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+        for n in 1..=100 {
+            let alt = dir.join(format!("{n}-{filename}"));
+            if !alt.exists() {
+                return Ok(alt);
+            }
+        }
+        Err(VaultError::TrashFull(filename.to_string()))
+    }
+
     /// 按文件名取正文。文件名来自前端,必须先过白名单。
     pub fn read_clip(&self, filename: &str) -> Result<ClipContent, VaultError> {
         if !slug::is_safe_filename(filename) {
@@ -473,6 +545,113 @@ mod tests {
         let dir = TempDir::new().expect("建临时目录");
         let v = Vault::new(dir.path());
         (dir, v)
+    }
+
+    #[test]
+    fn 删掉的剪藏从列表里消失但文件还在() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com", "该删的", "正文")).unwrap();
+
+        v.trash(&saved.filename).unwrap();
+
+        assert!(v.scan().unwrap().clips.is_empty(), "列表里不该再出现");
+        assert!(!v.clips_dir().join(&saved.filename).exists(), "原位置不该留着");
+        assert!(v.trash_dir().join(&saved.filename).exists(), "文件应搬到回收站");
+        // 递归数一遍:是"搬走了",不是"复制了一份"
+        assert_eq!(walk_all(v.root()).len(), 1, "vault 里只该剩这一份文件");
+        drop(dir);
+    }
+
+    #[test]
+    fn 撤销能把剪藏放回原位() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com", "后悔了", "正文")).unwrap();
+
+        v.trash(&saved.filename).unwrap();
+        let back = v.restore(&saved.filename).unwrap();
+
+        assert_eq!(back.filename, saved.filename);
+        assert_eq!(back.title, "后悔了");
+        assert_eq!(v.scan().unwrap().clips.len(), 1);
+        assert!(!v.trash_dir().join(&saved.filename).exists());
+        drop(dir);
+    }
+
+    #[test]
+    fn 回收站不会出现在列表里() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let a = v.save(&input("https://a.com", "留着", "正文")).unwrap();
+        let b = v.save(&input("https://b.com", "扔掉", "正文")).unwrap();
+        v.trash(&b.filename).unwrap();
+
+        let names: Vec<String> =
+            v.scan().unwrap().clips.into_iter().map(|c| c.filename).collect();
+        assert_eq!(names, vec![a.filename]);
+        drop(dir);
+    }
+
+    #[test]
+    fn 回收站里重名不会覆盖前一个() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let a = v.save(&input("https://a.com", "第一个", "正文")).unwrap();
+        // 绕过 trash 往回收站塞一个同名文件,模拟"删过一轮、又被手工放回来删第二轮"
+        fs::create_dir_all(v.trash_dir()).unwrap();
+        fs::write(v.trash_dir().join(&a.filename), "占位".as_bytes()).unwrap();
+
+        v.trash(&a.filename).unwrap();
+
+        // 原来那个占位文件必须还在。悄悄覆盖掉用户的东西是最不能忍的一类错
+        assert_eq!(fs::read_to_string(v.trash_dir().join(&a.filename)).unwrap(), "占位");
+        let names: Vec<String> = fs::read_dir(v.trash_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".md"))
+            .collect();
+        assert_eq!(names.len(), 2, "回收站里该有两份,不是一份被覆盖掉");
+        drop(dir);
+    }
+
+    #[test]
+    fn 删除和撤销都挡路径穿越() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        for bad in ["../evil.md", "a/b.md", r"..\evil.md"] {
+            assert!(matches!(v.trash(bad), Err(VaultError::UnsafeFilename(_))), "{bad} 不该被放行");
+            assert!(matches!(v.restore(bad), Err(VaultError::UnsafeFilename(_))), "{bad} 不该被放行");
+        }
+        drop(dir);
+    }
+
+    #[test]
+    fn 删不存在的剪藏要说人话() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let missing = "20260101-aaaaaaaa-none-com.md";
+        assert!(matches!(v.trash(missing), Err(VaultError::NotFound(_))));
+        assert!(matches!(v.restore(missing), Err(VaultError::NotFound(_))));
+        drop(dir);
+    }
+
+    /// 递归数一遍 vault 里有多少个文件,用来证明"搬走了"而不是"复制了一份"。
+    fn walk_all(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&dir) else { continue };
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
     }
 
     #[test]

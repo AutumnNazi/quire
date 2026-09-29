@@ -10,6 +10,8 @@ export interface ClipLike {
   clippedAt: string;
   read: boolean;
   archived: boolean;
+  /** 列表改的是同一个对象的副本,靠它认人。 */
+  filename?: string;
 }
 
 /** 列表的显示模式。
@@ -20,7 +22,9 @@ export interface ClipLike {
 export type ListFilter = "all" | "unread" | "archived";
 export type ListMode = ListFilter | "week";
 
-/** 一周的分组。用 ISO 周,和后端 `weekly_digest` 保持同一套规则。 */
+/** 一周的分组。ISO 周只在这一处实现——后端曾经也有一份 `weekly_digest`,
+ *  结果两边按不同的时区算周,同一篇剪藏在用户换时区后会落到不同的栏里。
+ *  分组是纯展示逻辑,放在前端就够了,不值得为它多一次 IPC 往返。 */
 export interface WeekGroup<T> {
   isoYear: number;
   isoWeek: number;
@@ -90,4 +94,13 @@ export function selectClips<T extends ClipLike>(clips: T[], filter: ListFilter):
     : filter === "archived" ? clips.filter((c) => c.archived)
     : clips;
   return [...kept].sort(byClippedAtDesc);
+}
+
+/** 把一篇剪藏插进列表,同名的替换掉,并保持时间倒序。
+ *
+ *  撤销删除会往列表里放回一篇**旧**剪藏,直接 `clips = [back, ...clips]`
+ *  会把它顶到最前面——顺序该由剪藏时间决定,不由用户刚才按了哪个键决定。 */
+export function upsertClip<T extends ClipLike>(clips: T[], clip: T): T[] {
+  const rest = clips.filter((c) => c.filename !== clip.filename);
+  return [...rest, clip].sort(byClippedAtDesc);
 }

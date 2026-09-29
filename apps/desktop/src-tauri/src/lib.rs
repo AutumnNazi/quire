@@ -126,6 +126,21 @@ fn set_clip_flags(
     vault.set_flags(&filename, read, archived).map_err(|e| e.to_string())
 }
 
+/// 移进回收站。**不真删**——剪藏工具里唯一能把用户东西弄没的操作,
+/// 没必要一按就没。真要清空,用户自己去 `clips/.trash/` 里翻。
+#[tauri::command]
+fn trash_clip(filename: String, state: State<AppState>) -> Result<(), String> {
+    let vault = current_vault(&state)?;
+    vault.trash(&filename).map_err(|e| e.to_string())
+}
+
+/// 从回收站放回原位。
+#[tauri::command]
+fn restore_clip(filename: String, state: State<AppState>) -> Result<ClipSummary, String> {
+    let vault = current_vault(&state)?;
+    vault.restore(&filename).map_err(|e| e.to_string())
+}
+
 /// 把整个剪藏库拼成单个 Markdown,写到用户选的位置。
 ///
 /// 走对话框让用户自己定存哪、叫什么名——导出是用户的动作,
@@ -306,6 +321,8 @@ pub fn run() {
             read_clip,
             search_clips,
             set_clip_flags,
+            trash_clip,
+            restore_clip,
             export_vault,
             capture_clipboard,
             save_clip,

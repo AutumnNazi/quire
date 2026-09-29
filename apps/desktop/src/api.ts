@@ -23,6 +23,9 @@ export const api = {
   // 不能传 null——Rust 侧那边是 Option<bool>,null 过来会变成"没写"以外的乱东西。
   setClipFlags: (filename: string, read?: boolean, archived?: boolean) =>
     invoke<ClipSummary>("set_clip_flags", { filename, read: read ?? null, archived: archived ?? null }),
+  // 移进回收站,不是真删。后端只搬文件,用户不点撤销也还能自己去捞。
+  trashClip: (filename: string) => invoke<void>("trash_clip", { filename }),
+  restoreClip: (filename: string) => invoke<ClipSummary>("restore_clip", { filename }),
   // 返回 null 表示用户在保存对话框点了取消,那不是故障。
   exportVault: () => invoke<string | null>("export_vault"),
   captureClipboard: () => invoke<ClipboardCapture>("capture_clipboard"),

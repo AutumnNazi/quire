@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { groupByWeek, isUnread, isoWeekKey, selectClips, type ClipLike } from "./list";
+import { groupByWeek, isUnread, isoWeekKey, selectClips, upsertClip, type ClipLike } from "./list";
 
-function clip(partial: Partial<ClipLike> & { clippedAt: string }): ClipLike {
-  return { title: "t", read: false, archived: false, ...partial };
+function clip(partial: Partial<ClipLike> & { clippedAt: string; filename?: string }): ClipLike {
+  return { title: "t", read: false, archived: false, filename: partial.filename ?? partial.title, ...partial };
 }
 
 describe("未读判定", () => {
@@ -142,5 +142,31 @@ describe("筛选与排序", () => {
     const before = all.map((c) => c.title);
     selectClips(all, "unread");
     expect(all.map((c) => c.title)).toEqual(before);
+  });
+});
+
+describe("插回列表", () => {
+  const a = clip({ title: "3月3日", clippedAt: "2026-03-03T09:00:00" });
+  const b = clip({ title: "3月1日", clippedAt: "2026-03-01T09:00:00" });
+  const c = clip({ title: "3月2日", clippedAt: "2026-03-02T09:00:00" });
+
+  it("放回来的是旧的也要回到它自己的位置上", () => {
+    // 撤销的时候最容易写成 `clips = [back, ...clips]`,那样删除一篇旧的
+    // 再撤销,它会窜到列表最前面。顺序是剪藏时间,不是操作顺序
+    expect(upsertClip([a, c], b).map((x) => x.title)).toEqual(["3月3日", "3月2日", "3月1日"]);
+  });
+
+  it("已存在的按文件名替换,不会变成两条", () => {
+    const changed = { ...b, title: "改过标题" };
+    const out = upsertClip([a, b, c], changed);
+    // 它还是 3月1日那篇,只换了标题,所以位置不变
+    expect(out.map((x) => x.title)).toEqual(["3月3日", "3月2日", "改过标题"]);
+    expect(out.filter((x) => x.filename === b.filename)).toHaveLength(1);
+  });
+
+  it("不改传进来的数组", () => {
+    const before = [a, c];
+    upsertClip(before, b);
+    expect(before).toHaveLength(2);
   });
 });

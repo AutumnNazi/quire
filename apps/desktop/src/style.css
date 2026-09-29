@@ -9,6 +9,8 @@
   --text-muted: #6b6b66;
   --accent: #2f6f4f;
   --accent-soft: #e8f0ea;
+  --danger: #a33a2e;
+  --danger-soft: #f7e8e6;
   --warn-bg: #fdf3e3;
   --warn-border: #e8c98a;
   --warn-text: #6b4a12;
@@ -27,6 +29,8 @@
     --text-muted: #9a9a93;
     --accent: #7fc8a0;
     --accent-soft: #22322a;
+    --danger: #e08a80;
+    --danger-soft: #3a2422;
     --warn-bg: #33280f;
     --warn-border: #6b5320;
     --warn-text: #e8c98a;
@@ -416,6 +420,16 @@ kbd {
   border-color: var(--accent);
   color: var(--accent);
 }
+
+/* 删除。**平时不抢眼**,默认就长这样,不做成血红的按钮——
+   它只是把文件挪到回收站,不是不可逆操作,真做成危险按钮是在吓用户,
+   吓久了用户就不敢用了,积着的杂剪就永远清不掉。hover 才提个醒。 */
+.btn.danger:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.btn.danger:active { background: var(--danger-soft); }
 
 .prose {
   max-width: 42rem;

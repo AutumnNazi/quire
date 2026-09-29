@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { api } from "./api";
 import type { ClipboardCapture } from "./clipboard";
 import { clipToMarkdown, MARKDOWN_PLACEHOLDER, renderMarkdown } from "./markdown";
-import { groupByWeek, selectClips, type ListMode } from "./list";
+import { groupByWeek, selectClips, upsertClip, type ListMode } from "./list";
 import type { ClipContent, ClipSummary, SearchHit, VaultInfo } from "./types";
 
 const root = document.querySelector<HTMLDivElement>("#app");
@@ -47,10 +47,7 @@ root.innerHTML = `
   </main>
   <div class="toast" id="toast" hidden>
     <span class="toast-text" id="toast-text"></span>
-    <span class="toast-actions" id="toast-actions" hidden>
-      <button class="btn primary" id="toast-save">保存</button>
-      <button class="btn" id="toast-dismiss">忽略</button>
-    </span>
+    <span class="toast-actions" id="toast-actions" hidden></span>
     <button class="btn close" id="toast-close" aria-label="关闭">×</button>
   </div>
 `;
@@ -101,13 +98,29 @@ function clearError(): void {
   warnEl.textContent = "";
 }
 
-function showToast(text: string, withActions: boolean): void {
+interface ToastAction {
+  label: string;
+  primary?: boolean;
+  onClick: () => void;
+}
+
+/** 弹一条提示。带按钮的等用户处理,不自动消失——**按钮消失的那一下,
+ *  用户就还没来得及反应**,剪藏提示、删除撤销都栽在这上面过。 */
+function showToast(text: string, actions: ToastAction[] = []): void {
   if (toastTimer) clearTimeout(toastTimer);
   toastTextEl.textContent = text;
-  toastActionsEl.hidden = !withActions;
+  toastActionsEl.replaceChildren(
+    ...actions.map((action) => {
+      const button = document.createElement("button");
+      button.className = action.primary ? "btn primary" : "btn";
+      button.textContent = action.label;
+      button.addEventListener("click", action.onClick);
+      return button;
+    }),
+  );
+  toastActionsEl.hidden = actions.length === 0;
   toastEl.hidden = false;
-  if (!withActions) {
-    // 纯提示两三秒后自己消失;带按钮的等用户处理,不自动消失
+  if (actions.length === 0) {
     toastTimer = setTimeout(() => {
       toastEl.hidden = true;
     }, 2600);
@@ -304,6 +317,44 @@ async function toggleArchive(clip: ClipContent): Promise<void> {
   }
 }
 
+/** 移到回收站。**不真删**——剪藏工具里唯一能把用户东西弄没的操作,
+ *  没有必要一按就没。真想清空,用户自己去 `clips/.trash/` 里翻,那时候他
+ *  是想清楚了才翻的。 */
+async function trashClip(clip: ClipContent): Promise<void> {
+  const { filename } = clip;
+  try {
+    await api.trashClip(filename);
+    clips = clips.filter((c) => c.filename !== filename);
+    if (hits) hits = hits.filter((h) => h.summary.filename !== filename);
+    if (activeFilename === filename) {
+      activeFilename = null;
+      renderEmptyDetail();
+    }
+    renderList();
+    showToast("已移到回收站", [
+      { label: "撤销", primary: true, onClick: () => void undoTrash(filename) },
+      { label: "关闭", onClick: hideToast },
+    ]);
+  } catch (err) {
+    showError(`删除失败:${String(err)}`);
+  }
+}
+
+async function undoTrash(filename: string): Promise<void> {
+  hideToast();
+  try {
+    const back = await api.restoreClip(filename);
+    // 走 upsert 而不是 `[back, ...clips]`:放回来的是一篇旧剪藏,
+    // 顶到列表最前面的话,撤销一次顺序就乱一次
+    clips = upsertClip(clips, back);
+    renderList();
+    showToast("放回来了");
+  } catch (err) {
+    // 放不回来是真出了岔子,不能当成没事发生——用户会以为东西回来了
+    showError(`撤销失败,文件还在回收站里:${String(err)}`);
+  }
+}
+
 function syncArchiveButton(clip: ClipContent): void {
   if (!archiveBtn) return;
   archiveBtn.textContent = clip.archived ? "取消归档" : "归档";
@@ -365,7 +416,12 @@ function renderDetail(clip: ClipContent): void {
   archive.className = "btn ghost";
   archiveBtn = archive;
   archive.addEventListener("click", () => void toggleArchive(clip));
-  actions.append(archive);
+  const remove = document.createElement("button");
+  remove.className = "btn danger";
+  remove.textContent = "删除";
+  remove.title = "移到回收站,不是真删——放回收站里随时能捞回来";
+  remove.addEventListener("click", () => void trashClip(clip));
+  actions.append(archive, remove);
   syncArchiveButton(clip);
 
   header.append(title, meta, actions);
@@ -424,7 +480,7 @@ async function pasteNow(): Promise<void> {
       return;
     }
     await saveCapture(capture);
-    showToast("已剪藏", false);
+    showToast("已剪藏");
   } catch (err) {
     showError(String(err));
   }
@@ -520,7 +576,7 @@ el<HTMLButtonElement>("btn-export").addEventListener("click", async () => {
   try {
     // 返回 null 是用户在保存对话框点了取消,那不是故障,别弹红字
     const path = await api.exportVault();
-    if (path) showToast("已导出", false);
+    if (path) showToast("已导出");
   } catch (err) {
     showError(`导出失败:${String(err)}`);
   }
@@ -544,7 +600,7 @@ watchEl.addEventListener("change", () => {
     .then((info) => {
       watchEl.checked = info.watching;
       if (info.watching) {
-        showToast("已开启监控:复制文章后会提示保存", false);
+        showToast("已开启监控:复制文章后会提示保存");
       } else {
         hideToast();
       }
@@ -564,19 +620,6 @@ document.addEventListener("keydown", (e) => {
 });
 
 el<HTMLButtonElement>("toast-close").addEventListener("click", hideToast);
-el<HTMLButtonElement>("toast-dismiss").addEventListener("click", hideToast);
-el<HTMLButtonElement>("toast-save").addEventListener("click", () => {
-  if (!pendingCapture) {
-    hideToast();
-    return;
-  }
-  const capture = pendingCapture;
-  hideToast();
-  void saveCapture(capture)
-    .then(() => showToast("已剪藏", false))
-    .catch((err) => showError(String(err)));
-});
-
 async function boot(): Promise<void> {
   // 先挂监听再拉列表。反过来的话,在这两步之间发生的剪藏不会触发任何事件,
   // 用户会看到"扩展显示剪藏成功,列表里却没有"
@@ -586,7 +629,21 @@ async function boot(): Promise<void> {
     pendingCapture = event.payload;
     const preview =
       event.payload.text?.trim().split("\n").find((l) => l.trim())?.slice(0, 40) || "剪贴板内容";
-    showToast(`检测到:${preview}`, true);
+    showToast(`检测到:${preview}`, [
+      {
+        label: "保存",
+        primary: true,
+        onClick: () => {
+          const capture = pendingCapture;
+          hideToast();
+          if (!capture) return;
+          void saveCapture(capture)
+            .then(() => showToast("已剪藏"))
+            .catch((err) => showError(String(err)));
+        },
+      },
+      { label: "忽略", onClick: hideToast },
+    ]);
   });
 
   await loadVaultInfo();
