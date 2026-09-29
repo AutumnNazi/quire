@@ -94,6 +94,32 @@ describe("按周分组", () => {
   });
 });
 
+describe("归档视图", () => {
+  const mixed = [
+    clip({ title: "未读", clippedAt: "2026-03-02T09:00:00" }),
+    clip({ title: "已读", clippedAt: "2026-03-03T09:00:00", read: true }),
+    clip({ title: "已归档", clippedAt: "2026-03-04T09:00:00", archived: true }),
+    clip({ title: "又归档又读了", clippedAt: "2026-03-05T09:00:00", read: true, archived: true }),
+  ];
+
+  it("归档视图只给归档过的", () => {
+    expect(selectClips(mixed, "archived").map((c) => c.title)).toEqual(["又归档又读了", "已归档"]);
+  });
+
+  it("归档和未读是两个互不包含的集合", () => {
+    // 归档过的绝不能出现在未读里,否则「都读完了」这个念头永远达不成
+    const unread = selectClips(mixed, "unread").map((c) => c.title);
+    const archived = selectClips(mixed, "archived").map((c) => c.title);
+    expect(unread).not.toContain("已归档");
+    expect(archived).not.toContain("未读");
+  });
+
+  it("全部视图里归档过的仍在,不会凭空消失", () => {
+    // 归档是「挪到一边」不是「删掉」。用户归档完回头找,必须在全部里还看得见。
+    expect(selectClips(mixed, "all").map((c) => c.title)).toContain("已归档");
+  });
+});
+
 describe("筛选与排序", () => {
   const all = [
     clip({ title: "a", clippedAt: "2026-03-02T09:00:00" }),

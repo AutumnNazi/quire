@@ -17,7 +17,7 @@ export interface ClipLike {
  *  `week` 不是「筛掉一部分」,而是换个排布方式,所以它和 all/unread 不是
  *  同一类东西——`selectClips` 不接它,只由 `groupByWeek` 处理。放进同一个
  *  联合类型里,调用方就得在每个 switch 里补一个永远走不到的分支。 */
-export type ListFilter = "all" | "unread";
+export type ListFilter = "all" | "unread" | "archived";
 export type ListMode = ListFilter | "week";
 
 /** 一周的分组。用 ISO 周,和后端 `weekly_digest` 保持同一套规则。 */
@@ -83,6 +83,11 @@ export function groupByWeek<T extends ClipLike>(clips: T[]): WeekGroup<T>[] {
 
 /** 筛选 + 排序。搜索命中与否不在这里管——那是另一回事,别混进一个函数。 */
 export function selectClips<T extends ClipLike>(clips: T[], filter: ListFilter): T[] {
-  const kept = filter === "unread" ? clips.filter(isUnread) : clips;
+  // 归档是「挪到一边」不是「删掉」,所以必须有个地方能翻回来。
+  // 没有归档视图的话,用户点完归档东西就凭空消失了,那是数据丢失的观感。
+  const kept =
+    filter === "unread" ? clips.filter(isUnread)
+    : filter === "archived" ? clips.filter((c) => c.archived)
+    : clips;
   return [...kept].sort(byClippedAtDesc);
 }

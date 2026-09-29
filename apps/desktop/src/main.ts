@@ -28,6 +28,7 @@ root.innerHTML = `
       <button class="filter active" id="filter-all" role="tab" aria-selected="true">全部</button>
       <button class="filter" id="filter-unread" role="tab" aria-selected="false" title="没读过、也没归档的">未读</button>
       <button class="filter" id="filter-week" role="tab" aria-selected="false" title="按自然周分组,一眼看出这周积了多少">每周</button>
+      <button class="filter" id="filter-archived" role="tab" aria-selected="false" title="归档过的剪藏。归档是挪到一边,不是删掉,随时能翻回来。">归档</button>
     </div>
     <label class="watch-toggle" title="开启后,你在别处复制文章时会自动提示存到 Quire。默认关闭。">
       <input type="checkbox" id="chk-watch" />
@@ -72,12 +73,16 @@ const searchEl = el<HTMLInputElement>("search");
 const filterAllEl = el<HTMLButtonElement>("filter-all");
 const filterUnreadEl = el<HTMLButtonElement>("filter-unread");
 const filterWeekEl = el<HTMLButtonElement>("filter-week");
+const filterArchivedEl = el<HTMLButtonElement>("filter-archived");
 
 let clips: ClipSummary[] = [];
 /** 非空时列表显示的是检索结果,而不是全库。空数组和 null 要分清:
  *  null = 没在搜,空数组 = 搜了但一条没中,两者界面不一样。 */
 let hits: SearchHit[] | null = null;
 let activeFilename: string | null = null;
+/** 当前详情页的归档按钮。归档之后要改它的文案,但重渲染整篇正文
+ *  会把滚动位置弹回顶部、还要再解析一遍 Markdown,所以就地改这一个节点。 */
+let archiveBtn: HTMLButtonElement | null = null;
 /** 当前筛选。搜索和筛选是**两回事**:搜出来的结果不再过筛,否则用户
  *  搜到一篇却看不见,只会当成搜索坏了。 */
 let filter: ListMode = "all";
@@ -162,11 +167,13 @@ function renderList(): void {
   if (shown.length === 0) {
     const none = document.createElement("div");
     none.className = "empty";
-    // 说清楚为什么空:是"还没读"还是"都读完了",差别很大。
-    // 只写"没有内容"的话,用户会以为剪藏丢了。
-    none.innerHTML = filter === "unread"
-      ? `<p class="empty-title">没有未读了</p><p>都读过了。要看全部,点「全部」。</p>`
-      : `<p class="empty-title">没有剪藏</p>`;
+    // 三种空态三种说法。「没有内容」这种话等于让用户以为剪藏丢了。
+    none.innerHTML =
+      filter === "unread"
+        ? `<p class="empty-title">没有未读了</p><p>都读过了。要看全部,点「全部」。</p>`
+        : filter === "archived"
+          ? `<p class="empty-title">还没有归档</p><p>看完不打算再看的,在正文页点「归档」挪到这儿。</p>`
+          : `<p class="empty-title">没有剪藏</p>`;
     listEl.append(none);
     return;
   }
@@ -274,8 +281,42 @@ async function toggleRead(clip: ClipSummary, next: boolean): Promise<void> {
   }
 }
 
+/** 归档/取消归档。归档是「挪到一边」不是「删掉」,所以要有个地方能翻回来——
+ *  列表里的「归档」筛选就是那个地方。放在正文页而不是列表项上,是因为
+ *  「看完了不打算再留」是个读完之后的决定,不是扫一眼列表时顺手做的。 */
+async function toggleArchive(clip: ClipContent): Promise<void> {
+  try {
+    const updated = await api.setClipFlags(clip.filename, undefined, !clip.archived);
+    const i = clips.findIndex((c) => c.filename === clip.filename);
+    if (i >= 0) clips[i] = updated;
+    if (hits) {
+      for (const hit of hits) {
+        if (hit.summary.filename === clip.filename) hit.summary = updated;
+      }
+    }
+    // 详情页手上这份也一起换掉,否则再点一次会拿旧的 archived 取反
+    clip.archived = updated.archived;
+    clip.read = updated.read;
+    syncArchiveButton(clip);
+    renderList();
+  } catch (err) {
+    showError(`${clip.archived ? "取消归档" : "归档"}失败:${String(err)}`);
+  }
+}
+
+function syncArchiveButton(clip: ClipContent): void {
+  if (!archiveBtn) return;
+  archiveBtn.textContent = clip.archived ? "取消归档" : "归档";
+  archiveBtn.classList.toggle("active", clip.archived);
+  archiveBtn.setAttribute("aria-pressed", String(clip.archived));
+  archiveBtn.title = clip.archived
+    ? "放回全部列表"
+    : "看完不打算再看的,挪到「归档」里去";
+}
+
 function renderDetail(clip: ClipContent): void {
   detailEl.replaceChildren();
+  archiveBtn = null;
 
   const header = document.createElement("header");
   header.className = "detail-head";
@@ -318,7 +359,16 @@ function renderDetail(clip: ClipContent): void {
     );
   }
 
-  header.append(title, meta);
+  const actions = document.createElement("div");
+  actions.className = "detail-actions";
+  const archive = document.createElement("button");
+  archive.className = "btn ghost";
+  archiveBtn = archive;
+  archive.addEventListener("click", () => void toggleArchive(clip));
+  actions.append(archive);
+  syncArchiveButton(clip);
+
+  header.append(title, meta, actions);
   detailEl.append(header, body);
   detailEl.scrollTop = 0;
 }
@@ -453,6 +503,7 @@ function setFilter(next: ListMode): void {
     [filterAllEl, "all"],
     [filterUnreadEl, "unread"],
     [filterWeekEl, "week"],
+    [filterArchivedEl, "archived"],
   ] as const) {
     const on = value === next;
     button.classList.toggle("active", on);
@@ -463,6 +514,7 @@ function setFilter(next: ListMode): void {
 filterAllEl.addEventListener("click", () => setFilter("all"));
 filterUnreadEl.addEventListener("click", () => setFilter("unread"));
 filterWeekEl.addEventListener("click", () => setFilter("week"));
+filterArchivedEl.addEventListener("click", () => setFilter("archived"));
 
 el<HTMLButtonElement>("btn-export").addEventListener("click", async () => {
   try {

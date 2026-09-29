@@ -61,6 +61,9 @@ body {
   border-bottom: 1px solid var(--border);
   background: var(--bg-raised);
   flex: none;
+  /* 中文没有词边界,一被压窄就整个词竖着断成两行(「归档」变成上下两个「归」「档」)。
+     宁可让搜索框先缩,也不能让按钮变形。 */
+  white-space: nowrap;
 }
 
 .brand {
@@ -86,6 +89,7 @@ body {
   font: inherit;
   font-size: 12.5px;
   padding: 5px 11px;
+  flex: none;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg);
@@ -179,10 +183,14 @@ kbd {
 }
 
 /* ── 搜索框 ── */
+/* 工具栏里唯一允许被压缩的:窗口窄了就先委屈搜索框,
+   按钮和筛选标签保持原尺寸,不然中文标签会断成两行 */
 .search {
   font: inherit;
   font-size: 12.5px;
   width: 220px;
+  flex: 0 1 auto;
+  min-width: 96px;
   max-width: 26vw;
   padding: 5px 10px;
   border: 1px solid var(--border);
@@ -193,10 +201,11 @@ kbd {
 
 .search::placeholder { color: var(--text-muted); }
 
-/* 全部 / 未读 / 每周。做成一组小标签而不是下拉框:这三个选项互斥、
+/* 全部 / 未读 / 每周 / 归档。做成一组小标签而不是下拉框:这几个选项互斥、
    都很常用,藏进下拉就等于每次都多点一次。 */
 .filters {
   display: flex;
+  flex: none;
   gap: 2px;
   padding: 2px;
   background: var(--bg-sunken);
@@ -392,6 +401,21 @@ kbd {
 
 .detail-meta a { color: var(--accent); text-decoration: none; }
 .detail-meta a:hover { text-decoration: underline; }
+
+/* 详情头部的操作区。贴着标题右上角,读完之后伸手就够得着 */
+.detail-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+/* 归档是状态而不是命令:按下去之后按钮要保持"已归档"的选中态,
+   否则归档完一刷新视觉上就跟没点过一样 */
+.btn.ghost.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
 
 .prose {
   max-width: 42rem;
