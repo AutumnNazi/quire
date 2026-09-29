@@ -9,6 +9,8 @@ export interface ClipSummary {
   clippedAt: string;
   read: boolean;
   archived: boolean;
+  /** 读到哪儿了,0–1。没写过就是 0。 */
+  progress: number;
   tags: string[];
 }
 
@@ -63,4 +65,11 @@ export interface TrashListing {
 export interface BatchReport {
   succeeded: string[];
   failed: Array<{ filename: string; reason: string }>;
+}
+
+/** 导入结果。两边的文件名**不是一回事**:`report` 里是用户源文件夹里的原名
+ *  (报错要指得准),`imported` 里是落进剪藏库之后的新文件名。 */
+export interface ImportReport {
+  report: BatchReport;
+  imported: string[];
 }

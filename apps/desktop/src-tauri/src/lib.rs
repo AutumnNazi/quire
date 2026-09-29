@@ -31,8 +31,8 @@ use clipboard::ClipboardCapture;
 use search::SearchHit;
 use tauri_plugin_dialog::DialogExt;
 use vault::{
-    BatchReport, ClipContent, ClipInput, ClipSummary, SaveOutcome, ScanResult, SharedVault,
-    TrashListing, Vault,
+    BatchReport, ClipContent, ClipInput, ClipSummary, ImportReport, SaveOutcome, ScanResult,
+    SharedVault, TrashListing, Vault,
 };
 
 /// 剪贴板轮询间隔。开启监控后一直在读剪贴板,太密会白耗 CPU,
@@ -152,6 +152,64 @@ fn set_clip_flags(
     let vault = current_vault(&state)?;
     vault
         .set_flags(&filename, read, archived)
+        .map_err(|e| e.to_string())
+}
+
+/// 导入一个文件夹里的 Markdown。**只读源目录**,源文件一个字节都不动。
+///
+/// 已经在库里的同一篇会被跳过并报出来——用户导进一个存过一堆旧文的文件夹,
+/// 里面有一半是重复的,那是正常情况,不是失败。
+#[tauri::command]
+async fn import_markdown(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ImportReport, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.dialog().file().pick_folder(move |picked| {
+        let _ = tx.send(picked);
+    });
+    // recv 会一直阻塞到用户做出选择,而这是 async 命令:直接调会占死 worker
+    // 线程,单线程 runtime 下就是彻底死锁
+    let received = tauri::async_runtime::spawn_blocking(move || rx.recv())
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|_| "选择器没有返回结果".to_string())?;
+    let Some(picked) = received else {
+        return Err("已取消".to_string());
+    };
+    let path = picked.into_path().map_err(|e| e.to_string())?;
+
+    // 一次可能导几百篇,读文件和写盘都不轻。挡在命令前面的话界面会假死
+    let vault = current_vault(&state)?;
+    let importer = vault.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || importer.import_markdown(&path))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+
+    // 导入的剪藏也得把图下到本地,否则它们会永远指着原站。
+    // **Quire 说自己剪藏时会存图,导入也是剪藏**,不存的话这批文章就成了一
+    // 个洞:平时看不出问题,等原站关站那天,这批文章一起烂掉。
+    // 逐篇 spawn,不排队:一次导 500 篇排着下的话,天都亮了
+    for filename in &result.imported {
+        spawn_image_localization(app.clone(), vault.clone(), filename.clone());
+    }
+    Ok(result)
+}
+
+/// 记读到哪儿了。**读的位置是用户的数据**,所以它和 read / archived 走同一条
+/// 落盘路径:只重新序列化 frontmatter,正文一个字节都不动。
+#[tauri::command]
+fn set_clip_progress(
+    filename: String,
+    progress: f32,
+    state: State<AppState>,
+) -> Result<ClipSummary, String> {
+    let vault = current_vault(&state)?;
+    vault
+        .set_progress(&filename, progress)
         .map_err(|e| e.to_string())
 }
 
@@ -455,6 +513,8 @@ pub fn run() {
             read_clip,
             search_clips,
             set_clip_flags,
+            import_markdown,
+            set_clip_progress,
             trash_clips,
             set_clip_flags_batch,
             list_trash,

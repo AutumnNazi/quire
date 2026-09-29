@@ -39,6 +39,10 @@ pub enum VaultError {
     AlreadyExists(String),
     #[error("回收站里挤不下了,请自己清一清: {0}")]
     TrashFull(String),
+    /// 导入时这一篇被跳过了。**不是故障**——用户导进一个存过一堆旧文的
+    /// 文件夹,里面有一半是重复的,那是正常情况。但理由要说给用户听。
+    #[error("已跳过:{0}")]
+    ImportSkipped(String),
     /// 文件搬回去了但元数据解析失败。**文件已经回到库里了**——撤销是让用户
     /// 拿回东西的,不能因为读不出元数据就反悔把它留在回收站里。
     #[error("剪藏已放回,但读不出元数据: {0}({1})")]
@@ -85,6 +89,8 @@ pub struct ClipSummary {
     pub clipped_at: String,
     pub read: bool,
     pub archived: bool,
+    /// 读到哪儿了,0.0–1.0。没写过就是 0.0。
+    pub progress: f32,
     pub tags: Vec<String>,
 }
 
@@ -157,6 +163,16 @@ pub struct TrashListing {
 pub struct BatchReport {
     pub succeeded: Vec<String>,
     pub failed: Vec<PurgeFailure>,
+}
+
+/// 导入的结果。两边的文件名**不是一回事**,所以分开两个字段:
+/// `report` 里是用户源文件夹里的原名(报错要指得准),
+/// `imported` 里是落进剪藏库之后的新文件名(图片本地化按它找文件)。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportReport {
+    pub report: BatchReport,
+    pub imported: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -249,6 +265,7 @@ impl Vault {
             tags: Vec::new(),
             read: false,
             archived: false,
+            progress: 0.0,
             extra: Default::default(),
         };
 
@@ -377,6 +394,46 @@ impl Vault {
         out = format!("---{newline}{out}---{newline}{body}");
         write_atomic(&path, out.as_bytes())?;
 
+        Ok(summary_from(fm, filename.to_string()))
+    }
+
+    /// 记读到哪儿了。
+    ///
+    /// 走的是和 `set_flags` 完全一样的路子:只重新序列化 frontmatter,
+    /// 正文原样拼回去,用户的字段和换行风格都不动。
+    ///
+    /// **闸是"值没变就不写",不是"值是 0 就不写"。** 进度是滚动条给的,
+    /// 每抖一下都来一次,差不到一个百分点直接返回。用户什么都不干的时候
+    /// 文件的 mtime 不该被刷成一片,那既是磁盘写入也是无意义的元数据变更
+    /// (还会把文件监控自己吵醒)。
+    ///
+    /// 反过来,滚回顶部(0)是**真的位置变化**,得记下来:用户重新打开一篇
+    /// 读了一半的文章又从头看,那"读到哪儿"的答案就该是开头。
+    pub fn set_progress(&self, filename: &str, progress: f32) -> Result<ClipSummary, VaultError> {
+        if !slug::is_safe_filename(filename) {
+            return Err(VaultError::UnsafeFilename(filename.to_string()));
+        }
+        let clamped = if progress.is_finite() {
+            progress.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let path = self.clips_dir().join(filename);
+        let original =
+            fs::read_to_string(&path).map_err(|_| VaultError::NotFound(filename.to_string()))?;
+        let (block, body) = frontmatter::split(&original)
+            .ok_or_else(|| VaultError::NotFound(filename.to_string()))?;
+        let newline = if block.contains("\r\n") { "\r\n" } else { "\n" };
+        let mut fm = Frontmatter::parse(block);
+        if (fm.progress - clamped).abs() < 0.01 {
+            return Ok(summary_from(fm, filename.to_string()));
+        }
+        fm.progress = clamped;
+
+        let mut out = fm.render().replace('\n', newline);
+        out = format!("---{newline}{out}---{newline}{body}");
+        write_atomic(&path, out.as_bytes())?;
         Ok(summary_from(fm, filename.to_string()))
     }
 
@@ -642,6 +699,116 @@ impl Vault {
         Ok(TrashListing { items })
     }
 
+    /// 导入一个文件夹里的 Markdown。
+    ///
+    /// **只读源目录,一个字节都不写回去。** 源文件夹是用户的,Quire 在这一步
+    /// 只是个读者;写坏了就是毁了用户的东西。
+    ///
+    /// 两种源文件都认:
+    /// - 带 Quire frontmatter 的,字段照搬,但 **id 和文件名重新发**——
+    ///   同一个 id 库里只能有一个,沿用旧 id 等于第二篇盖掉第一篇;
+    /// - 没有 frontmatter 的,当普通 Markdown 笔记:一级标题当标题,
+    ///   没有标题就取第一行。这不是"坏文件",是最常见的一种。
+    ///
+    /// 已经在库里的同一篇(按地址判重)会跳过并报出来,不当失败处理——
+    /// 用户导入的文件夹里有一堆自己以前存过的东西,那是正常情况。
+    pub fn import_markdown(&self, dir: &Path) -> Result<ImportReport, VaultError> {
+        // 剪藏库自己不能往自己里导。看着像功能,其实是个陷阱:用户点了"导入
+        // 剪藏目录"以为能去重,实际得到一堆换了新 id 的副本,原来的还在原地。
+        // 更糟的是对着同一个目录反复导,库会越滚越大
+        if dir == self.clips_dir() || dir.starts_with(self.clips_dir()) {
+            return Err(VaultError::ImportSkipped("这就是剪藏库自己,不用导".into()));
+        }
+        let mut report = BatchReport::default();
+        let mut imported = Vec::new();
+        for path in collect_markdown(dir) {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("(未命名)")
+                .to_string();
+            // 报告里用的是**源文件名**——用户看的是自己那个文件夹里的东西,
+            // 给他一串带 id 的新文件名等于没说
+            match self.import_one(&path) {
+                Ok(clip) => {
+                    report.succeeded.push(name);
+                    imported.push(clip.filename);
+                }
+                Err(e) => report.failed.push(PurgeFailure {
+                    filename: name,
+                    reason: e.to_string(),
+                }),
+            }
+        }
+        Ok(ImportReport { report, imported })
+    }
+
+    fn import_one(&self, path: &Path) -> Result<ClipSummary, VaultError> {
+        let original =
+            fs::read_to_string(path).map_err(|e| VaultError::Io(std::io::Error::other(e)))?;
+        let parsed = match frontmatter::split(&original) {
+            // 有 frontmatter 就照单全收,**哪怕里面没有 id**。从 Obsidian 搬过来
+            // 的笔记、别的工具导出的文件都长这样:带着自己的一套字段,就是没有
+            // Quire 的 id。为这个拒收,等于把最常见的导入场景堵死——id 下面
+            // 统一重发就是了
+            Some((block, body)) => (Frontmatter::parse(block), body.trim_start().to_string()),
+            None => (Frontmatter::default(), original.trim().to_string()),
+        };
+        let (mut fm, body) = parsed;
+        if body.trim().is_empty() {
+            return Err(VaultError::EmptyContent);
+        }
+
+        // 地址判重。没地址的笔记不参与判重:两段不相干的话地址都是空的,
+        // 拿空串去比对就是"第二段永远导不进来"
+        if !fm.url.trim().is_empty() {
+            if let Some(existing) = self.find_by_url(&fm.url)? {
+                return Err(VaultError::ImportSkipped(format!(
+                    "已经在库里了:{}",
+                    existing.title
+                )));
+            }
+        }
+
+        let now = Local::now();
+        let id = fresh_id();
+        let date = ids::date_prefix(now.year(), now.month(), now.day());
+        let host = slug::host_of(fm.url.trim());
+        // 文件名按新 id 重新生成,不可能和库里撞上;真撞上了(同一毫秒同随机)
+        // 也不能覆盖,那是最不能忍的一类错
+        let mut filename = slug::filename_for(&date, &id, &host);
+        let mut n = 1;
+        while self.clips_dir().join(&filename).exists() {
+            filename = format!("{date}-{id}-{n}-{}.md", slug::site_slug(&host));
+            n += 1;
+        }
+
+        fm.id = id;
+        fm.clipped_at = if fm.clipped_at.trim().is_empty() {
+            now.to_rfc3339_opts(SecondsFormat::Secs, false)
+        } else {
+            fm.clipped_at
+        };
+        if fm.title.trim().is_empty() {
+            fm.title = heading_or_first_line(&body);
+        }
+        if fm.site.trim().is_empty() {
+            // 源文件没写站点就别空着:列表里空站点那一行看着像程序坏了
+            fm.site = if host.is_empty() {
+                "导入".to_string()
+            } else {
+                host
+            };
+        }
+        if fm.excerpt.as_deref().is_none_or(|e| e.trim().is_empty()) {
+            fm.excerpt = first_paragraph(&body);
+        }
+
+        let target = self.clips_dir().join(&filename);
+        write_atomic(&target, fm.to_markdown(&body).as_bytes())?;
+        Ok(summary_from(fm, filename))
+    }
+
     /// 彻底删除一篇。**这条路没有撤销**,所以只能作用于回收站里的文件。
     pub fn purge(&self, filename: &str) -> Result<(), VaultError> {
         if !slug::is_safe_filename(filename) {
@@ -843,8 +1010,82 @@ pub fn summary_from(fm: Frontmatter, filename: String) -> ClipSummary {
         clipped_at: fm.clipped_at,
         read: fm.read,
         archived: fm.archived,
+        progress: fm.progress,
         tags: fm.tags,
     }
+}
+
+/// 收集要导入的 `.md`。**只挖一层的子目录**,再深就该让用户自己挑了——
+/// 点一次导入把整个网盘同步目录扫一遍,那不是导入,那是接管用户硬盘。
+/// 点开头的目录一律跳过:`.git`、`.obsidian` 这些不是笔记。
+fn collect_markdown(dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                if depth > 0 {
+                    walk(&path, depth - 1, out);
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, 1, &mut out);
+    // 按文件名排,报错顺序才稳定,用户第二次导入看到的清单和第一次一样
+    out.sort();
+    out
+}
+
+/// 导入用的标题:先找一级标题,没有就取第一行非空内容。
+/// 去掉行首的 `#` 和空白,剩下的就是用户在笔记里写的那个标题。
+fn heading_or_first_line(body: &str) -> String {
+    for line in body.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let t = t.trim_start_matches('#').trim();
+        if !t.is_empty() {
+            return t.chars().take(80).collect();
+        }
+    }
+    String::new()
+}
+
+/// 导入用的摘要:第一段不是标题、不是代码、不是引用的文字。
+/// 复用不了 `excerpt_of`(那是前端的),后端这边只需要一个够用的版本。
+fn first_paragraph(body: &str) -> Option<String> {
+    let block = body
+        .split(
+            "
+
+",
+        )
+        .map(|b| b.trim())
+        .find(|b| !b.is_empty() && !b.starts_with(['#', '>', '|', '-', '*', '`', '[']));
+    let text = block?
+        .replace("![", " ![")
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.chars().take(120).collect())
 }
 
 fn read_summary(path: &Path, filename: &str) -> Result<ClipSummary, String> {
@@ -2066,5 +2307,391 @@ mod tests {
         );
         assert_eq!(report.failed.len(), 1);
         assert!(v.scan().unwrap().clips.is_empty());
+    }
+    #[test]
+    fn 进度能存能读回来() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com", "长文", "正文")).unwrap();
+
+        v.set_progress(&saved.filename, 0.37).unwrap();
+
+        let back = v.read_clip(&saved.filename).unwrap().summary;
+        assert!((back.progress - 0.37).abs() < 1e-6);
+        assert!(
+            v.scan().unwrap().clips[0].progress > 0.0,
+            "列表里也得看得到"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn 存进度不碰正文也不碰别的字段() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let nl = "\n\n";
+        let saved = v
+            .save(&input(
+                "https://a.com",
+                "标题",
+                &format!("第一段{nl}第二段"),
+            ))
+            .unwrap();
+        let path = dir.path().join("clips").join(&saved.filename);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let body_of = |t: &str| t.split_once(nl).map(|(_, b)| b.to_string()).unwrap();
+
+        v.set_progress(&saved.filename, 0.5).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body_of(&before), body_of(&after), "正文一个字节都不能动");
+        assert!(after.contains("title: \"标题\""));
+        assert!(after.contains("progress: 0.50"));
+        drop(dir);
+    }
+
+    #[test]
+    fn 进度钳在零到一之间() {
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com", "标题", "正文")).unwrap();
+
+        v.set_progress(&saved.filename, 5.0).unwrap();
+        assert_eq!(v.read_clip(&saved.filename).unwrap().summary.progress, 1.0);
+        v.set_progress(&saved.filename, -3.0).unwrap();
+        assert_eq!(v.read_clip(&saved.filename).unwrap().summary.progress, 0.0);
+    }
+
+    #[test]
+    fn 没动过就不该动文件() {
+        // 滚动一次写一次的话,用户什么都不干也会把 mtime 刷成一片
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com", "标题", "正文")).unwrap();
+        let path = dir.path().join("clips").join(&saved.filename);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        v.set_progress(&saved.filename, 0.0).unwrap();
+        v.set_progress(&saved.filename, 0.0).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "零进度不该触发写盘"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn 进度差不到一个百分点就不重写() {
+        // 内容上看不出差别——`{:.2}` 格式化之后 0.500 和 0.501 落盘都是 0.50。
+        // 但 `write_atomic` 是"写临时文件再改名",文件会被整个换掉:mtime 变了,
+        // **文件监控也会被吵醒**,于是"用户只是在滚动"变成一串列表刷新。
+        // 所以只能看 mtime。
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com", "标题", "正文")).unwrap();
+        let path = dir.path().join("clips").join(&saved.filename);
+        v.set_progress(&saved.filename, 0.500).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        v.set_progress(&saved.filename, 0.501).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "肉眼看不出的差别不该重写文件"
+        );
+
+        v.set_progress(&saved.filename, 0.60).unwrap();
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "真的动了就该写下去"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn 进度存不了要报错不能装作存上了() {
+        // 静默返回"存好了"是最不能忍的一类错:界面会说进度记下了,下次打开
+        // 还是从头开始,用户根本不会想到是软件没存
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        assert!(matches!(
+            v.set_progress("2026-09-29-missing-example-com.md", 0.5)
+                .unwrap_err(),
+            VaultError::NotFound(_)
+        ));
+        assert!(matches!(
+            v.set_progress("../../.ssh/id_rsa.md", 0.5).unwrap_err(),
+            VaultError::UnsafeFilename(_)
+        ));
+    }
+    /* ── 导入文件夹里的 .md ── */
+
+    #[test]
+    fn 导入认得Quire格式的文件() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let src = TempDir::new().unwrap();
+        let file = src.path().join("旧剪藏.md");
+        std::fs::write(
+            &file,
+            "---
+id: \"old1\"
+title: \"之前存的那篇\"
+url: https://old.example.com/p
+             site: old.example.com
+excerpt: \"一段摘要\"
+author: \"老王\"
+             clipped_at: 2025-06-01T10:00:00+08:00
+---
+
+正文还在。
+",
+        )
+        .unwrap();
+
+        let report = v.import_markdown(src.path()).unwrap().report;
+        assert_eq!(report.succeeded.len(), 1, "报告: {:?}", report);
+        let imported = v.scan().unwrap().clips;
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].title, "之前存的那篇");
+        assert_eq!(imported[0].url, "https://old.example.com/p");
+        assert_eq!(imported[0].excerpt.as_deref(), Some("一段摘要"));
+        drop(dir);
+    }
+
+    #[test]
+    fn 导入给旧文件换个新的id和文件名() {
+        // 同一个 id 在库里只能有一个。两份都叫 `2025-06-01-old1-x.md` 的话,
+        // 第二篇会直接盖掉第一篇——那是**静默丢数据**
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let src = TempDir::new().unwrap();
+        // 两篇带着**同一个旧 id**,但地址不同——测的是 id 撞车那条路
+        std::fs::write(
+            src.path().join("甲.md"),
+            "---
+id: \"same\"
+title: \"甲\"
+url: https://a.com/1
+---
+
+正文甲
+",
+        )
+        .unwrap();
+        std::fs::write(
+            src.path().join("乙.md"),
+            "---
+id: \"same\"
+title: \"乙\"
+url: https://b.com/2
+---
+
+正文乙
+",
+        )
+        .unwrap();
+
+        let report = v.import_markdown(src.path()).unwrap().report;
+        assert!(
+            report.failed.is_empty(),
+            "两篇地址不同,不该有失败: {:?}",
+            report
+        );
+
+        let clips = v.scan().unwrap().clips;
+        assert_eq!(clips.len(), 2, "两篇都得在");
+        assert_ne!(clips[0].filename, clips[1].filename);
+        let ids: std::collections::HashSet<&String> = clips.iter().map(|c| &c.id).collect();
+        assert_eq!(ids.len(), 2, "id 也得重新发");
+        drop(dir);
+    }
+
+    #[test]
+    fn 没有frontmatter的当纯文本导入() {
+        // 用户从别处搬过来的笔记多半没有 frontmatter。那种文件不是"坏文件",
+        // 是**正常的一种**——直接拒掉等于把最常见的导入场景堵死
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let src = TempDir::new().unwrap();
+        std::fs::write(
+            src.path().join("读书笔记.md"),
+            "# 深入理解所有权
+
+所有权是 Rust 的核心。
+",
+        )
+        .unwrap();
+
+        v.import_markdown(src.path()).unwrap();
+
+        let clip = v.scan().unwrap().clips.into_iter().next().unwrap();
+        assert_eq!(clip.title, "深入理解所有权", "拿一级标题当标题");
+        assert_eq!(clip.url, "", "没有地址就老实空着,别编一个");
+        assert_eq!(clip.site, "导入");
+        let content = v.read_clip(&clip.filename).unwrap();
+        assert!(content.body.contains("所有权是 Rust 的核心"));
+        drop(dir);
+    }
+
+    #[test]
+    fn 纯文本实在抽不出标题就用第一行() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let src = TempDir::new().unwrap();
+        std::fs::write(
+            src.path().join("随手.md"),
+            "
+
+今天想到一个点子
+
+展开说说。
+",
+        )
+        .unwrap();
+
+        v.import_markdown(src.path()).unwrap();
+
+        let clip = v.scan().unwrap().clips.into_iter().next().unwrap();
+        assert_eq!(clip.title, "今天想到一个点子");
+        drop(dir);
+    }
+
+    #[test]
+    fn 库里已经有的同一篇不重复导入() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        v.save(&input("https://a.com/post", "已经在库里", "正文"))
+            .unwrap();
+        let src = TempDir::new().unwrap();
+        std::fs::write(
+            src.path().join("又来了.md"),
+            "---
+title: \"又是这篇\"
+url: https://a.com/post
+---
+
+正文
+",
+        )
+        .unwrap();
+
+        let report = v.import_markdown(src.path()).unwrap().report;
+        assert!(report.succeeded.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert!(
+            report.failed[0].reason.contains("已经在库里"),
+            "原因要说人话:{}",
+            report.failed[0].reason
+        );
+        assert_eq!(v.scan().unwrap().clips.len(), 1);
+        drop(dir);
+    }
+
+    #[test]
+    fn 导入的源文件一个字都不能动() {
+        // 源文件夹是用户的,Quire 只是读者。写坏了就是**毁了用户的东西**
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let src = TempDir::new().unwrap();
+        let raw = "---
+id: \"x\"
+title: \"原文\"
+url: https://a.com/1
+---
+
+原始正文
+";
+        let file = src.path().join("原文.md");
+        std::fs::write(&file, raw).unwrap();
+
+        v.import_markdown(src.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            raw,
+            "源文件必须原封不动"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn 空的和读不出来的会报出来不假装成功() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let src = TempDir::new().unwrap();
+        std::fs::write(
+            src.path().join("空的.md"),
+            "   
+
+  
+",
+        )
+        .unwrap();
+        std::fs::write(src.path().join("非UTF8.md"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+        let report = v.import_markdown(src.path()).unwrap().report;
+        assert!(report.succeeded.is_empty());
+        assert_eq!(report.failed.len(), 2, "两个都得报出来: {:?}", report);
+        drop(dir);
+    }
+
+    #[test]
+    fn 非md文件不当剪藏() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let src = TempDir::new().unwrap();
+        std::fs::write(src.path().join("笔记.txt"), "这是一段笔记").unwrap();
+        std::fs::write(
+            src.path().join("该读.md"),
+            "该读的一篇
+",
+        )
+        .unwrap();
+
+        let report = v.import_markdown(src.path()).unwrap().report;
+        assert_eq!(report.succeeded.len(), 1);
+        assert!(report.failed.is_empty(), "不是 .md 的直接跳过,不算失败");
+        drop(dir);
+    }
+
+    #[test]
+    fn 子目录里的也导进来() {
+        // 用户的笔记不会都摊在一个文件夹里。挖一层的 dot 目录就够了——
+        // 再深就该让用户自己挑子目录了
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let src = TempDir::new().unwrap();
+        std::fs::create_dir_all(src.path().join("子目录")).unwrap();
+        std::fs::write(
+            src.path().join("子目录").join("里面的.md"),
+            "里面的笔记
+",
+        )
+        .unwrap();
+
+        let report = v.import_markdown(src.path()).unwrap().report;
+        assert_eq!(report.succeeded.len(), 1, "报告: {:?}", report);
+        drop(dir);
+    }
+
+    #[test]
+    fn 导不进剪藏库自己的目录() {
+        // 把剪藏库导进自己看着像功能,其实是个陷阱:用户以为能去重,
+        // 实际得到一堆换了新 id 的副本,原来的还在原地。反复导几次,
+        // 库就滚成两倍三倍了
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        v.save(&input("https://a.com/1", "标题", "正文")).unwrap();
+        assert_eq!(v.scan().unwrap().clips.len(), 1, "前提:库里确实有东西");
+
+        let err = v.import_markdown(&v.clips_dir()).unwrap_err();
+        assert!(matches!(err, VaultError::ImportSkipped(_)), "实际: {err}");
+        assert_eq!(v.scan().unwrap().clips.len(), 1, "一篇都不能多出来");
+        drop(dir);
     }
 }

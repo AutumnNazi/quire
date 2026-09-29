@@ -8,6 +8,7 @@ import type {
   ClipContent,
   ClipSummary,
   BatchReport,
+  ImportReport,
   ScanResult,
   SearchHit,
   TrashListing,
@@ -37,6 +38,8 @@ export const api = {
   // 移进回收站,不是真删。后端只搬文件,用户不点撤销也还能自己去捞。
   // 一篇就是一批里只有一篇,所以只有批量这一条命令
   trashClips: (filenames: string[]) => invoke<BatchReport>("trash_clips", { filenames }),
+  setClipProgress: (filename: string, progress: number) =>
+    invoke<ClipSummary>("set_clip_progress", { filename, progress }),
   setClipFlagsBatch: (filenames: string[], read?: boolean, archived?: boolean) =>
     invoke<BatchReport>("set_clip_flags_batch", {
       filenames,
@@ -59,6 +62,9 @@ export const api = {
     invoke<SaveOutcome>("save_clip", { input, force }),
   setClipboardWatch: (enabled: boolean) =>
     invoke<VaultInfo>("set_clipboard_watch", { enabled }),
+
+  // 导入会弹目录选择器,用户取消时后端回 Err("已取消")——那不是故障
+  importMarkdown: () => invoke<ImportReport>("import_markdown"),
 
   pickVault: () => invoke<VaultInfo | null>("pick_vault"),
   openVaultFolder: () => invoke<void>("open_vault_folder"),

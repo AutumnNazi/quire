@@ -4,7 +4,7 @@
 //! 用户会在任何文本编辑器里手改这些文件,十年后 Quire 还得读得懂自己的老数据。
 //! 自己实现比迁就第三方 crate 的私有行为更可控。
 //!
-//! 支持的标量子集:`"..."` / `'...'` 字符串、裸串、`true`/`false`、整数、
+//! 支持的标量子集:`"..."` / `'...'` 字符串、裸串、`true`/`false`、整数、小数、
 //! `[a, b]` 列表、裸键(`key:`)。不认识的写法一律当纯字符串,不报错也不丢数据。
 
 use std::collections::BTreeMap;
@@ -16,6 +16,9 @@ pub enum Value {
     Str(String),
     Bool(bool),
     Int(i64),
+    /// 小数。以前没有这个变体,`0.42` 会被当成字符串存,再写回去就变成
+    /// `"0.42"`——用户文件里的数值每过一次 Quire 就多一层引号。
+    Float(f64),
     List(Vec<String>),
     /// 写成 `key:`,值为空。区分于空字符串,是为了往返后能还原原样。
     Empty,
@@ -32,6 +35,15 @@ impl Value {
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// 整数也算数:`progress: 1` 应当读成 1.0 而不是"没写过"。
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Float(f) => Some(*f),
+            Value::Int(n) => Some(*n as f64),
             _ => None,
         }
     }
@@ -62,6 +74,8 @@ pub struct Frontmatter {
     pub tags: Vec<String>,
     pub read: bool,
     pub archived: bool,
+    /// 读到哪儿了,0.0–1.0。**存 0 就不往文件里写**,省得每篇都挂一行噪音。
+    pub progress: f32,
     pub extra: BTreeMap<String, Value>,
 }
 
@@ -109,6 +123,15 @@ fn parse_value(raw: &str) -> Value {
     }
     if let Ok(n) = s.parse::<i64>() {
         return Value::Int(n);
+    }
+    // 只认"确实带小数点或指数"的写法。`NaN` / `inf` 一律当字符串,
+    // 它们序列化回去会变成没法再解析回来的东西
+    if (s.contains('.') || s.contains('e') || s.contains('E')) && s.parse::<f64>().is_ok() {
+        if let Ok(f) = s.parse::<f64>() {
+            if f.is_finite() {
+                return Value::Float(f);
+            }
+        }
     }
     Value::Str(s.to_string())
 }
@@ -158,6 +181,7 @@ fn render_value(v: &Value) -> String {
         Value::Str(s) => format!("\"{}\"", escape(s)),
         Value::Bool(b) => b.to_string(),
         Value::Int(n) => n.to_string(),
+        Value::Float(f) => format!("{f}"),
         Value::List(items) => {
             if items.is_empty() {
                 "[]".to_string()
@@ -207,6 +231,9 @@ impl Frontmatter {
                 "tags" => fm.tags = value.as_list().map(|v| v.to_vec()).unwrap_or_default(),
                 "read" => fm.read = value.as_bool().unwrap_or(false),
                 "archived" => fm.archived = value.as_bool().unwrap_or(false),
+                // 钳到 0..=1。文件是用户的,手改成 `progress: 明天` 或
+                // `progress: 3.7` 都得能扛住,不能让一个坏值顺着列表流到界面上
+                "progress" => fm.progress = value.as_f64().unwrap_or(0.0).clamp(0.0, 1.0) as f32,
                 _ => {
                     fm.extra.insert(key.to_string(), value);
                 }
@@ -264,6 +291,9 @@ impl Frontmatter {
         push("tags", &render_value(&Value::List(self.tags.clone())));
         push("read", &self.read.to_string());
         push("archived", &self.archived.to_string());
+        if self.progress > 0.0 {
+            push("progress", &format!("{:.2}", self.progress));
+        }
         for (k, v) in &self.extra {
             push(k, &render_value(v));
         }
@@ -307,6 +337,7 @@ mod tests {
             tags: vec!["rust".into(), "编程".into()],
             read: false,
             archived: false,
+            progress: 0.0,
             extra: BTreeMap::new(),
         }
     }
@@ -393,5 +424,67 @@ mod tests {
     fn 列表元素正确解析() {
         let fm = Frontmatter::parse("tags: [\"rust\", \"编程\"]\n");
         assert_eq!(fm.tags, vec!["rust".to_string(), "编程".to_string()]);
+    }
+    #[test]
+    fn 阅读进度能往返() {
+        let mut fm = sample();
+        fm.progress = 0.42;
+        let back = Frontmatter::parse(&fm.render());
+        assert!((back.progress - 0.42).abs() < 1e-6);
+    }
+
+    #[test]
+    fn 没写过进度就是零() {
+        // 老剪藏里根本没有这个字段。读不出来不能当成 100%(那等于"已读完"),
+        // 也不能当成中间值
+        let fm = Frontmatter::parse(
+            "id: \"a\"
+title: \"t\"
+",
+        );
+        assert_eq!(fm.progress, 0.0);
+    }
+
+    #[test]
+    fn 进度是零就不写进文件() {
+        // 每篇都多一行 progress: 0 是纯噪音,用户打开文件会以为那是个字段
+        assert!(!sample().render().contains("progress"));
+        let mut fm = sample();
+        fm.progress = 0.5;
+        assert!(fm.render().contains("progress: 0.5"));
+    }
+
+    #[test]
+    fn 乱写的进度不会变成奇怪的数() {
+        // 文件是用户的,手改成 progress: 明天 或 progress: 3.7 都得能扛住
+        assert_eq!(
+            Frontmatter::parse(
+                "id: \"a\"
+progress: abc
+"
+            )
+            .progress,
+            0.0
+        );
+        assert_eq!(
+            Frontmatter::parse(
+                "id: \"a\"
+progress: 3.7
+"
+            )
+            .progress,
+            1.0,
+            "超过 1 的当读完"
+        );
+        assert_eq!(
+            Frontmatter::parse(
+                "id: \"a\"
+progress: -1
+"
+            )
+            .progress,
+            0.0,
+            "负数当没读过"
+        );
     }
 }

@@ -360,6 +360,7 @@ kbd {
 }
 
 .clip {
+  position: relative; /* 「读到一半」的角标靠它定位 */
   padding: 12px 16px;
   border-bottom: 1px solid var(--border);
   cursor: pointer;
@@ -582,3 +583,41 @@ kbd {
 
 .batch-bar[hidden] { display: none; }
 .batch-bar .count { color: var(--text-muted); margin-right: auto; }
+
+/* ── 阅读进度 ── */
+
+/* 进度条压在详情页正文最上面,一条 3px 的线。不做成带百分比的大组件:
+   那是"任务管理"的语气,这里是"读到哪儿了",一个记号就够。
+   用 accent 色的实心段,剩下的走轨道色。 */
+.read-progress {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  height: 3px;
+  margin: -32px -40px 0;
+  background: transparent;
+}
+
+.read-progress > i {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 120ms linear;
+}
+
+/* 列表里的"读到一半"。标在右上角而不是做成底部进度条:列表项已经很密,
+   再加一条会让人扫不清标题。百分比本身比一条线更好读。 */
+.clip-half {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 0 6px;
+  pointer-events: none;
+}

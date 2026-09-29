@@ -54,6 +54,7 @@ root.innerHTML = `
       <input type="checkbox" id="chk-watch" />
       <span>监控剪贴板</span>
     </label>
+    <button class="btn" id="btn-import" title="把一个文件夹里的 Markdown 导入剪藏库。只读源文件,不会改动它们。">导入</button>
     <button class="btn" id="btn-export" title="把整个剪藏库导出成一个 Markdown 文件,Obsidian / Logseq 都能直接打开">导出</button>
     <button class="btn" id="btn-open">打开剪藏目录</button>
     <button class="btn" id="btn-pick">更换目录</button>
@@ -113,6 +114,11 @@ let clips: ClipSummary[] = [];
 let trash: TrashItem[] = [];
 /** 多选。空集合 = 没在选,界面上不出现批量操作条。 */
 let selected: Selection = new Set();
+/** 滚动停止多久之后才把进度写盘。写盘会换掉整个文件(临时文件 + 改名),
+ * 也会吵醒文件监控,滚动条每抖一下就写一次是灾难。1.5 秒是"用户停手了"
+ * 和"用户还在慢慢读"之间比较稳的分界。 */
+const PROGRESS_SAVE_DELAY = 1500;
+let progressTimer: ReturnType<typeof setTimeout> | null = null;
 /** Shift 连选的锚点。`null` 表示还没点过起点——这时按 Shift 只选当前那条。 */
 let selectionAnchor: string | null = null;
 /** 非空时列表显示的是检索结果,而不是全库。空数组和 null 要分清:
@@ -378,6 +384,14 @@ function clipItem(
   item.dataset.filename = clip.filename;
   if (clip.filename === activeFilename) item.classList.add("active");
   if (clip.read || clip.archived) item.classList.add("done");
+  // 读了一半要在列表里看得见,不然「读到哪儿了」这个功能只有自己知道。
+  // 绝对定位,视觉上在右上角;**挂到 DOM 末尾**是为了读屏软件先念标题
+  let halfRead: HTMLElement | null = null;
+  if (clip.progress > 0 && !clip.read && !clip.archived) {
+    halfRead = document.createElement("span");
+    halfRead.className = "clip-half";
+    halfRead.textContent = `${Math.round(clip.progress * 100)}%`;
+  }
 
   const title = document.createElement("h3");
   title.className = "clip-title";
@@ -402,6 +416,7 @@ function clipItem(
 
   if (clip.filename && selected.has(clip.filename)) item.classList.add("selected");
   if (opts.readToggle === false) {
+    if (halfRead) item.append(halfRead);
     item.addEventListener("click", (e) => onItemClick(e, clip.filename));
     return item;
   }
@@ -420,6 +435,7 @@ function clipItem(
     void toggleRead(clip, !clip.read);
   });
   item.append(toggle);
+  if (halfRead) item.append(halfRead);
 
   item.addEventListener("click", (e) => onItemClick(e, clip.filename));
   return item;
@@ -573,6 +589,7 @@ function syncArchiveButton(clip: ClipContent): void {
 }
 
 function renderDetail(clip: ClipContent): void {
+  detachProgress();
   detailEl.replaceChildren();
   archiveBtn = null;
 
@@ -599,6 +616,14 @@ function renderDetail(clip: ClipContent): void {
     link.textContent = "打开原文";
     meta.prepend(link);
   }
+
+  // 进度条。**放在正文最上面而不是文章末尾**:读到哪儿了这件事,
+  // 得在滚动时一眼看见,而不是滚到底才知道
+  const progress = document.createElement("div");
+  progress.className = "read-progress";
+  progress.title = "读到哪儿了";
+  const bar = document.createElement("i");
+  progress.append(bar);
 
   const body = document.createElement("article");
   body.className = "prose";
@@ -632,11 +657,82 @@ function renderDetail(clip: ClipContent): void {
   syncArchiveButton(clip);
 
   header.append(title, meta, actions);
-  detailEl.append(header, body);
+  detailEl.append(header, progress, body);
   detailEl.scrollTop = 0;
+  trackReadingProgress(clip.filename, clip.progress, bar);
+}
+
+/* ── 阅读进度 ── */
+
+/** 当前详情页挂着的滚动监听。换一篇之前要先摘掉,不然读第二篇时
+ *  第一篇的滚动也会往它自己的文件里写进度。 */
+let progressScroll: { filename: string; onScroll: () => void } | null = null;
+
+/** 读到哪儿了,0–1。
+ *
+ *  **一屏装得下就是 100%。** 短笔记没有"读一半"这回事,给它记 0.3 只会
+ *  让列表里出现一条永远停在三分之一的长条。 */
+function readingProgress(): number {
+  const scrollable = detailEl.scrollHeight - detailEl.clientHeight;
+  if (scrollable <= 8) return 1;
+  return Math.min(1, detailEl.scrollTop / scrollable);
+}
+
+/** 挂上滚动监听,停手 1.5 秒后把进度写盘。
+ *
+ *  打开时先按文件里记的进度跳回去——"读到哪儿了"这个功能有一半的价值
+ *  在于**重新打开时接着读**。`requestAnimationFrame` 是为了等布局稳定,
+ *  刚 render 完就量 scrollHeight,拿到的可能还是上一篇的旧值。 */
+function trackReadingProgress(filename: string, saved: number, bar: HTMLElement): void {
+  detachProgress();
+  bar.style.width = `${Math.round(saved * 100)}%`;
+  if (saved > 0) {
+    requestAnimationFrame(() => {
+      const scrollable = detailEl.scrollHeight - detailEl.clientHeight;
+      if (scrollable > 8) detailEl.scrollTop = scrollable * saved;
+    });
+  }
+
+  const onScroll = (): void => {
+    bar.style.width = `${Math.round(readingProgress() * 100)}%`;
+    if (progressTimer) clearTimeout(progressTimer);
+    progressTimer = setTimeout(() => {
+      progressTimer = null;
+      void saveProgress(filename, readingProgress());
+    }, PROGRESS_SAVE_DELAY);
+  };
+  detailEl.addEventListener("scroll", onScroll, { passive: true });
+  progressScroll = { filename, onScroll };
+}
+
+/** 摘掉进度监听和待写的定时器。**每个重画详情的地方都得调**:
+ * 监听器挂在 `detailEl` 上而不是正文节点上,换一篇不会自动摘,
+ * 读第二篇时第一篇的滚动也会往它自己的文件里写进度。 */
+function detachProgress(): void {
+  if (progressTimer) {
+    clearTimeout(progressTimer);
+    progressTimer = null;
+  }
+  if (progressScroll) {
+    detailEl.removeEventListener("scroll", progressScroll.onScroll);
+    progressScroll = null;
+  }
+}
+
+
+async function saveProgress(filename: string, progress: number): Promise<void> {
+  // 已经读到 100% 的,以后再打开也不该被"读了一半"的进度条盖住。
+  // 后端只认"值变了才写",但界面这一侧也得先想清楚
+  if (progress >= 0.999) progress = 1;
+  try {
+    await api.setClipProgress(filename, progress);
+  } catch {
+    // 记不住进度是小事,不该在读文章的时候弹一条红字打断
+  }
 }
 
 function renderEmptyDetail(): void {
+  detachProgress();
   detailEl.replaceChildren();
   archiveBtn = null; // 上一篇的按钮节点已经脱离文档,留着只会改空气
   const hint = document.createElement("div");
@@ -663,6 +759,7 @@ async function openTrashDetail(filename: string): Promise<void> {
   activeFilename = filename;
   renderList();
   archiveBtn = null;
+  detachProgress();
   detailEl.replaceChildren();
   try {
     const clip = await api.readTrashClip(filename);
@@ -682,6 +779,8 @@ async function openTrashDetail(filename: string): Promise<void> {
 }
 
 function renderTrashDetail(clip: ClipContent): void {
+  // 回收站里不记进度:**彻底删除之前**显示"你读到 80%"会让人以为还能接着读
+  detachProgress();
   const header = document.createElement("header");
   header.className = "detail-header";
   const title = document.createElement("h1");
@@ -1071,6 +1170,45 @@ el<HTMLButtonElement>("batch-delete").addEventListener("click", () => {
     },
   ]);
 });
+
+el<HTMLButtonElement>("btn-import").addEventListener("click", async () => {
+  try {
+    const { report } = await api.importMarkdown();
+    await refreshList();
+    reportImport(report);
+  } catch (err) {
+    // 用户在目录选择器上点了取消,那不是故障
+    if (String(err).includes("已取消")) return;
+    showError(`导入失败:${String(err)}`);
+  }
+});
+
+/** 导入结果。**跳过的那些必须列出来**:用户导进一个存过一堆旧文的文件夹,
+ * 里面有一半是重复的,界面只报一句"导入完成"的话,他没法判断到底进来了多少。 */
+function reportImport(report: BatchReport): void {
+  const n = report.succeeded.length;
+  if (n === 0) {
+    showError(
+      report.failed.length > 0
+        ? `一篇都没导进来。${report.failed.length} 个文件被跳过,` +
+            `比如 ${report.failed[0].filename}:${report.failed[0].reason}`
+        : "那个文件夹里没有 .md 文件",
+    );
+    return;
+  }
+  if (report.failed.length === 0) {
+    showToast(`导入了 ${n} 篇`);
+    return;
+  }
+  showError(
+    `导入了 ${n} 篇,跳过 ${report.failed.length} 个:` +
+      report.failed
+        .slice(0, 3)
+        .map((f) => `${f.filename}(${f.reason})`)
+        .join("、") +
+      (report.failed.length > 3 ? ` 等 ${report.failed.length} 个` : ""),
+  );
+}
 
 el<HTMLButtonElement>("btn-export").addEventListener("click", async () => {
   try {
