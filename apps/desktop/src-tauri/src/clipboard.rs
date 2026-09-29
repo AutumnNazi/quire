@@ -671,6 +671,29 @@ mod tests {
         false
     }
 
+    /// 读回来的还是不是**我们写进去的那一份**。
+    ///
+    /// 剪贴板是全局共享的,写和读之间任何一个程序(浏览器、编辑器、
+    /// 连字取巧的小工具)动了它,我们读到的就是别人的东西。而报出来的是
+    /// 「元数据应齐全: {}」——把环境抢占说成了解析坏了,排查的人会去翻
+    /// 自己的解析代码,方向从第一步就错了。
+    ///
+    /// `canary` 是只出现在我们写的那份里的字样,拿它当判据。
+    fn require_ours(capture: &ClipboardCapture, canary: &str, test_name: &str) -> bool {
+        if capture.html.as_deref().is_some_and(|h| h.contains(canary)) {
+            return true;
+        }
+        let forced = std::env::var("QUIRE_REQUIRE_CLIPBOARD").is_ok();
+        let reason = format!(
+            "{test_name}:写完之后读回来的已经不是我们写的那份了(别的程序在这中间              动了剪贴板)。这是环境问题,不是这条链路坏了。设 QUIRE_REQUIRE_CLIPBOARD=1              可要求它必须原样回来。"
+        );
+        if forced {
+            panic!("{reason}");
+        }
+        eprintln!("跳过 —— {reason}");
+        false
+    }
+
     /// 写进真实剪贴板之后确认一下。**写不进去要按"环境占着"处理,
     /// 不能报成断言失败**——测试接着读回来拿到的是上一次的残留内容,
     /// 报出来的是「`left == right` failed」,把环境问题说成了代码问题,
@@ -948,6 +971,9 @@ mod tests {
         }
 
         let capture = capture_clipboard().expect("应能读回刚写进去的内容");
+        if !require_ours(&capture, "深入理解所有权", "真实剪贴板往返") {
+            return;
+        }
         assert_eq!(capture.url.as_deref(), Some("https://example.com/post/1"));
         assert_eq!(capture.html.as_deref(), Some(context), "HTML 应逐字节读回");
         assert!(!capture.is_empty());
@@ -995,6 +1021,9 @@ mod tests {
         }
 
         let capture = capture_clipboard().expect("应能读回扩展载荷");
+        if !require_ours(&capture, "本地优先的稍后读", "扩展载荷经真实剪贴板仍完整") {
+            return;
+        }
         assert_eq!(
             capture.meta.len(),
             EXTENSION_META.len(),
