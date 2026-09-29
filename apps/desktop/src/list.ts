@@ -104,3 +104,30 @@ export function upsertClip<T extends ClipLike>(clips: T[], clip: T): T[] {
   const rest = clips.filter((c) => c.filename !== clip.filename);
   return [...rest, clip].sort(byClippedAtDesc);
 }
+
+/** 键盘上下移动选中项,返回新的选中文件名。列表空了就返回 null。
+ *
+ *  **停在两头,不循环。** 到底之后再按一下却弹回顶上,读着读着就被甩回
+ *  第一篇,人会以为软件抽风。
+ *
+ *  `current` 不在 `visible` 里只是个兜底;「刚标完已读、接着读下一篇」
+ *  那条正常路径走 `reanchorAfterRemoval`,它才知道该落到哪一篇。 */
+export function moveSelection(visible: string[], current: string | null, delta: number): string | null {
+  if (visible.length === 0) return null;
+  const at = current === null ? -1 : visible.indexOf(current);
+  if (at < 0) return delta > 0 ? visible[0] : visible[visible.length - 1];
+  const next = at + delta;
+  if (next < 0 || next >= visible.length) return visible[at];
+  return visible[next];
+}
+
+/** 刚处理完一篇(标了已读、归档了)之后,选中项落到哪。
+ *
+ *  那一篇会从列表里消失,光按文件名已经找不到它的位置了。**得用下标**:
+ *  停在 [a,b,c] 的 b 上标了已读,剩 [a,c],接着读的应该是 c——也就是原来
+ *  它下面那一篇。要是图省事按名字找不到就回顶上,用户会以为自己刚读过
+ *  的那篇又回来了,平白多读一遍。 */
+export function reanchorAfterRemoval(visible: string[], indexBefore: number): string | null {
+  if (visible.length === 0) return null;
+  return visible[Math.min(Math.max(indexBefore, 0), visible.length - 1)];
+}

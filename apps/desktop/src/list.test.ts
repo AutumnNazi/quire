@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { groupByWeek, isUnread, isoWeekKey, selectClips, upsertClip, type ClipLike } from "./list";
+import {
+  groupByWeek,
+  isUnread,
+  isoWeekKey,
+  moveSelection,
+  reanchorAfterRemoval,
+  selectClips,
+  upsertClip,
+  type ClipLike,
+} from "./list";
 
 function clip(partial: Partial<ClipLike> & { clippedAt: string; filename?: string }): ClipLike {
   return { title: "t", read: false, archived: false, filename: partial.filename ?? partial.title, ...partial };
@@ -168,5 +177,56 @@ describe("插回列表", () => {
     const before = [a, c];
     upsertClip(before, b);
     expect(before).toHaveLength(2);
+  });
+});
+
+describe("键盘移动选中", () => {
+  const list = ["a.md", "b.md", "c.md"];
+
+  it("空列表就没有选中可言", () => {
+    expect(moveSelection([], null, 1)).toBeNull();
+    expect(moveSelection([], "a.md", -1)).toBeNull();
+  });
+
+  it("还没选中时,下键挑第一篇、上键挑最后一篇", () => {
+    // 上键往回翻,人一般是从最新的开始往下读,不是从最老的
+    expect(moveSelection(list, null, 1)).toBe("a.md");
+    expect(moveSelection(list, null, -1)).toBe("c.md");
+  });
+
+  it("停在两头,不循环", () => {
+    expect(moveSelection(list, "a.md", -1)).toBe("a.md");
+    expect(moveSelection(list, "c.md", 1)).toBe("c.md");
+  });
+
+  it("中间就一步一格", () => {
+    expect(moveSelection(list, "a.md", 1)).toBe("b.md");
+    expect(moveSelection(list, "b.md", -1)).toBe("a.md");
+  });
+
+  it("选中的那篇不在列表里了,下键回顶上、上键回末尾", () => {
+    // 这是兜底,不是正常路径。正常路径走 reanchorAfterRemoval
+    expect(moveSelection(["b.md", "c.md"], "a.md", 1)).toBe("b.md");
+    expect(moveSelection(["b.md", "c.md"], "a.md", -1)).toBe("c.md");
+  });
+});
+
+describe("标完已读之后接着读", () => {
+  it("下一篇顶上来,不用每篇都重新按一次下一条", () => {
+    // 停在 b(下标 1),标了已读它就走了,剩 [a, c] —— 落点该是 c,
+    // 也就是原来它下面那一篇,而不是退回 a 让用户重读一遍
+    expect(reanchorAfterRemoval(["a.md", "c.md"], 1)).toBe("c.md");
+  });
+
+  it("删的是最后一篇,往前挪一位", () => {
+    expect(reanchorAfterRemoval(["a.md", "b.md"], 2)).toBe("b.md");
+  });
+
+  it("全删光了就没有选中可言", () => {
+    expect(reanchorAfterRemoval([], 0)).toBeNull();
+  });
+
+  it("没选中过就挑第一篇", () => {
+    expect(reanchorAfterRemoval(["a.md", "b.md"], -1)).toBe("a.md");
   });
 });

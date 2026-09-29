@@ -3,7 +3,14 @@ import { listen } from "@tauri-apps/api/event";
 import { api } from "./api";
 import type { ClipboardCapture } from "./clipboard";
 import { clipToMarkdown, MARKDOWN_PLACEHOLDER, renderMarkdown } from "./markdown";
-import { groupByWeek, selectClips, upsertClip, type ListMode } from "./list";
+import {
+  groupByWeek,
+  moveSelection,
+  reanchorAfterRemoval,
+  selectClips,
+  upsertClip,
+  type ListMode,
+} from "./list";
 import type { ClipContent, ClipSummary, SearchHit, VaultInfo } from "./types";
 
 const root = document.querySelector<HTMLDivElement>("#app");
@@ -37,6 +44,11 @@ root.innerHTML = `
     <button class="btn" id="btn-export" title="把整个剪藏库导出成一个 Markdown 文件,Obsidian / Logseq 都能直接打开">导出</button>
     <button class="btn" id="btn-open">打开剪藏目录</button>
     <button class="btn" id="btn-pick">更换目录</button>
+    <span
+      class="shortcut-hint"
+      title="↑↓ 上下翻 · r 标已读 · a 归档 · / 搜索 · Ctrl+V 剪藏"
+      ><kbd>↑</kbd><kbd>↓</kbd> 翻 <kbd>r</kbd> 读完 <kbd>a</kbd> 归档 <kbd>/</kbd> 搜</span
+    >
   </header>
   <main class="split">
     <aside class="list-pane">
@@ -144,6 +156,16 @@ function formatWhen(iso: string): string {
   return d.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" });
 }
 
+/** 当前屏幕上真的列出来的那些剪藏,按显示顺序。
+ *
+ *  快捷键只认这个列表——认 `clips` 的话,「未读」视图下按下一条会跳到
+ *  一篇根本没显示的文章上,用户看着屏幕会以为软件坏了。 */
+function visibleFilenames(): string[] {
+  return [...listEl.querySelectorAll<HTMLElement>(".clip")].map(
+    (el) => el.dataset.filename ?? "",
+  ).filter(Boolean);
+}
+
 function renderList(): void {
   listEl.replaceChildren();
 
@@ -232,6 +254,7 @@ function renderHitList(results: SearchHit[]): void {
 function clipItem(clip: ClipSummary, sub: string | null): HTMLElement {
   const item = document.createElement("article");
   item.className = "clip";
+  item.dataset.filename = clip.filename;
   if (clip.filename === activeFilename) item.classList.add("active");
   if (clip.read || clip.archived) item.classList.add("done");
 
@@ -297,31 +320,49 @@ async function toggleRead(clip: ClipSummary, next: boolean): Promise<void> {
 /** 归档/取消归档。归档是「挪到一边」不是「删掉」,所以要有个地方能翻回来——
  *  列表里的「归档」筛选就是那个地方。放在正文页而不是列表项上,是因为
  *  「看完了不打算再留」是个读完之后的决定,不是扫一眼列表时顺手做的。 */
-async function toggleArchive(clip: ClipContent): Promise<void> {
+async function toggleArchive(filename: string): Promise<void> {
+  const before = clips.find((c) => c.filename === filename);
+  if (!before) return;
   try {
-    const updated = await api.setClipFlags(clip.filename, undefined, !clip.archived);
-    const i = clips.findIndex((c) => c.filename === clip.filename);
-    if (i >= 0) clips[i] = updated;
+    const updated = await api.setClipFlags(filename, undefined, !before.archived);
+    clips = upsertClip(clips, updated);
     if (hits) {
       for (const hit of hits) {
-        if (hit.summary.filename === clip.filename) hit.summary = updated;
+        if (hit.summary.filename === filename) hit.summary = updated;
       }
     }
-    // 详情页手上这份也一起换掉,否则再点一次会拿旧的 archived 取反
-    clip.archived = updated.archived;
-    clip.read = updated.read;
-    syncArchiveButton(clip);
+    // 详情页那一份可能还是旧值,刷新一下,不然再点一次按钮会拿旧的
+    // archived 取反,变成"点了没反应"
+    if (activeFilename === filename) await refreshOpenDetail();
     renderList();
   } catch (err) {
-    showError(`${clip.archived ? "取消归档" : "归档"}失败:${String(err)}`);
+    showError(`${before.archived ? "取消归档" : "归档"}失败:${String(err)}`);
+  }
+}
+
+/** 重新拉一次正在看的那篇。
+ *
+ *  改完标志之后,详情页手上那份 `ClipContent` 还是旧值——不刷的话再点一次
+ *  归档按钮会拿旧的 `archived` 取反,用户看着就是"点了没反应"。这里重读
+ *  一次,顺带把滚动位置留着,不然改个标志正文就弹回顶部了。 */
+async function refreshOpenDetail(): Promise<void> {
+  if (!activeFilename) return;
+  const filename = activeFilename;
+  const scroll = detailEl.scrollTop;
+  try {
+    const clip = await api.readClip(filename);
+    if (activeFilename !== filename) return;
+    renderDetail(clip);
+    detailEl.scrollTop = scroll;
+  } catch (err) {
+    showError(`读不出来:${String(err)}`);
   }
 }
 
 /** 移到回收站。**不真删**——剪藏工具里唯一能把用户东西弄没的操作,
  *  没有必要一按就没。真想清空,用户自己去 `clips/.trash/` 里翻,那时候他
  *  是想清楚了才翻的。 */
-async function trashClip(clip: ClipContent): Promise<void> {
-  const { filename } = clip;
+async function trashClip(filename: string): Promise<void> {
   try {
     await api.trashClip(filename);
     clips = clips.filter((c) => c.filename !== filename);
@@ -415,12 +456,12 @@ function renderDetail(clip: ClipContent): void {
   const archive = document.createElement("button");
   archive.className = "btn ghost";
   archiveBtn = archive;
-  archive.addEventListener("click", () => void toggleArchive(clip));
+  archive.addEventListener("click", () => void toggleArchive(clip.filename));
   const remove = document.createElement("button");
   remove.className = "btn danger";
   remove.textContent = "删除";
   remove.title = "移到回收站,不是真删——放回收站里随时能捞回来";
-  remove.addEventListener("click", () => void trashClip(clip));
+  remove.addEventListener("click", () => void trashClip(clip.filename));
   actions.append(archive, remove);
   syncArchiveButton(clip);
 
@@ -506,11 +547,18 @@ async function runSearch(query: string): Promise<void> {
 }
 
 // 每敲一下就全库扫一遍,剪藏多了会跟着手抖。去抖 200ms 是体感不明显的下限。
-searchEl.addEventListener("input", () => {
+function onQueryChanged(): void {
   if (searchTimer) clearTimeout(searchTimer);
   const value = searchEl.value;
   searchTimer = setTimeout(() => void runSearch(value), 200);
-});
+}
+
+// **两个事件都得听。** `input[type=search]` 自带一套清除行为:按 Esc 或者
+// 点框里的 × ,Chromium 会把值清空,但只抛 `search` 和 `change`,**不抛
+// `input`**。只听 input 的话,用户按一下 Esc 退出搜索框,值是空了、列表却
+// 永远停在"搜到 0 条"——看上去就像剪藏全没了。
+searchEl.addEventListener("input", onQueryChanged);
+searchEl.addEventListener("search", onQueryChanged);
 
 async function refreshList(): Promise<void> {
   try {
@@ -611,11 +659,78 @@ watchEl.addEventListener("change", () => {
     });
 });
 
-// Ctrl+V 走的是系统剪贴板,不是往 DOM 里插文本,所以要拦下默认行为
+/** 用户正在打字的话就别抢键。搜索框里敲 r 是搜索 r,不是标已读。 */
+function isTyping(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el) return false;
+  return el.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName);
+}
+
+/** 处理完一篇之后接着读下一篇。
+ *
+ *  标了已读/归档之后,那一篇多半已经从当前视图里消失了(`r` 在「未读」里
+ *  按一下就消失)。光按文件名找不到它了,得用**改动前记下的下标**找它下面
+ *  的那篇,不然用户会退回第一篇重读一遍。 */
+function advanceAfterRemoval(indexBefore: number): void {
+  const next = reanchorAfterRemoval(visibleFilenames(), indexBefore);
+  if (next) {
+    void openDetail(next);
+  } else {
+    activeFilename = null;
+    renderEmptyDetail();
+    renderList();
+  }
+}
+
 document.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v") {
+    // Ctrl+V 走的是系统剪贴板,不是往 DOM 里插文本,所以要拦下默认行为
     e.preventDefault();
     void pasteNow();
+    return;
+  }
+
+  if (e.key === "Escape" && isTyping(e.target)) {
+    (e.target as HTMLElement).blur();
+    return;
+  }
+  if (e.key === "/" && !isTyping(e.target)) {
+    e.preventDefault();
+    searchEl.focus();
+    searchEl.select();
+    return;
+  }
+  if (e.ctrlKey || e.metaKey || e.altKey || isTyping(e.target)) return;
+
+  const key = e.key.toLowerCase();
+  if (key === "arrowdown" || key === "j") {
+    e.preventDefault();
+    const next = moveSelection(visibleFilenames(), activeFilename, 1);
+    // 移动就直接打开:稍后读是拿来"一篇篇读过去"的,让人多按一下回车
+    // 只会把连着读变成点读
+    if (next) void openDetail(next);
+    return;
+  }
+  if (key === "arrowup" || key === "k") {
+    e.preventDefault();
+    const prev = moveSelection(visibleFilenames(), activeFilename, -1);
+    if (prev) void openDetail(prev);
+    return;
+  }
+
+  const current = activeFilename ? clips.find((c) => c.filename === activeFilename) : null;
+  if (!current) return;
+  if (key === "r" || key === "a") {
+    e.preventDefault();
+    // 下标必须在动手**之前**记。动完之后这一篇已经不在列表里了,
+    // 那时候再找它的位置只会得到 -1,接着读就退回第一篇重来了
+    const at = visibleFilenames().indexOf(current.filename);
+    const done = key === "r" ? toggleRead(current, !current.read) : toggleArchive(current.filename);
+    void done.then(() => {
+      // 还留在列表里(比如在「全部」视图里标已读)就别乱动光标,
+      // 用户可能还想把它归档
+      if (!visibleFilenames().includes(current.filename)) advanceAfterRemoval(at);
+    });
   }
 });
 
