@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   ClipboardCapture,
   ClipInput,
-  SavedClip,
+  SaveOutcome,
 } from "./clipboard";
 import type { ClipContent, ClipSummary, ScanResult, SearchHit, VaultInfo } from "./types";
 
@@ -29,7 +29,10 @@ export const api = {
   // 返回 null 表示用户在保存对话框点了取消,那不是故障。
   exportVault: () => invoke<string | null>("export_vault"),
   captureClipboard: () => invoke<ClipboardCapture>("capture_clipboard"),
-  saveClip: (input: ClipInput) => invoke<SavedClip>("save_clip", { input }),
+  // force 是给用户的出口:文章更新了想重存一份时,界面上点「仍然存一份」会带上它。
+  // 不给这个开关的话,判重就是个只进不出的死胡同。
+  saveClip: (input: ClipInput, force = false) =>
+    invoke<SaveOutcome>("save_clip", { input, force }),
   setClipboardWatch: (enabled: boolean) =>
     invoke<VaultInfo>("set_clipboard_watch", { enabled }),
 

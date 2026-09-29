@@ -33,8 +33,6 @@ pub enum VaultError {
     UnsafeFilename(String),
     #[error("剪藏内容为空,已拒绝")]
     EmptyContent,
-    #[error("缺少原文地址")]
-    MissingUrl,
     #[error("剪藏不存在: {0}")]
     NotFound(String),
     #[error("已经有同名剪藏了,没敢放回去: {0}")]
@@ -121,6 +119,17 @@ pub struct SavedClip {
     pub path: String,
 }
 
+/// 存完之后的结果。**「已经剪过了」是一个正常的结局,不是错误。**
+///
+/// 早先一律往库里塞,同一篇文章存两遍,列表里就多一条一模一样的。
+/// 用户得自己认出哪条是新的——那是在让用户替软件擦屁股。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum SaveOutcome {
+    Saved { id: String, filename: String },
+    Duplicate { filename: String, title: String },
+}
+
 pub struct Vault {
     root: PathBuf,
 }
@@ -161,9 +170,6 @@ impl Vault {
             return Err(VaultError::EmptyContent);
         }
         let url = input.url.trim();
-        if url.is_empty() {
-            return Err(VaultError::MissingUrl);
-        }
         self.ensure_dirs()?;
 
         let now = Local::now();
@@ -177,8 +183,12 @@ impl Vault {
         let host = slug::host_of(url);
         let filename = slug::filename_for(&date, &id, &host);
 
-        // site 字段是给人看的,可以容忍扩展传了个显示名
+        // site 字段是给人看的,可以容忍扩展传了个显示名。
+        // 剪贴板里没有链接是常态——随手复制一段话、一个命令、一段代码。
+        // 那种剪藏老实标成"剪贴板":站点栏空着的话,列表里就是
+        // " · 09-29 16:20"这么一行,看着像程序坏了。
         let site = match input.site_name.trim() {
+            "" if host.is_empty() => "剪贴板".to_string(),
             "" => host.clone(),
             s => s.to_string(),
         };
@@ -247,6 +257,48 @@ impl Vault {
         Ok(ScanResult { clips, unreadable })
     }
 
+    /// 存一篇剪藏,存之前先看库里有没有同一篇。
+    ///
+    /// `force` 是给用户的出口:文章更新了想重存一份是合理需求,判重要是
+    /// 拦死不让存,用户就只剩"自己去剪藏目录里改文件名"这一条路。
+    /// 界面在提示重复时必须给得出这个选项。
+    ///
+    /// 判重只读不写——已有那篇的正文一个字都不该动(见 `判重时不碰已有那篇的正文`)。
+    pub fn save_checked(&self, input: &ClipInput, force: bool) -> Result<SaveOutcome, VaultError> {
+        if !force {
+            if let Some(existing) = self.find_by_url(&input.url)? {
+                return Ok(SaveOutcome::Duplicate {
+                    filename: existing.filename,
+                    title: existing.title,
+                });
+            }
+        }
+        let saved = self.save(input)?;
+        Ok(SaveOutcome::Saved {
+            id: saved.id,
+            filename: saved.filename,
+        })
+    }
+
+    /// 按原文地址找已经剪过的那一篇。
+    ///
+    /// **一篇东西在同一篇文章上存两份,是没人在意的重复,却实实在在把列表
+    /// 弄脏了。** 识别一篇文章的凭据是它的地址:标题可能一模一样,正文
+    /// 可能被网站改过,地址不会。
+    pub fn find_by_url(&self, url: &str) -> Result<Option<ClipSummary>, VaultError> {
+        let want = normalize_url(url);
+        if want.is_empty() {
+            // 剪贴板里没有链接的纯文本也会存。拿空串去全库比对毫无意义,
+            // 而且真撞上了就是"所有剪藏都算重复"
+            return Ok(None);
+        }
+        Ok(self
+            .scan()?
+            .clips
+            .into_iter()
+            .find(|c| normalize_url(&c.url) == want))
+    }
+
     /// 改已读 / 归档标志。传 `None` 表示这一项不动。
     ///
     /// **重写整个文件是有代价的,所以必须做到只改该改的。** 用户的剪藏文件
@@ -266,8 +318,8 @@ impl Vault {
             return Err(VaultError::UnsafeFilename(filename.to_string()));
         }
         let path = self.clips_dir().join(filename);
-        let original = fs::read_to_string(&path)
-            .map_err(|_| VaultError::NotFound(filename.to_string()))?;
+        let original =
+            fs::read_to_string(&path).map_err(|_| VaultError::NotFound(filename.to_string()))?;
         let (block, body) = frontmatter::split(&original)
             .ok_or_else(|| VaultError::NotFound(filename.to_string()))?;
 
@@ -319,8 +371,12 @@ impl Vault {
             }
             // 读不出来的跳过而不是整体失败:用户手动改坏的 .md 不该让
             // 整份导出泡汤——那等于因为一个错文件拿不回全部数据。
-            let Ok(text) = fs::read_to_string(&path) else { continue };
-            let Some((block, body)) = frontmatter::split(&text) else { continue };
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some((block, body)) = frontmatter::split(&text) else {
+                continue;
+            };
             let fm = Frontmatter::parse(block);
             if fm.id.is_empty() {
                 continue;
@@ -335,10 +391,7 @@ impl Vault {
 
         let mut out = String::new();
         out.push_str("# Quire 剪藏导出\n\n");
-        out.push_str(&format!(
-            "共 {} 篇,由 Quire 导出。\n\n",
-            items.len()
-        ));
+        out.push_str(&format!("共 {} 篇,由 Quire 导出。\n\n", items.len()));
         out.push_str("| 剪藏于 | 标题 | 原文 |\n| --- | --- | --- |\n");
         for (clipped_at, fm, _) in &items {
             out.push_str(&format!(
@@ -428,7 +481,11 @@ impl Vault {
     fn move_assets(&self, id: &str, to_trash: bool) -> Result<(), VaultError> {
         let live = self.assets_dir().join(id);
         let trashed = self.trash_dir().join(crate::assets::ASSETS_DIR).join(id);
-        let (from, to) = if to_trash { (&live, &trashed) } else { (&trashed, &live) };
+        let (from, to) = if to_trash {
+            (&live, &trashed)
+        } else {
+            (&trashed, &live)
+        };
         if !from.is_dir() {
             return Ok(());
         }
@@ -448,7 +505,11 @@ impl Vault {
         let text = fs::read_to_string(path).ok()?;
         let (block, _) = frontmatter::split(&text)?;
         let id = Frontmatter::parse(block).id;
-        if id.is_empty() { None } else { Some(id) }
+        if id.is_empty() {
+            None
+        } else {
+            Some(id)
+        }
     }
 
     /// 图片目录。平铺在 clips/ 下面、按剪藏 id 分桶。`scan()` 只看
@@ -474,8 +535,7 @@ impl Vault {
             frontmatter::split(&text).ok_or_else(|| format!("剪藏格式不对: {filename}"))?;
         let id = Frontmatter::parse(block).id;
 
-        let (new_body, ok, failed) =
-            crate::assets::localize(body, &id, &self.assets_dir(), fetch)?;
+        let (new_body, ok, failed) = crate::assets::localize(body, &id, &self.assets_dir(), fetch)?;
         // 一张都没换成功就别动文件,省掉一次无谓的写盘
         if new_body == body {
             return Ok((ok, failed));
@@ -510,9 +570,10 @@ impl Vault {
             return Err(VaultError::UnsafeFilename(filename.to_string()));
         }
         let path = self.clips_dir().join(filename);
-        let text = fs::read_to_string(&path).map_err(|_| VaultError::NotFound(filename.to_string()))?;
-        let (block, body) = frontmatter::split(&text)
-            .ok_or_else(|| VaultError::NotFound(filename.to_string()))?;
+        let text =
+            fs::read_to_string(&path).map_err(|_| VaultError::NotFound(filename.to_string()))?;
+        let (block, body) =
+            frontmatter::split(&text).ok_or_else(|| VaultError::NotFound(filename.to_string()))?;
         let fm = Frontmatter::parse(block);
         Ok(ClipContent {
             summary: summary_from(fm, filename.to_string()),
@@ -550,6 +611,29 @@ fn fresh_id() -> String {
 }
 
 /// 由 frontmatter 拼出列表摘要。搜索模块也要用,所以是 pub。
+/// 地址归一化到"够用来判重"的程度。**刻意只做最小的那点处理**:大小写
+/// 敏感的路径不能一律小写,查询串里的参数更不能丢——那是两个不同页面。
+/// 只吃掉尾斜杠和首尾空白,剩下的原样比。
+fn normalize_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // 只去尾部连续的斜杠,根路径 `https://a.com/` 不能被削成 `https://a.com`
+    let without = trimmed.trim_end_matches('/');
+    if without.len()
+        >= trimmed
+            .split("://")
+            .next()
+            .map(|s| s.len() + 3)
+            .unwrap_or(0)
+    {
+        without.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub fn summary_from(fm: Frontmatter, filename: String) -> ClipSummary {
     ClipSummary {
         id: fm.id,
@@ -631,8 +715,14 @@ mod tests {
         v.trash(&saved.filename).unwrap();
 
         assert!(v.scan().unwrap().clips.is_empty(), "列表里不该再出现");
-        assert!(!v.clips_dir().join(&saved.filename).exists(), "原位置不该留着");
-        assert!(v.trash_dir().join(&saved.filename).exists(), "文件应搬到回收站");
+        assert!(
+            !v.clips_dir().join(&saved.filename).exists(),
+            "原位置不该留着"
+        );
+        assert!(
+            v.trash_dir().join(&saved.filename).exists(),
+            "文件应搬到回收站"
+        );
         // 递归数一遍:是"搬走了",不是"复制了一份"
         assert_eq!(walk_all(v.root()).len(), 1, "vault 里只该剩这一份文件");
         drop(dir);
@@ -662,8 +752,13 @@ mod tests {
         let b = v.save(&input("https://b.com", "扔掉", "正文")).unwrap();
         v.trash(&b.filename).unwrap();
 
-        let names: Vec<String> =
-            v.scan().unwrap().clips.into_iter().map(|c| c.filename).collect();
+        let names: Vec<String> = v
+            .scan()
+            .unwrap()
+            .clips
+            .into_iter()
+            .map(|c| c.filename)
+            .collect();
         assert_eq!(names, vec![a.filename]);
         drop(dir);
     }
@@ -680,7 +775,10 @@ mod tests {
         v.trash(&a.filename).unwrap();
 
         // 原来那个占位文件必须还在。悄悄覆盖掉用户的东西是最不能忍的一类错
-        assert_eq!(fs::read_to_string(v.trash_dir().join(&a.filename)).unwrap(), "占位");
+        assert_eq!(
+            fs::read_to_string(v.trash_dir().join(&a.filename)).unwrap(),
+            "占位"
+        );
         let names: Vec<String> = fs::read_dir(v.trash_dir())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -695,8 +793,14 @@ mod tests {
         let (dir, v) = vault();
         v.ensure_dirs().unwrap();
         for bad in ["../evil.md", "a/b.md", r"..\evil.md"] {
-            assert!(matches!(v.trash(bad), Err(VaultError::UnsafeFilename(_))), "{bad} 不该被放行");
-            assert!(matches!(v.restore(bad), Err(VaultError::UnsafeFilename(_))), "{bad} 不该被放行");
+            assert!(
+                matches!(v.trash(bad), Err(VaultError::UnsafeFilename(_))),
+                "{bad} 不该被放行"
+            );
+            assert!(
+                matches!(v.restore(bad), Err(VaultError::UnsafeFilename(_))),
+                "{bad} 不该被放行"
+            );
         }
         drop(dir);
     }
@@ -733,8 +837,14 @@ mod tests {
         assert_eq!((ok, failed), (1, 0));
         let text = fs::read_to_string(v.clips_dir().join(&saved.filename)).unwrap();
         assert!(text.contains("assets/"), "正文该指向本地图片,实际:\n{text}");
-        assert!(!text.contains("cdn.example.com"), "不该还留着远程地址:\n{text}");
-        assert!(v.assets_dir().join(&saved.id).join("0.png").exists(), "图片得真的落盘");
+        assert!(
+            !text.contains("cdn.example.com"),
+            "不该还留着远程地址:\n{text}"
+        );
+        assert!(
+            v.assets_dir().join(&saved.id).join("0.png").exists(),
+            "图片得真的落盘"
+        );
         assert!(text.contains("正文。"), "正文别的地方不能动");
         drop(dir);
     }
@@ -746,19 +856,34 @@ mod tests {
         v.ensure_dirs().unwrap();
         let path = {
             let saved = v
-                .save(&input("https://a.com/post", "带图的", "![a](https://cdn.x.com/a.png)\n"))
+                .save(&input(
+                    "https://a.com/post",
+                    "带图的",
+                    "![a](https://cdn.x.com/a.png)\n",
+                ))
                 .unwrap();
             // 手工塞一个用户自己的字段,模拟"用户在 Quire 之外改过文件"
             let p = v.clips_dir().join(&saved.filename);
-            let text = fs::read_to_string(&p).unwrap().replace("tags: []\n", "tags: [手写的]\nmine: 1\n");
+            let text = fs::read_to_string(&p)
+                .unwrap()
+                .replace("tags: []\n", "tags: [手写的]\nmine: 1\n");
             fs::write(&p, text).unwrap();
-            let head = fs::read_to_string(&p).unwrap().split("---").nth(1).unwrap().to_string();
+            let head = fs::read_to_string(&p)
+                .unwrap()
+                .split("---")
+                .nth(1)
+                .unwrap()
+                .to_string();
             v.localize_images(&saved.filename, |_| {
                 Ok((Some("image/png".to_string()), b"x".to_vec()))
             })
             .unwrap();
             let after = fs::read_to_string(&p).unwrap();
-            assert_eq!(after.split("---").nth(1).unwrap(), head, "frontmatter 被动了:\n{after}");
+            assert_eq!(
+                after.split("---").nth(1).unwrap(),
+                head,
+                "frontmatter 被动了:\n{after}"
+            );
             p
         };
         assert!(path.exists());
@@ -770,7 +895,11 @@ mod tests {
         let (dir, v) = vault();
         v.ensure_dirs().unwrap();
         let saved = v
-            .save(&input("https://a.com/post", "下不来", "![a](https://cdn.x.com/a.png)\n"))
+            .save(&input(
+                "https://a.com/post",
+                "下不来",
+                "![a](https://cdn.x.com/a.png)\n",
+            ))
             .unwrap();
         let before = fs::read_to_string(v.clips_dir().join(&saved.filename)).unwrap();
 
@@ -792,17 +921,41 @@ mod tests {
     fn 删剪藏时图片跟着走() {
         let (dir, v) = vault();
         v.ensure_dirs().unwrap();
-        let saved = v.save(&input("https://a.com/post", "带图的", "![a](https://cdn.x.com/a.png)\n")).unwrap();
-        v.localize_images(&saved.filename, |_| Ok((Some("image/png".into()), b"x".to_vec()))).unwrap();
+        let saved = v
+            .save(&input(
+                "https://a.com/post",
+                "带图的",
+                "![a](https://cdn.x.com/a.png)\n",
+            ))
+            .unwrap();
+        v.localize_images(&saved.filename, |_| {
+            Ok((Some("image/png".into()), b"x".to_vec()))
+        })
+        .unwrap();
         assert!(v.assets_dir().join(&saved.id).join("0.png").exists());
 
         v.trash(&saved.filename).unwrap();
-        assert!(!v.assets_dir().join(&saved.id).exists(), "图片该跟着进回收站,别留孤儿");
-        assert!(v.trash_dir().join(crate::assets::ASSETS_DIR).join(&saved.id).join("0.png").exists());
+        assert!(
+            !v.assets_dir().join(&saved.id).exists(),
+            "图片该跟着进回收站,别留孤儿"
+        );
+        assert!(v
+            .trash_dir()
+            .join(crate::assets::ASSETS_DIR)
+            .join(&saved.id)
+            .join("0.png")
+            .exists());
 
         v.restore(&saved.filename).unwrap();
-        assert!(v.assets_dir().join(&saved.id).join("0.png").exists(), "撤销时图片也得回来");
-        assert!(!v.trash_dir().join(crate::assets::ASSETS_DIR).join(&saved.id).exists());
+        assert!(
+            v.assets_dir().join(&saved.id).join("0.png").exists(),
+            "撤销时图片也得回来"
+        );
+        assert!(!v
+            .trash_dir()
+            .join(crate::assets::ASSETS_DIR)
+            .join(&saved.id)
+            .exists());
         drop(dir);
     }
 
@@ -811,7 +964,9 @@ mod tests {
         // 手工放进去的 .md、没经过图片本地化的老剪藏,都没有 assets 目录
         let (dir, v) = vault();
         v.ensure_dirs().unwrap();
-        let saved = v.save(&input("https://a.com/post", "老剪藏", "没有图。\n")).unwrap();
+        let saved = v
+            .save(&input("https://a.com/post", "老剪藏", "没有图。\n"))
+            .unwrap();
         assert!(v.trash(&saved.filename).is_ok());
         assert!(v.restore(&saved.filename).is_ok());
         drop(dir);
@@ -821,12 +976,92 @@ mod tests {
     fn 图片目录不该混进列表() {
         let (dir, v) = vault();
         v.ensure_dirs().unwrap();
-        let saved = v.save(&input("https://a.com/post", "带图的", "![a](https://cdn.x.com/a.png)\n")).unwrap();
-        v.localize_images(&saved.filename, |_| Ok((Some("image/png".into()), b"x".to_vec()))).unwrap();
+        let saved = v
+            .save(&input(
+                "https://a.com/post",
+                "带图的",
+                "![a](https://cdn.x.com/a.png)\n",
+            ))
+            .unwrap();
+        v.localize_images(&saved.filename, |_| {
+            Ok((Some("image/png".into()), b"x".to_vec()))
+        })
+        .unwrap();
 
-        let names: Vec<String> = v.scan().unwrap().clips.into_iter().map(|c| c.filename).collect();
+        let names: Vec<String> = v
+            .scan()
+            .unwrap()
+            .clips
+            .into_iter()
+            .map(|c| c.filename)
+            .collect();
         assert_eq!(names, vec![saved.filename], "assets/ 目录不该出现在列表里");
-        assert!(v.scan().unwrap().unreadable.is_empty(), "assets/ 也不该被报成读不出元数据");
+        assert!(
+            v.scan().unwrap().unreadable.is_empty(),
+            "assets/ 也不该被报成读不出元数据"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn 认得出已经剪过的同一篇() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        v.save(&input("https://a.com/post", "第一遍", "正文"))
+            .unwrap();
+
+        let hit = v.find_by_url("https://a.com/post").unwrap();
+
+        assert_eq!(hit.map(|c| c.title), Some("第一遍".to_string()));
+        drop(dir);
+    }
+
+    #[test]
+    fn 不同文章不算重复() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        v.save(&input("https://a.com/post-1", "甲", "正文"))
+            .unwrap();
+        v.save(&input("https://a.com/post-2", "乙", "正文"))
+            .unwrap();
+
+        assert!(v.find_by_url("https://a.com/post-3").unwrap().is_none());
+        // 前缀相同的两个地址不能被当成同一篇
+        assert!(v.find_by_url("https://a.com/post").unwrap().is_none());
+        drop(dir);
+    }
+
+    #[test]
+    fn 末尾多个斜杠算同一篇() {
+        // 分享链接带不带尾斜杠是随意的,判成两篇纯粹恶心人
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        v.save(&input("https://a.com/post/", "甲", "正文")).unwrap();
+
+        assert!(v.find_by_url("https://a.com/post").unwrap().is_some());
+        assert!(v.find_by_url("  https://a.com/post//  ").unwrap().is_some());
+        drop(dir);
+    }
+
+    #[test]
+    fn 空地址不去库里找() {
+        // 剪贴板里没有链接的纯文本也会存,拿空串去全库比对毫无意义
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        v.save(&input("https://a.com/post", "甲", "正文")).unwrap();
+
+        assert!(v.find_by_url("   ").unwrap().is_none());
+        drop(dir);
+    }
+
+    #[test]
+    fn 读不出元数据的文件不会把查询搞崩() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        v.save(&input("https://a.com/post", "甲", "正文")).unwrap();
+        fs::write(v.clips_dir().join("坏文件.md"), "没有 frontmatter").unwrap();
+
+        assert!(v.find_by_url("https://a.com/post").unwrap().is_some());
         drop(dir);
     }
 
@@ -851,14 +1086,19 @@ mod tests {
     #[test]
     fn 保存后能从列表读回来() {
         let (_d, v) = vault();
-        let saved = v.save(&input(
-            "https://example.com/post/1",
-            "深入理解所有权",
-            "# 深入理解所有权\n\n正文内容。",
-        ))
-        .expect("应保存成功");
+        let saved = v
+            .save(&input(
+                "https://example.com/post/1",
+                "深入理解所有权",
+                "# 深入理解所有权\n\n正文内容。",
+            ))
+            .expect("应保存成功");
 
-        assert!(saved.filename.starts_with("2026-"), "文件名应带日期前缀: {}", saved.filename);
+        assert!(
+            saved.filename.starts_with("2026-"),
+            "文件名应带日期前缀: {}",
+            saved.filename
+        );
         assert!(saved.filename.ends_with("example-com.md"));
 
         let scan = v.scan().expect("应扫描成功");
@@ -872,7 +1112,11 @@ mod tests {
     fn 详情能取回不含frontmatter的正文() {
         let (_d, v) = vault();
         let saved = v
-            .save(&input("https://a.com/x", "标题", "# 标题\n\n第一段。\n\n第二段。"))
+            .save(&input(
+                "https://a.com/x",
+                "标题",
+                "# 标题\n\n第一段。\n\n第二段。",
+            ))
             .unwrap();
         let content = v.read_clip(&saved.filename).expect("应读到正文");
         assert!(content.body.starts_with("# 标题"));
@@ -884,14 +1128,24 @@ mod tests {
     fn 列表按剪藏时间倒序() {
         let (_d, v) = vault();
         for i in 0..3 {
-            v.save(&input(&format!("https://a{}.com/", i), &format!("第{}篇", i), "正文")).unwrap();
+            v.save(&input(
+                &format!("https://a{}.com/", i),
+                &format!("第{}篇", i),
+                "正文",
+            ))
+            .unwrap();
             // 同一毫秒内连续保存时,靠盐值保证 id 不重复;这里退一步也不该崩
         }
         let scan = v.scan().unwrap();
         assert_eq!(scan.clips.len(), 3);
         // id 倒序排完,任意两两之间不应出现逆序
         for w in scan.clips.windows(2) {
-            assert!(w[0].id >= w[1].id, "列表未按 id 倒序: {} < {}", w[0].id, w[1].id);
+            assert!(
+                w[0].id >= w[1].id,
+                "列表未按 id 倒序: {} < {}",
+                w[0].id,
+                w[1].id
+            );
         }
     }
 
@@ -899,28 +1153,71 @@ mod tests {
     fn 拒绝路径穿越的文件名() {
         let (_d, v) = vault();
         // 详情接口按文件名取正文,这条不守等于把用户整个磁盘开放出去
-        let err = v.read_clip("../../../Windows/System32/config/SAM.md").unwrap_err();
+        let err = v
+            .read_clip("../../../Windows/System32/config/SAM.md")
+            .unwrap_err();
         assert!(matches!(err, VaultError::UnsafeFilename(_)));
     }
 
     #[test]
-    fn 拒绝空内容和缺URL() {
+    fn 拒绝空内容() {
         let (_d, v) = vault();
         assert!(matches!(
-            v.save(&input("https://a.com/", "标题", "   \n  ")).unwrap_err(),
+            v.save(&input("https://a.com/", "标题", "   \n  "))
+                .unwrap_err(),
             VaultError::EmptyContent
         ));
-        assert!(matches!(
-            v.save(&input("  ", "标题", "正文")).unwrap_err(),
-            VaultError::MissingUrl
-        ));
+    }
+
+    #[test]
+    fn 没有原文地址也能存() {
+        // 「随手复制一段话」是 Quire 最常见的用法。用户按了 Ctrl+V 却只看到
+        // 一句「缺少原文地址」、什么都没存上——主路径被堵死,零门槛也就没了
+        let (dir, v) = vault();
+        let saved = v
+            .save(&input(
+                "",
+                "随手记的一个点子",
+                "今天想到:剪藏工具应该只存 Markdown",
+            ))
+            .unwrap();
+        assert!(dir.path().join("clips").join(&saved.filename).exists());
+    }
+
+    #[test]
+    fn 没有地址的剪藏站点标成剪贴板() {
+        // 站点栏空着的话,列表里就是" · 09-29 16:20"这么一行,看着像坏了
+        let (_d, v) = vault();
+        let saved = v.save(&input("", "随手记的一个点子", "正文")).unwrap();
+        let clip = v
+            .read_clip(&saved.filename)
+            .expect("刚存的剪藏应能读回来")
+            .summary;
+        assert_eq!(clip.site, "剪贴板");
+        assert_eq!(clip.url, "", "没有地址就老实留空,别编一个假链接出来");
+        assert!(
+            saved.filename.ends_with("-clipped.md"),
+            "文件名后缀要能看:{}",
+            saved.filename
+        );
+    }
+
+    #[test]
+    fn 没有地址的永远不算重复() {
+        // 两段毫不相干的话,地址都是空的。判重要是拿空串去比对,
+        // 结果就是"第二段话永远存不进去"——那是静默丢数据,比多存一份糟得多
+        let (_d, v) = vault();
+        v.save(&input("", "第一段", "今天天气不错")).unwrap();
+        v.save(&input("", "第二段", "顺便记个电话")).unwrap();
+        assert_eq!(v.scan().unwrap().clips.len(), 2, "两段都得在");
     }
 
     #[test]
     fn 抽不到标题时用主机名兜底() {
         // SPA 和纯图片文章抽不出标题是常态,列表里不能是一片空白
         let (_d, v) = vault();
-        v.save(&input("https://news.example.com/story", "", "正文")).unwrap();
+        v.save(&input("https://news.example.com/story", "", "正文"))
+            .unwrap();
         let scan = v.scan().unwrap();
         assert_eq!(scan.clips[0].title, "news.example.com");
     }
@@ -946,7 +1243,8 @@ mod tests {
     fn 坏文件被报告而不是静默丢弃() {
         // 用户可能正手动编辑 vault 里的文件。悄悄跳过会让人以为剪藏丢了。
         let (_d, v) = vault();
-        v.save(&input("https://a.com/1", "正常文章", "正文")).unwrap();
+        v.save(&input("https://a.com/1", "正常文章", "正文"))
+            .unwrap();
         fs::write(v.clips_dir().join("broken.md"), "这里没有 frontmatter").unwrap();
         fs::write(v.clips_dir().join("note.txt"), "不是 md").unwrap();
 
@@ -968,7 +1266,10 @@ mod tests {
         .unwrap();
 
         let scan = v.scan().unwrap();
-        assert!(scan.clips.iter().any(|c| c.title == "手写的"), "CRLF 文件应能解析");
+        assert!(
+            scan.clips.iter().any(|c| c.title == "手写的"),
+            "CRLF 文件应能解析"
+        );
     }
 
     #[test]
@@ -977,7 +1278,12 @@ mod tests {
         // 自定义字段、换行风格、正文里的空行全洗掉的话,Quire 就成了那个
         // 「存下来其实是租的」的工具——只是租给了 Quire 自己。
         let (_d, v) = vault();
-        v.save(&input("https://a.com/1", "标题", "第一段\n\n第二段  \n缩进")).unwrap();
+        v.save(&input(
+            "https://a.com/1",
+            "标题",
+            "第一段\n\n第二段  \n缩进",
+        ))
+        .unwrap();
         // 文件名是 save 自己算的(日期+id+主机名),别在这儿猜——猜错了
         // 测试会报「文件不存在」,跟被测的逻辑八竿子打不着
         let name = v.scan().unwrap().clips[0].filename.clone();
@@ -1017,7 +1323,10 @@ mod tests {
         let rewritten = fs::read_to_string(&path).unwrap();
         let (block, _) = frontmatter::split(&rewritten).unwrap();
         let fm = Frontmatter::parse(block);
-        assert!(fm.extra.contains_key("rating"), "rating 是用户自己加的,不能丢");
+        assert!(
+            fm.extra.contains_key("rating"),
+            "rating 是用户自己加的,不能丢"
+        );
         assert!(fm.extra.contains_key("status"), "status 同理");
     }
 
@@ -1055,7 +1364,10 @@ mod tests {
     #[test]
     fn 改已读状态拒绝路径穿越() {
         let (_d, v) = vault();
-        assert!(v.set_flags("../../evil.md", Some(true), None).is_err(), "不能写到 vault 外面");
+        assert!(
+            v.set_flags("../../evil.md", Some(true), None).is_err(),
+            "不能写到 vault 外面"
+        );
     }
 
     #[test]
@@ -1064,15 +1376,20 @@ mod tests {
         // 所以是纯 Markdown,不是 zip、不是 json、不是自家格式。用户拿这个文件
         // 丢进 Obsidian / Logseq / 任何编辑器,都得是能看的东西。
         let (_d, v) = vault();
-        v.save(&input("https://a.com/1", "第一篇", "正文一")).unwrap();
-        v.save(&input("https://b.com/2", "第二篇", "正文二")).unwrap();
+        v.save(&input("https://a.com/1", "第一篇", "正文一"))
+            .unwrap();
+        v.save(&input("https://b.com/2", "第二篇", "正文二"))
+            .unwrap();
 
         let out = v.export_markdown().unwrap();
         assert!(out.contains("| 标题 |"), "开头应有索引表格");
         assert!(out.contains("第一篇"), "清单里应有第一篇");
         assert!(out.contains("第二篇"));
         assert!(out.contains("正文一"), "正文不能只导标题——那等于只导了目录");
-        assert!(out.contains("https://a.com/1"), "原文地址必须留着,否则回溯链断了");
+        assert!(
+            out.contains("https://a.com/1"),
+            "原文地址必须留着,否则回溯链断了"
+        );
     }
 
     #[test]
@@ -1098,12 +1415,15 @@ mod tests {
 
         let out = v.export_markdown().unwrap();
         // 首尾各一个 hr 分隔整篇,正文里不该再出现 --- 行
-        let hr_lines = out
-            .lines()
-            .filter(|l| l.trim() == "---")
-            .count();
-        assert_eq!(hr_lines, 1, "只该有开头那一道分隔线,不该把每个 clip 的 YAML 也带进来");
-        assert!(!out.contains("clipped_at:"), "frontmatter 字段不该出现在导出里");
+        let hr_lines = out.lines().filter(|l| l.trim() == "---").count();
+        assert_eq!(
+            hr_lines, 1,
+            "只该有开头那一道分隔线,不该把每个 clip 的 YAML 也带进来"
+        );
+        assert!(
+            !out.contains("clipped_at:"),
+            "frontmatter 字段不该出现在导出里"
+        );
     }
 
     #[test]
@@ -1121,7 +1441,11 @@ mod tests {
         let (_d, v) = vault();
         v.save(&input("https://a.com/1", "好的", "正文")).unwrap();
         v.ensure_dirs().unwrap();
-        fs::write(v.clips_dir().join("broken.md"), "这个文件根本没有 frontmatter").unwrap();
+        fs::write(
+            v.clips_dir().join("broken.md"),
+            "这个文件根本没有 frontmatter",
+        )
+        .unwrap();
 
         let out = v.export_markdown().unwrap();
         assert!(out.contains("好的"), "正常的那篇必须还在");
@@ -1144,5 +1468,79 @@ mod tests {
         let b = v.save(&input("https://a.com/p", "标题", "第二次")).unwrap();
         assert_ne!(a.filename, b.filename, "两次剪藏不应共用文件名");
         assert_eq!(v.scan().unwrap().clips.len(), 2);
+    }
+
+    #[test]
+    fn 存之前判重_重复的只报已有那篇() {
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        let first = v
+            .save(&input("https://a.com/post", "第一遍", "原正文"))
+            .unwrap();
+
+        // 末尾多个斜杠指的是同一篇,不该当成两篇
+        let again = input("https://a.com/post/", "第二遍", "新正文");
+        match v.save_checked(&again, false).unwrap() {
+            SaveOutcome::Duplicate { filename, title } => {
+                assert_eq!(filename, first.filename, "要报的是库里那篇,不是刚剪的");
+                assert_eq!(title, "第一遍");
+            }
+            SaveOutcome::Saved { .. } => panic!("同一篇地址不该存第二份"),
+        }
+        assert_eq!(v.scan().unwrap().clips.len(), 1, "库里应该还是一篇");
+    }
+
+    #[test]
+    fn 判重时不碰已有那篇的正文() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let first = v
+            .save(&input("https://a.com/post", "标题", "原正文"))
+            .unwrap();
+        let before =
+            std::fs::read_to_string(dir.path().join("clips").join(&first.filename)).unwrap();
+
+        v.save_checked(&input("https://a.com/post", "新标题", "新正文"), false)
+            .unwrap();
+
+        let after =
+            std::fs::read_to_string(dir.path().join("clips").join(&first.filename)).unwrap();
+        assert_eq!(before, after, "判重是只读的,不该把已有剪藏重写一遍");
+    }
+
+    #[test]
+    fn 用户坚持就照存() {
+        // 文章更新了想重存一份,这是合理需求。判重不能变成死胡同——
+        // 不给出口的话,用户唯一能做的就是自己去剪藏目录里改文件名。
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        v.save(&input("https://a.com/post", "第一遍", "原正文"))
+            .unwrap();
+
+        let again = input("https://a.com/post", "第二遍", "新正文");
+        match v.save_checked(&again, true).unwrap() {
+            SaveOutcome::Saved { filename, .. } => {
+                assert!(dir.path().join("clips").join(&filename).exists())
+            }
+            SaveOutcome::Duplicate { .. } => panic!("用户坚持了就不该再拦"),
+        }
+        assert_eq!(v.scan().unwrap().clips.len(), 2, "两篇都得在");
+    }
+
+    #[test]
+    fn 删掉的可以重新剪() {
+        // 删掉再剪同一篇,是"我后悔了想存回来",不是重复
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v
+            .save(&input("https://a.com/post", "标题", "正文"))
+            .unwrap();
+        v.trash(&saved.filename).unwrap();
+
+        let again = input("https://a.com/post", "标题", "正文");
+        assert!(matches!(
+            v.save_checked(&again, false).unwrap(),
+            SaveOutcome::Saved { .. }
+        ));
     }
 }

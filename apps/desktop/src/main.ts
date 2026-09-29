@@ -490,27 +490,64 @@ async function openDetail(filename: string): Promise<void> {
   }
 }
 
-async function saveCapture(capture: ClipboardCapture): Promise<void> {
+/** 存一篇剪藏。返回 `null` 表示存成了,返回文件名表示"已经剪过了"。
+ *
+ *  判重交给后端做——地址来自剪贴板,前端那份和库里那份没法保证同源。
+ *  `force` 来自用户在重复提示里点了「仍然存一份」。 */
+async function saveCapture(
+  capture: ClipboardCapture,
+  force = false,
+): Promise<string | null> {
   const { markdown, title, excerpt, meta } = clipToMarkdown(capture);
   if (!markdown.trim()) {
     showError("剪贴板里没有可保存的内容");
-    return;
+    return null;
   }
-  await api.saveClip({
-    schemaVersion: 1,
-    url: capture.url ?? "",
-    title,
-    // 有扩展就用它给的站点显示名,没有就留空让后端从 URL 推主机名
-    siteName: meta["quire-site"] ?? "",
-    author: meta["quire-author"] ?? null,
-    excerpt: excerpt || null,
-    markdown,
-    publishedAt: meta["quire-published"] ?? null,
-    image: meta["quire-image"] ?? null,
-    // 剪贴板里没有 favicon,存进去只会是个永远加载不出来的死链
-    favicon: null,
-  });
+  const outcome = await api.saveClip(
+    {
+      schemaVersion: 1,
+      url: capture.url ?? "",
+      title,
+      // 有扩展就用它给的站点显示名,没有就留空让后端从 URL 推主机名
+      siteName: meta["quire-site"] ?? "",
+      author: meta["quire-author"] ?? null,
+      excerpt: excerpt || null,
+      markdown,
+      publishedAt: meta["quire-published"] ?? null,
+      image: meta["quire-image"] ?? null,
+      // 剪贴板里没有 favicon,存进去只会是个永远加载不出来的死链
+      favicon: null,
+    },
+    force,
+  );
   clearError();
+  return outcome.status === "duplicate" ? outcome.filename : null;
+}
+
+/** 同一篇已经剪过了。用户复制这一下多半是有目的的,真正想要的一般是
+ *  **已经存的那篇**,所以第一按钮是跳过去。
+ *
+ *  「仍然存一份」不能省:文章更新了想重存是合理需求,判重一旦只进不出,
+ *  用户就只剩"自己去剪藏目录里改文件名"这一条路——那不是防重复,
+ *  那是把活推给用户。 */
+function announceDuplicate(filename: string, capture: ClipboardCapture): void {
+  showToast("这篇之前剪过了", [
+    { label: "打开它", primary: true, onClick: () => void openDetail(filename) },
+    {
+      label: "仍然存一份",
+      onClick: () => {
+        hideToast();
+        void saveCapture(capture, true)
+          .then((again) => {
+            // 判重是后端说了算,带着 force 仍被判重说明中间有人动过库
+            if (again) announceDuplicate(again, capture);
+            else showToast("已剪藏");
+          })
+          .catch((err) => showError(String(err)));
+      },
+    },
+    { label: "关闭", onClick: hideToast },
+  ]);
 }
 
 async function pasteNow(): Promise<void> {
@@ -520,8 +557,9 @@ async function pasteNow(): Promise<void> {
       showError("剪贴板是空的,先在别处复制点内容");
       return;
     }
-    await saveCapture(capture);
-    showToast("已剪藏");
+    const duplicate = await saveCapture(capture);
+    if (duplicate) announceDuplicate(duplicate, capture);
+    else showToast("已剪藏");
   } catch (err) {
     showError(String(err));
   }
@@ -759,7 +797,10 @@ async function boot(): Promise<void> {
           hideToast();
           if (!capture) return;
           void saveCapture(capture)
-            .then(() => showToast("已剪藏"))
+            .then((duplicate) => {
+              if (duplicate) announceDuplicate(duplicate, capture);
+              else showToast("已剪藏");
+            })
             .catch((err) => showError(String(err)));
         },
       },

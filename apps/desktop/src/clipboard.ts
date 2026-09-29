@@ -10,12 +10,13 @@ export interface ClipboardCapture {
   meta: Record<string, string>;
 }
 
-/** 剪藏落盘后返回。字段名与 Rust 侧 `SavedClip` 一致。 */
-export interface SavedClip {
-  id: string;
-  filename: string;
-  path: string;
-}
+/** 剪藏落盘后的结果。字段名与 Rust 侧 `SaveOutcome` 一致。
+ *
+ *  `duplicate` 是个正常的结局,不是错误:同一篇文章不该在列表里出现两次。
+ *  界面上要给出「跳到已经剪过的那篇」的入口,而不是干巴巴一句"已存在"。 */
+export type SaveOutcome =
+  | { status: "saved"; id: string; filename: string }
+  | { status: "duplicate"; filename: string; title: string };
 
 /** 落盘请求体。字段名与 Rust 侧 `ClipInput` 一致(camelCase)。 */
 export interface ClipInput {

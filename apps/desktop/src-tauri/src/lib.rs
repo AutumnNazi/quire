@@ -26,11 +26,11 @@ use std::time::Duration;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use chrono::Local;
 use clipboard::ClipboardCapture;
 use search::SearchHit;
-use chrono::Local;
 use tauri_plugin_dialog::DialogExt;
-use vault::{ClipContent, ClipInput, ClipSummary, SavedClip, ScanResult, SharedVault, Vault};
+use vault::{ClipContent, ClipInput, ClipSummary, SaveOutcome, ScanResult, SharedVault, Vault};
 
 /// 剪贴板轮询间隔。开启监控后一直在读剪贴板,太密会白耗 CPU,
 /// 太疏则用户复制完要干等。
@@ -72,7 +72,11 @@ struct ClipSavedNotice {
 
 fn current_vault(state: &State<AppState>) -> Result<Arc<Vault>, String> {
     // 锁中毒说明别的线程 panic 过,此时 vault 状态不可信,直接报错让用户重启
-    state.vault.read().map(|g| g.clone()).map_err(|e| e.to_string())
+    state
+        .vault
+        .read()
+        .map(|g| g.clone())
+        .map_err(|e| e.to_string())
 }
 
 fn info_of(state: &State<AppState>) -> VaultInfo {
@@ -131,7 +135,9 @@ fn set_clip_flags(
     state: State<AppState>,
 ) -> Result<ClipSummary, String> {
     let vault = current_vault(&state)?;
-    vault.set_flags(&filename, read, archived).map_err(|e| e.to_string())
+    vault
+        .set_flags(&filename, read, archived)
+        .map_err(|e| e.to_string())
 }
 
 /// 移进回收站。**不真删**——剪藏工具里唯一能把用户东西弄没的操作,
@@ -192,19 +198,26 @@ fn capture_clipboard() -> Result<ClipboardCapture, String> {
 fn save_clip(
     app: AppHandle,
     input: ClipInput,
+    force: Option<bool>,
     state: State<AppState>,
-) -> Result<SavedClip, String> {
+) -> Result<SaveOutcome, String> {
     let vault = current_vault(&state)?;
-    let saved = vault.save(&input).map_err(|e| e.to_string())?;
-    let _ = app.emit(
-        "clip-saved",
-        ClipSavedNotice {
-            id: saved.id.clone(),
-            filename: saved.filename.clone(),
-        },
-    );
-    spawn_image_localization(app, vault, saved.filename.clone());
-    Ok(saved)
+    // 判重放在真正落盘之前。同一篇文章存两遍,列表里就多一条一模一样的,
+    // 用户得自己认出哪条是新的——那是在替软件擦屁股。
+    let outcome = vault
+        .save_checked(&input, force.unwrap_or(false))
+        .map_err(|e| e.to_string())?;
+    if let SaveOutcome::Saved { id, filename } = &outcome {
+        let _ = app.emit(
+            "clip-saved",
+            ClipSavedNotice {
+                id: id.clone(),
+                filename: filename.clone(),
+            },
+        );
+        spawn_image_localization(app, vault, filename.clone());
+    }
+    Ok(outcome)
 }
 
 /// 后台把文章里的图片下到本地,下完再发一次 `clip-saved-images`。
@@ -242,7 +255,13 @@ fn spawn_image_localization(app: AppHandle, vault: Arc<Vault>, filename: String)
         });
         if let Ok((saved, _)) = result {
             if saved > 0 {
-                let _ = app.emit("clip-saved-images", ImagesLocalized { filename, count: saved });
+                let _ = app.emit(
+                    "clip-saved-images",
+                    ImagesLocalized {
+                        filename,
+                        count: saved,
+                    },
+                );
             }
         }
     });
@@ -256,7 +275,10 @@ fn set_clipboard_watch(enabled: bool, state: State<AppState>) -> Result<VaultInf
         // 开启的瞬间把剪贴板里现有的内容记成"已见"。否则用户刚打开开关,
         // 就会被自己几分钟前复制的东西弹一次提示,平白觉得这东西在窥探。
         if let Ok(capture) = clipboard::capture_clipboard() {
-            state.watch.last_hash.store(hash_of(&capture), Ordering::Relaxed);
+            state
+                .watch
+                .last_hash
+                .store(hash_of(&capture), Ordering::Relaxed);
         }
     }
     state.watch.enabled.store(enabled, Ordering::Relaxed);
@@ -265,7 +287,10 @@ fn set_clipboard_watch(enabled: bool, state: State<AppState>) -> Result<VaultInf
 
 /// 弹出目录选择器,选完立刻切换并广播。取消选择返回 None,保持原目录不变。
 #[tauri::command]
-async fn pick_vault(app: AppHandle, state: State<'_, AppState>) -> Result<Option<VaultInfo>, String> {
+async fn pick_vault(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<VaultInfo>, String> {
     use tauri_plugin_dialog::DialogExt;
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -326,24 +351,22 @@ fn default_vault_dir() -> PathBuf {
 /// 后台轮询剪贴板。默认关闭,只把内容**通知**给前端,不自动保存——
 /// 自动存等于替用户做决定,而且监控开着的时候什么都会往里灌。
 fn start_clipboard_watch(app: AppHandle, state: Arc<WatchState>) {
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_millis(WATCH_INTERVAL_MS));
-            if !state.enabled.load(Ordering::Relaxed) {
-                continue;
-            }
-            let Ok(capture) = clipboard::capture_clipboard() else {
-                continue;
-            };
-            if capture.is_empty() {
-                continue;
-            }
-            let hash = hash_of(&capture);
-            if state.last_hash.swap(hash, Ordering::Relaxed) == hash {
-                continue;
-            }
-            let _ = app.emit("clipboard-changed", capture);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(WATCH_INTERVAL_MS));
+        if !state.enabled.load(Ordering::Relaxed) {
+            continue;
         }
+        let Ok(capture) = clipboard::capture_clipboard() else {
+            continue;
+        };
+        if capture.is_empty() {
+            continue;
+        }
+        let hash = hash_of(&capture);
+        if state.last_hash.swap(hash, Ordering::Relaxed) == hash {
+            continue;
+        }
+        let _ = app.emit("clipboard-changed", capture);
     });
 }
 
