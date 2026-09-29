@@ -228,11 +228,39 @@ impl Frontmatter {
         push("title", &format!("\"{}\"", escape(&self.title)));
         push("url", &format!("\"{}\"", escape(&self.url)));
         push("site", &format!("\"{}\"", escape(&self.site)));
-        push("author", &self.author.as_deref().map(|s| format!("\"{}\"", escape(s))).unwrap_or_default());
+        push(
+            "author",
+            &self
+                .author
+                .as_deref()
+                .map(|s| format!("\"{}\"", escape(s)))
+                .unwrap_or_default(),
+        );
         push("clipped_at", &format!("\"{}\"", escape(&self.clipped_at)));
-        push("published_at", &self.published_at.as_deref().map(|s| format!("\"{}\"", escape(s))).unwrap_or_default());
-        push("excerpt", &self.excerpt.as_deref().map(|s| format!("\"{}\"", escape(s))).unwrap_or_default());
-        push("cover", &self.cover.as_deref().map(|s| format!("\"{}\"", escape(s))).unwrap_or_default());
+        push(
+            "published_at",
+            &self
+                .published_at
+                .as_deref()
+                .map(|s| format!("\"{}\"", escape(s)))
+                .unwrap_or_default(),
+        );
+        push(
+            "excerpt",
+            &self
+                .excerpt
+                .as_deref()
+                .map(|s| format!("\"{}\"", escape(s)))
+                .unwrap_or_default(),
+        );
+        push(
+            "cover",
+            &self
+                .cover
+                .as_deref()
+                .map(|s| format!("\"{}\"", escape(s)))
+                .unwrap_or_default(),
+        );
         push("tags", &render_value(&Value::List(self.tags.clone())));
         push("read", &self.read.to_string());
         push("archived", &self.archived.to_string());

@@ -98,7 +98,9 @@ mod tests {
     fn 只含base36字符集() {
         let id = new_id(1_789_123_456_789, 0xDEAD_BEEF);
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
-        assert!(id.chars().all(|c| BASE36.contains(&(c as u8).to_ascii_lowercase())));
+        assert!(id
+            .chars()
+            .all(|c| BASE36.contains(&(c as u8).to_ascii_lowercase())));
     }
 
     #[test]

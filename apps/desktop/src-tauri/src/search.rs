@@ -204,8 +204,7 @@ fn snippet<'a>(body: &str, tokens: impl Iterator<Item = &'a str>) -> String {
     const WINDOW: usize = 60;
 
     // body 传进来时已经是小写版,词条也是小写的,直接找
-    let Some(start) = tokens.filter_map(|t| body.find(t)).min()
-    else {
+    let Some(start) = tokens.filter_map(|t| body.find(t)).min() else {
         return first_chars(body, WINDOW);
     };
 
@@ -373,7 +372,11 @@ mod tests {
     #[test]
     fn 标题命中的排在正文命中之前() {
         let (_d, v) = vault_with(&[
-            ("https://a.com/1", "完全不相干的标题", "这里提到了编程这个词"),
+            (
+                "https://a.com/1",
+                "完全不相干的标题",
+                "这里提到了编程这个词",
+            ),
             ("https://a.com/2", "编程", "这里讲的是别的东西"),
         ]);
         let hits = search(&v, "编程", 10).unwrap();
@@ -398,7 +401,13 @@ mod tests {
     #[test]
     fn 限制条数真的生效() {
         let clips: Vec<(String, String, String)> = (0..5)
-            .map(|i| (format!("https://a.com/{i}"), "同一个标题".to_string(), "同一个词".to_string()))
+            .map(|i| {
+                (
+                    format!("https://a.com/{i}"),
+                    "同一个标题".to_string(),
+                    "同一个词".to_string(),
+                )
+            })
             .collect();
         let borrowed: Vec<(&str, &str, &str)> = clips
             .iter()
@@ -440,7 +449,10 @@ mod tests {
         // 搜 rust 不该把 rustacean 也拽出来——用户搜的是 Rust 这门语言,
         // 不是碰巧含这四个字母的任何词
         let (_d, v) = vault_with(&[("https://a.com/1", "标题", "The rustacean is a crab")]);
-        assert!(search(&v, "rust", 10).unwrap().is_empty(), "rust 是 rustacean 的子串,不该算命中");
+        assert!(
+            search(&v, "rust", 10).unwrap().is_empty(),
+            "rust 是 rustacean 的子串,不该算命中"
+        );
     }
 
     #[test]
@@ -489,7 +501,10 @@ mod tests {
         let hits = search(&v, "关键", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].snippet.contains("关键"));
-        assert!(hits[0].snippet.chars().count() < 200, "片段不该把整篇塞进来");
+        assert!(
+            hits[0].snippet.chars().count() < 200,
+            "片段不该把整篇塞进来"
+        );
     }
 }
 
@@ -546,7 +561,10 @@ mod perf {
         let start = std::time::Instant::now();
         let hits = search(&v, query, 200).unwrap();
         let elapsed = start.elapsed();
-        println!("1000 篇(全部命中,最坏情况),搜「{query}」耗时 {elapsed:?},命中 {} 条", hits.len());
+        println!(
+            "1000 篇(全部命中,最坏情况),搜「{query}」耗时 {elapsed:?},命中 {} 条",
+            hits.len()
+        );
         assert!(!hits.is_empty(), "造的数据里应该有命中");
         // 门限放得宽,只为挡住数量级的劣化;debug 构建比 release 慢不少
         assert!(elapsed.as_secs() < 5, "搜 1000 篇用了 {elapsed:?},太慢了");

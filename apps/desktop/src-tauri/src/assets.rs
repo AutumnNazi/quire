@@ -54,8 +54,14 @@ fn scan_refs(markdown: &str) -> Vec<Ref<'_>> {
                 if let Some(len) = markdown[start..].find(')') {
                     let end = start + len;
                     let url = markdown[start..end].trim();
-                    let lead = start + (markdown[start..end].len() - markdown[start..end].trim_start().len());
-                    out.push(Ref { url: &markdown[lead..lead + url.len()], start: lead, end: lead + url.len(), quote: None });
+                    let lead = start
+                        + (markdown[start..end].len() - markdown[start..end].trim_start().len());
+                    out.push(Ref {
+                        url: &markdown[lead..lead + url.len()],
+                        start: lead,
+                        end: lead + url.len(),
+                        quote: None,
+                    });
                     i = end;
                     continue;
                 }
@@ -71,7 +77,12 @@ fn scan_refs(markdown: &str) -> Vec<Ref<'_>> {
                 let tag = &markdown[i..tag_end];
                 if let Some((value, quote)) = attribute(tag, "src") {
                     let start = i + (tag.find(&value).unwrap_or(0));
-                    out.push(Ref { url: &markdown[start..start + value.len()], start, end: start + value.len(), quote: Some(quote) });
+                    out.push(Ref {
+                        url: &markdown[start..start + value.len()],
+                        start,
+                        end: start + value.len(),
+                        quote: Some(quote),
+                    });
                 }
                 i = tag_end + 1;
                 continue;
@@ -109,7 +120,10 @@ fn attribute(tag: &str, name: &str) -> Option<(String, char)> {
         let at = from + at;
         from = at + name.len();
         // 名字得是完整的一个属性,不能从 `data-src` 里蹭出一个 src
-        let ok = at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'-' || bytes[at - 1] == b':');
+        let ok = at == 0
+            || !(bytes[at - 1].is_ascii_alphanumeric()
+                || bytes[at - 1] == b'-'
+                || bytes[at - 1] == b':');
         if !ok {
             continue;
         }
@@ -138,7 +152,12 @@ pub fn relative_path(clip_id: &str, index: usize, extension: &str) -> String {
 /// 是什么,还是按真实类型存。
 pub fn extension_for(content_type: Option<&str>, url: &str) -> String {
     if let Some(ct) = content_type {
-        let base = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        let base = ct
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         if base.starts_with("image/") {
             return match base.as_str() {
                 "image/jpeg" | "image/jpg" => "jpg",
@@ -184,7 +203,9 @@ pub fn rewrite_image_srcs(markdown: &str, map: &[(String, String)]) -> String {
     let mut out = String::with_capacity(markdown.len());
     let mut cursor = 0;
     for r in scan_refs(markdown) {
-        let Some((_, local)) = map.iter().find(|(remote, _)| remote == r.url) else { continue };
+        let Some((_, local)) = map.iter().find(|(remote, _)| remote == r.url) else {
+            continue;
+        };
         // 落在扫描区间之前的内容原样搬过去
         out.push_str(&markdown[cursor..r.start]);
         out.push_str(local);
@@ -266,7 +287,10 @@ mod tests {
     fn 只认远程的图() {
         let md = "![a](https://cdn.example.com/1.png)\n\n<img src=\"http://x.com/2.jpg\">\n\n![b](assets/abc/0.png)\n\n![c](data:image/png;base64,AAA)\n";
         let urls = extract_image_urls(md);
-        assert_eq!(urls, vec!["https://cdn.example.com/1.png", "http://x.com/2.jpg"]);
+        assert_eq!(
+            urls,
+            vec!["https://cdn.example.com/1.png", "http://x.com/2.jpg"]
+        );
     }
 
     #[test]
@@ -290,7 +314,10 @@ mod tests {
     #[test]
     fn 扩展名优先听服务器说的() {
         assert_eq!(extension_for(Some("image/webp"), "https://a.com/x"), "webp");
-        assert_eq!(extension_for(Some("image/jpeg; charset=binary"), "https://a.com/x"), "jpg");
+        assert_eq!(
+            extension_for(Some("image/jpeg; charset=binary"), "https://a.com/x"),
+            "jpg"
+        );
         // 服务器不说就退到 URL 里的后缀
         assert_eq!(extension_for(None, "https://a.com/pic.GIF"), "gif");
         assert_eq!(extension_for(None, "https://a.com/pic"), "bin");
@@ -299,19 +326,31 @@ mod tests {
     #[test]
     fn 不是图片就别存() {
         assert_eq!(extension_for(Some("text/html"), "https://a.com/x"), "");
-        assert_eq!(extension_for(Some("application/pdf"), "https://a.com/x"), "");
+        assert_eq!(
+            extension_for(Some("application/pdf"), "https://a.com/x"),
+            ""
+        );
     }
 
     #[test]
     fn 把下好的图换成相对路径() {
         let md = "![封面](https://cdn.example.com/a.png)\n\n正文。\n\n<img src=\"https://cdn.example.com/b.jpg\" alt=\"图\">\n";
         let map = vec![
-            ("https://cdn.example.com/a.png".to_string(), "assets/m1/0.png".to_string()),
-            ("https://cdn.example.com/b.jpg".to_string(), "assets/m1/1.jpg".to_string()),
+            (
+                "https://cdn.example.com/a.png".to_string(),
+                "assets/m1/0.png".to_string(),
+            ),
+            (
+                "https://cdn.example.com/b.jpg".to_string(),
+                "assets/m1/1.jpg".to_string(),
+            ),
         ];
         let out = rewrite_image_srcs(md, map.as_slice());
         assert!(out.contains("![封面](assets/m1/0.png)"), "{out}");
-        assert!(out.contains(r#"<img src="assets/m1/1.jpg" alt="图">"#), "{out}");
+        assert!(
+            out.contains(r#"<img src="assets/m1/1.jpg" alt="图">"#),
+            "{out}"
+        );
         assert!(!out.contains("cdn.example.com"), "{out}");
         assert!(out.contains("正文。"), "{out}");
     }
@@ -321,7 +360,10 @@ mod tests {
         // 下载失败的图必须还指着原站。宁可让它裂,也不能把链接改成
         // 一个不存在的本地路径——那样用户连"图原来在哪"都找不回来了
         let md = "![a](https://cdn.example.com/ok.png)\n\n![b](https://cdn.example.com/gone.png)\n";
-        let map = vec![("https://cdn.example.com/ok.png".to_string(), "assets/m1/0.png".to_string())];
+        let map = vec![(
+            "https://cdn.example.com/ok.png".to_string(),
+            "assets/m1/0.png".to_string(),
+        )];
         let out = rewrite_image_srcs(md, map.as_slice());
         assert!(out.contains("assets/m1/0.png"));
         assert!(out.contains("https://cdn.example.com/gone.png"), "{out}");
@@ -329,8 +371,12 @@ mod tests {
 
     #[test]
     fn 改写不能动到别的内容() {
-        let md = "# 标题\n\n[链接](https://a.com/1.png)\n\n正文里有 https://a.com/1.png 这个字样。\n";
-        let map = vec![("https://a.com/1.png".to_string(), "assets/m1/0.png".to_string())];
+        let md =
+            "# 标题\n\n[链接](https://a.com/1.png)\n\n正文里有 https://a.com/1.png 这个字样。\n";
+        let map = vec![(
+            "https://a.com/1.png".to_string(),
+            "assets/m1/0.png".to_string(),
+        )];
         let out = rewrite_image_srcs(md, map.as_slice());
         // 裸链接和正文里的字样都不是图片,一个字都不能动
         assert_eq!(out, md);
@@ -370,7 +416,9 @@ mod tests {
                         "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
-                    let _ = stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(body));
+                    let _ = stream
+                        .write_all(head.as_bytes())
+                        .and_then(|_| stream.write_all(body));
                 } else {
                     let _ = stream.write_all(
                         b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -411,7 +459,11 @@ mod tests {
         assert_eq!(ok, 1, "一张都没下下来");
         assert_eq!(failed, 0);
         let saved = dir.path().join("m1").join("0.png");
-        assert_eq!(std::fs::read(&saved).unwrap(), PNG, "落盘的内容得跟服务器给的一模一样");
+        assert_eq!(
+            std::fs::read(&saved).unwrap(),
+            PNG,
+            "落盘的内容得跟服务器给的一模一样"
+        );
     }
 
     #[test]
@@ -423,7 +475,6 @@ mod tests {
 
         let (new_body, _, _) = localize(&md, "m1", dir.path(), reqwest_fetch).unwrap();
         assert!(new_body.contains("assets/m1/0.png"), "{new_body}");
-
     }
 
     #[test]

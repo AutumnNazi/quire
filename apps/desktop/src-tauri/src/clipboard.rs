@@ -44,8 +44,7 @@ pub struct ClipboardCapture {
 impl ClipboardCapture {
     /// 什么有效内容都没有时,别给用户一个空剪藏。
     pub fn is_empty(&self) -> bool {
-        self.html.as_deref().map(str::trim).unwrap_or("").is_empty()
-            && self.text.trim().is_empty()
+        self.html.as_deref().map(str::trim).unwrap_or("").is_empty() && self.text.trim().is_empty()
     }
 }
 
@@ -359,8 +358,8 @@ mod platform {
     /// `真实剪贴板往返` 那条测试写完立刻读回来比对,写错就是写错。
     #[cfg(test)]
     pub fn set_html_for_test(raw: &[u8]) {
-        use windows_sys::Win32::System::Memory::{GlobalAlloc, GMEM_MOVEABLE};
         use windows_sys::Win32::System::DataExchange::EmptyClipboard;
+        use windows_sys::Win32::System::Memory::{GlobalAlloc, GMEM_MOVEABLE};
 
         unsafe {
             let mut name: Vec<u16> = "HTML Format".encode_utf16().collect();
@@ -400,7 +399,10 @@ mod platform {
         pub fn take() -> Self {
             use windows_sys::Win32::System::DataExchange::EmptyClipboard;
 
-            let mut snapshot = Snapshot { html: None, text: None };
+            let mut snapshot = Snapshot {
+                html: None,
+                text: None,
+            };
             unsafe {
                 let mut name: Vec<u16> = "HTML Format".encode_utf16().collect();
                 name.push(0);
@@ -420,8 +422,8 @@ mod platform {
         }
 
         pub fn restore(self) {
-            use windows_sys::Win32::System::Memory::{GlobalAlloc, GMEM_MOVEABLE};
             use windows_sys::Win32::System::DataExchange::EmptyClipboard;
+            use windows_sys::Win32::System::Memory::{GlobalAlloc, GMEM_MOVEABLE};
 
             unsafe {
                 let mut name: Vec<u16> = "HTML Format".encode_utf16().collect();
@@ -432,15 +434,18 @@ mod platform {
                 }
                 EmptyClipboard();
                 for (format, bytes) in [
-                    (CF_UNICODETEXT_U32, self.text.map(|t| {
-                        let mut u: Vec<u16> = t.encode_utf16().collect();
-                        u.push(0);
-                        let mut raw = Vec::new();
-                        for c in u {
-                            raw.extend_from_slice(&c.to_ne_bytes());
-                        }
-                        raw
-                    })),
+                    (
+                        CF_UNICODETEXT_U32,
+                        self.text.map(|t| {
+                            let mut u: Vec<u16> = t.encode_utf16().collect();
+                            u.push(0);
+                            let mut raw = Vec::new();
+                            for c in u {
+                                raw.extend_from_slice(&c.to_ne_bytes());
+                            }
+                            raw
+                        }),
+                    ),
                     (html_format, self.html),
                 ] {
                     let Some(bytes) = bytes else { continue };
@@ -498,7 +503,9 @@ mod platform {
     // NSString 不用单独引:`stringForType` 返回 `Retained<NSString>`,而
     // `to_string()` 走的是 Display 实现,那部分不需要这个名字在作用域里。
     // 之前多引了一个,clippy 在 macOS 上直接报 unused import。
-    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeHTML, NSPasteboardTypeString, NSPasteboardTypeURL};
+    use objc2_app_kit::{
+        NSPasteboard, NSPasteboardTypeHTML, NSPasteboardTypeString, NSPasteboardTypeURL,
+    };
 
     pub fn capture() -> Option<super::ClipboardCapture> {
         let board = NSPasteboard::generalPasteboard();
@@ -529,16 +536,18 @@ mod platform {
 
         // 和 Windows 保持同一个约定:meta 从 HTML 里取,所以复制粘贴网页
         // (只有 HTML、没有扩展写的 quire-* 标记)一样能拿到地址和正文。
-        let meta = html
-            .as_deref()
-            .map(super::extract_meta)
-            .unwrap_or_default();
+        let meta = html.as_deref().map(super::extract_meta).unwrap_or_default();
 
         // 刻意不写 `..Default::default()`:字段全列出来了,那玩意儿是个空操作,
         // clippy 会报 "struct update has no effect"。而少写字段本来就是编译错误,
         // 以后 `ClipboardCapture` 加了字段,这里会当场编不过——想要的安全网
         // 本来就不需要它。
-        Some(super::ClipboardCapture { url, html, text, meta })
+        Some(super::ClipboardCapture {
+            url,
+            html,
+            text,
+            meta,
+        })
     }
 }
 
@@ -555,7 +564,8 @@ mod platform {
 }
 
 pub fn capture_clipboard() -> Result<ClipboardCapture, String> {
-    platform::capture().ok_or_else(|| "读不到剪贴板内容(可能被其他程序占用,或当前平台尚未支持)".to_string())
+    platform::capture()
+        .ok_or_else(|| "读不到剪贴板内容(可能被其他程序占用,或当前平台尚未支持)".to_string())
 }
 
 #[cfg(test)]
@@ -588,7 +598,10 @@ mod tests {
         let header = header
             .replace("StartHTML:0000000000", &format!("StartHTML:{start:010}"))
             .replace("EndHTML:0000000000", &format!("EndHTML:{end:010}"))
-            .replace("StartFragment:0000000000", &format!("StartFragment:{start:010}"))
+            .replace(
+                "StartFragment:0000000000",
+                &format!("StartFragment:{start:010}"),
+            )
             .replace("EndFragment:0000000000", &format!("EndFragment:{end:010}"));
         format!("{header}{html}")
     }
@@ -646,7 +659,10 @@ mod tests {
     fn 从SourceURL头取地址() {
         let raw = build_cf_html(&[("SourceURL", "https://example.com/post/1")], CONTEXT);
         let parsed = parse_cf_html(&raw).unwrap();
-        assert_eq!(parsed.source_url.as_deref(), Some("https://example.com/post/1"));
+        assert_eq!(
+            parsed.source_url.as_deref(),
+            Some("https://example.com/post/1")
+        );
     }
 
     #[test]
@@ -655,7 +671,10 @@ mod tests {
         let ctx = format!("<html><head><meta http-equiv=\"refresh\" content=\"0; url=https://news.example.com/a\"></head><body>{CONTEXT}</body></html>");
         let raw = build_cf_html(&[], &ctx);
         let parsed = parse_cf_html(&raw).unwrap();
-        assert_eq!(parsed.source_url.as_deref(), Some("https://news.example.com/a"));
+        assert_eq!(
+            parsed.source_url.as_deref(),
+            Some("https://news.example.com/a")
+        );
     }
 
     #[test]
@@ -663,7 +682,10 @@ mod tests {
         let ctx = format!("<html><head><base href=\"https://blog.example.com/post/\"></head><body>{CONTEXT}</body></html>");
         let raw = build_cf_html(&[], &ctx);
         let parsed = parse_cf_html(&raw).unwrap();
-        assert_eq!(parsed.source_url.as_deref(), Some("https://blog.example.com/post/"));
+        assert_eq!(
+            parsed.source_url.as_deref(),
+            Some("https://blog.example.com/post/")
+        );
     }
 
     #[test]
@@ -671,7 +693,10 @@ mod tests {
         let ctx = format!("<html><head><meta name=\"source-url\" content=\"https://s.example.com/x\"></head><body>{CONTEXT}</body></html>");
         let raw = build_cf_html(&[], &ctx);
         let parsed = parse_cf_html(&raw).unwrap();
-        assert_eq!(parsed.source_url.as_deref(), Some("https://s.example.com/x"));
+        assert_eq!(
+            parsed.source_url.as_deref(),
+            Some("https://s.example.com/x")
+        );
     }
 
     #[test]
@@ -741,7 +766,10 @@ mod tests {
     fn 抓不到地址时不编造() {
         let raw = build_cf_html(&[], CONTEXT);
         let parsed = parse_cf_html(&raw).unwrap();
-        assert_eq!(parsed.source_url, None, "没有就是没有,不能拿正文里的东西凑一个");
+        assert_eq!(
+            parsed.source_url, None,
+            "没有就是没有,不能拿正文里的东西凑一个"
+        );
     }
 
     #[test]
@@ -813,7 +841,10 @@ mod tests {
     fn 扩展元数据与原文地址可以同时拿到() {
         // 扩展是靠 source-url 那个 meta 带地址的,这条路径必须和
         // 扩展元数据共存,否则装扩展反而丢了回溯能力
-        let ctx = extension_html(&[("source-url", "https://example.com/p"), ("quire-title", "标题")]);
+        let ctx = extension_html(&[
+            ("source-url", "https://example.com/p"),
+            ("quire-title", "标题"),
+        ]);
         let parsed = parse_cf_html(&build_cf_html(&[], &ctx)).unwrap();
         assert_eq!(parsed.source_url.as_deref(), Some("https://example.com/p"));
         assert_eq!(parsed.meta["quire-title"], "标题");
@@ -914,7 +945,12 @@ mod tests {
         platform::set_html_for_test(raw.as_bytes());
 
         let capture = capture_clipboard().expect("应能读回扩展载荷");
-        assert_eq!(capture.meta.len(), EXTENSION_META.len(), "元数据应齐全: {:?}", capture.meta);
+        assert_eq!(
+            capture.meta.len(),
+            EXTENSION_META.len(),
+            "元数据应齐全: {:?}",
+            capture.meta
+        );
         assert_eq!(capture.meta["quire-title"], "本地优先的稍后读");
         assert_eq!(capture.meta["quire-site"], "Rust 官方文档");
         assert_eq!(capture.meta["quire-author"], "张三");
