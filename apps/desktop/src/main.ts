@@ -11,7 +11,13 @@ import {
   upsertClip,
   type ListMode,
 } from "./list";
-import type { ClipContent, ClipSummary, SearchHit, VaultInfo } from "./types";
+import type {
+  ClipContent,
+  ClipSummary,
+  SearchHit,
+  TrashItem,
+  VaultInfo,
+} from "./types";
 
 const root = document.querySelector<HTMLDivElement>("#app");
 if (!root) throw new Error("页面缺少 #app 挂载点");
@@ -36,6 +42,7 @@ root.innerHTML = `
       <button class="filter" id="filter-unread" role="tab" aria-selected="false" title="没读过、也没归档的">未读</button>
       <button class="filter" id="filter-week" role="tab" aria-selected="false" title="按自然周分组,一眼看出这周积了多少">每周</button>
       <button class="filter" id="filter-archived" role="tab" aria-selected="false" title="归档过的剪藏。归档是挪到一边,不是删掉,随时能翻回来。">归档</button>
+      <button class="filter" id="filter-trash" role="tab" aria-selected="false" title="删掉的剪藏。放回来随时能翻回原位,彻底删除就没有了。">回收站</button>
     </div>
     <label class="watch-toggle" title="开启后,你在别处复制文章时会自动提示存到 Quire。默认关闭。">
       <input type="checkbox" id="chk-watch" />
@@ -83,8 +90,11 @@ const filterAllEl = el<HTMLButtonElement>("filter-all");
 const filterUnreadEl = el<HTMLButtonElement>("filter-unread");
 const filterWeekEl = el<HTMLButtonElement>("filter-week");
 const filterArchivedEl = el<HTMLButtonElement>("filter-archived");
+const filterTrashEl = el<HTMLButtonElement>("filter-trash");
 
 let clips: ClipSummary[] = [];
+/** 回收站里的东西。**进回收站视图时才去拉**,平时不占着一次 IPC 往返。 */
+let trash: TrashItem[] = [];
 /** 非空时列表显示的是检索结果,而不是全库。空数组和 null 要分清:
  *  null = 没在搜,空数组 = 搜了但一条没中,两者界面不一样。 */
 let hits: SearchHit[] | null = null;
@@ -94,7 +104,7 @@ let activeFilename: string | null = null;
 let archiveBtn: HTMLButtonElement | null = null;
 /** 当前筛选。搜索和筛选是**两回事**:搜出来的结果不再过筛,否则用户
  *  搜到一篇却看不见,只会当成搜索坏了。 */
-let filter: ListMode = "all";
+let filter: ListMode | "trash" = "all";
 /** 监控弹出来的内容。等用户点"保存"时才真正落盘——自动存等于替他做决定。 */
 let pendingCapture: ClipboardCapture | null = null;
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -168,6 +178,13 @@ function visibleFilenames(): string[] {
 
 function renderList(): void {
   listEl.replaceChildren();
+
+  // 回收站是**另一份数据**,不是 clips 的一个筛选。走前面的每条路径之前先岔开:
+  // 搜索、未读、每周,说的全是"库里还有什么",跟"删掉的还剩什么"没关系
+  if (filter === "trash") {
+    renderTrashList();
+    return;
+  }
 
   if (hits) {
     if (hits.length === 0) {
@@ -247,11 +264,82 @@ function renderWeekList(): void {
  *  正文摘要在这儿没用——用户搜的就是这几个字,得让他看见它们出现在哪儿。 */
 function renderHitList(results: SearchHit[]): void {
   for (const hit of results) {
-    listEl.append(clipItem(hit.summary, hit.snippet));
+    listEl.append(clipItem(hit.summary, hit.snippet, { readToggle: filter !== "trash" }));
   }
 }
 
-function clipItem(clip: ClipSummary, sub: string | null): HTMLElement {
+/** 回收站列表。**读不出元数据的也要列出来**——那正是最该被看见、
+ *  也最该能被清掉的一批,藏起来等于永远清不掉。
+ *
+ *  不复用 `clipItem`:那边带「标已读」开关,回收站里没有已读这回事,
+ *  给一堆删掉的剪藏挂个"已读"按钮只会让人以为还能标。 */
+function renderTrashList(): void {
+  if (trash.length === 0) {
+    const none = document.createElement("div");
+    none.className = "empty";
+    none.innerHTML = `<p class="empty-title">回收站是空的</p>`;
+    listEl.append(none);
+    return;
+  }
+  const total = trash.reduce((sum, item) => sum + item.sizeBytes, 0);
+  const header = document.createElement("div");
+  header.className = "week-header trash-header";
+  const label = document.createElement("span");
+  label.textContent = `${trash.length} 篇 · 共 ${formatBytes(total)}`;
+  // 清空摆在**它作用的东西旁边**,不占工具栏。工具栏是全局的,
+  // 在那儿长期摆一个红按钮,用户会怕点错,也把工具栏挤不下了
+  const empty = document.createElement("button");
+  empty.className = "btn danger";
+  empty.textContent = "清空";
+  empty.title = "把回收站里的全删掉,删了就找不回来了";
+  empty.addEventListener("click", () => askEmptyTrash());
+  header.append(label, empty);
+  listEl.append(header);
+
+  for (const item of trash) listEl.append(trashItem(item));
+}
+
+function trashItem(item: TrashItem): HTMLElement {
+  const el = document.createElement("article");
+  el.className = "clip";
+  el.dataset.filename = item.filename;
+  if (item.filename === activeFilename) el.classList.add("active");
+
+  const title = document.createElement("h3");
+  title.className = "clip-title";
+  title.textContent = item.summary?.title ?? "读不出标题的剪藏";
+  el.append(title);
+
+  const meta = document.createElement("p");
+  meta.className = "clip-meta";
+  const site = document.createElement("span");
+  site.className = "clip-site";
+  // 元数据读不出来时把文件名摆出来。那是用户自己在文件管理器里能认出的
+  // 唯一线索,也是判断"这条要不要删"的依据
+  site.textContent = item.summary?.site ?? item.filename;
+  const when = document.createElement("time");
+  when.textContent = item.summary ? formatWhen(item.summary.clippedAt) : formatBytes(item.sizeBytes);
+  meta.append(site, when);
+  el.append(meta);
+
+  el.addEventListener("click", () => void openTrashDetail(item.filename));
+  return el;
+}
+
+/** 体积显示。回收站不是免费的,它占着磁盘,用户有权知道占了多少。 */
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** 列表里的一条。`readToggle` 关掉时不给「标已读」——回收站里没有已读这回事,
+ *  给一堆删掉的剪藏挂个已读按钮,只会让人以为还能标。 */
+function clipItem(
+  clip: ClipSummary,
+  sub: string | null,
+  opts: { readToggle?: boolean } = {},
+): HTMLElement {
   const item = document.createElement("article");
   item.className = "clip";
   item.dataset.filename = clip.filename;
@@ -279,6 +367,11 @@ function clipItem(clip: ClipSummary, sub: string | null): HTMLElement {
     item.append(excerpt);
   }
 
+  if (opts.readToggle === false) {
+    item.addEventListener("click", () => void (filter === "trash" ? openTrashDetail(clip.filename) : openDetail(clip.filename)));
+    return item;
+  }
+
   // 已读开关。**不自动标已读**——打开列表就把一堆剪藏刷成已读,
   // 那等于替用户做决定,而且不可逆(他可能只是误点了一下)。
   const toggle = document.createElement("button");
@@ -294,7 +387,7 @@ function clipItem(clip: ClipSummary, sub: string | null): HTMLElement {
   });
   item.append(toggle);
 
-  item.addEventListener("click", () => void openDetail(clip.filename));
+  item.addEventListener("click", () => void (filter === "trash" ? openTrashDetail(clip.filename) : openDetail(clip.filename)));
   return item;
 }
 
@@ -472,6 +565,7 @@ function renderDetail(clip: ClipContent): void {
 
 function renderEmptyDetail(): void {
   detailEl.replaceChildren();
+  archiveBtn = null; // 上一篇的按钮节点已经脱离文档,留着只会改空气
   const hint = document.createElement("div");
   hint.className = "empty";
   hint.innerHTML = `<p class="empty-title">从左边选一篇</p>`;
@@ -488,6 +582,126 @@ async function openDetail(filename: string): Promise<void> {
   } catch (err) {
     showError(`读不出来:${String(err)}`);
   }
+}
+
+/** 打开回收站里的一篇。**能看内容才谈得上"确认要不要永久删"**——
+ *  「彻底删除」是整个软件里唯一没有撤销的操作,看不见就按下去那叫闭眼签字。 */
+async function openTrashDetail(filename: string): Promise<void> {
+  activeFilename = filename;
+  renderList();
+  archiveBtn = null;
+  detailEl.replaceChildren();
+  try {
+    const clip = await api.readTrashClip(filename);
+    if (activeFilename !== filename) return;
+    renderTrashDetail(clip);
+  } catch {
+    // 元数据坏掉的文件照样要点得开、能删得掉。这里不弹红字,
+    // 只说清实情,再把两个按钮摆出来
+    if (activeFilename !== filename) return;
+    const fallback = document.createElement("h1");
+    fallback.textContent = "读不出内容的剪藏";
+    const note = document.createElement("p");
+    note.className = "detail-meta";
+    note.textContent = "这个文件的 frontmatter 坏了,可能被你手动改过。它还在回收站里,也能删掉。";
+    detailEl.replaceChildren(fallback, note, trashActions(filename, null));
+  }
+}
+
+function renderTrashDetail(clip: ClipContent): void {
+  const header = document.createElement("header");
+  header.className = "detail-header";
+  const title = document.createElement("h1");
+  title.textContent = clip.title;
+  const meta = document.createElement("p");
+  meta.className = "detail-meta";
+  meta.append(document.createTextNode(clip.site));
+  const when = document.createElement("time");
+  when.textContent = clip.clippedAt.replace("T", " ").replace(/\+.*$/, "");
+  meta.append(when);
+  header.append(title, meta, trashActions(clip.filename, trash.find((t) => t.filename === clip.filename)?.sizeBytes ?? null));
+
+  const body = document.createElement("article");
+  body.className = "prose";
+  // 唯一使用 innerHTML 的地方,内容已过 DOMPurify
+  body.innerHTML = renderMarkdown(clip.body);
+  for (const img of body.querySelectorAll("img")) {
+    img.referrerPolicy = "no-referrer";
+    img.loading = "lazy";
+    img.addEventListener("error", () => { img.src = MARKDOWN_PLACEHOLDER; }, { once: true });
+  }
+  detailEl.replaceChildren(header, body);
+  detailEl.scrollTop = 0;
+}
+
+/** 回收站里的两个动作。`sizeBytes` 是磁盘上真实占的量,拿它说"删掉能省多少";
+ *  读不出内容的文件拿不到大小,就不显示这句。 */
+function trashActions(filename: string, sizeBytes: number | null): HTMLElement {
+  const actions = document.createElement("div");
+  actions.className = "detail-actions";
+
+  const back = document.createElement("button");
+  back.className = "btn primary";
+  back.textContent = "放回来";
+  back.title = "放回剪藏库的原位置,文件名和图片都跟着回来";
+  back.addEventListener("click", () => void restoreFromTrash(filename));
+
+  const purge = document.createElement("button");
+  purge.className = "btn danger";
+  purge.textContent = "彻底删除";
+  // 措辞要说清楚后果:没有撤销、没有回收站第二层
+  purge.title = sizeBytes === null
+    ? "删掉就找不回来了,没有撤销"
+    : `删掉就找不回来了,没有撤销(能腾出 ${formatBytes(sizeBytes)})`;
+  purge.addEventListener("click", () => void purgeFromTrash(filename));
+
+  actions.append(back, purge);
+  return actions;
+}
+
+async function restoreFromTrash(filename: string): Promise<void> {
+  try {
+    const back = await api.restoreClip(filename);
+    trash = trash.filter((t) => t.filename !== filename);
+    // 放回来的是一篇旧剪藏,走 upsert 才不会每次撤销都把它顶到列表最前面
+    clips = upsertClip(clips, back);
+    if (activeFilename === filename) {
+      // 放回来一篇之后接着看下一篇,而不是把详情页清空
+      const at = visibleFilenames().indexOf(filename);
+      activeFilename = null;
+      renderTrashList();
+      const next = reanchorAfterRemoval(visibleFilenames(), at);
+      if (next) void openTrashDetail(next);
+      else renderEmptyDetail();
+    } else {
+      renderTrashList();
+    }
+    showToast("放回来了");
+  } catch (err) {
+    // 放不回来是真出了岔子,不能当成没事发生——用户会以为东西回来了
+    showError(`放回失败:${String(err)}`);
+  }
+}
+
+async function purgeFromTrash(filename: string): Promise<void> {
+  const at = visibleFilenames().indexOf(filename);
+  try {
+    await api.purgeClip(filename);
+    trash = trash.filter((t) => t.filename !== filename);
+    activeFilename = null;
+    renderTrashList();
+    // 删掉一篇之后选中它原来那个位置的下一篇,而不是跳回第一篇
+    const next = reanchorAfterRemoval(visibleFilenames(), at);
+    if (next) void openTrashDetail(next);
+    else renderEmptyDetail();
+    showToast("彻底删除了");
+  } catch (err) {
+    showError(`彻底删除失败:${String(err)}`);
+  }
+}
+
+async function refreshTrash(): Promise<void> {
+  trash = (await api.listTrash()).items;
 }
 
 /** 存一篇剪藏。返回 `null` 表示存成了,返回文件名表示"已经剪过了"。
@@ -574,9 +788,14 @@ async function runSearch(query: string): Promise<void> {
     return;
   }
   try {
-    const results = await api.searchClips(trimmed);
-    // 用户可能已经改词或清空了。这次的返回值过期,丢掉
-    if (searchEl.value.trim() !== trimmed) return;
+    // 搜索跟着当前视图走。人在回收站里搜,搜的却是**库里**的东西的话,
+    // 他会以为"我明明删了它怎么还搜得到"——那等于删了个寂寞
+    const inTrash = filter === "trash";
+    const results = inTrash
+      ? await api.searchTrash(trimmed)
+      : await api.searchClips(trimmed);
+    // 用户可能已经改词、换视图或清空了。这次的返回值过期,丢掉
+    if (searchEl.value.trim() !== trimmed || filter === "trash" !== inTrash) return;
     hits = results;
     renderList();
   } catch (err) {
@@ -614,6 +833,9 @@ async function refreshList(): Promise<void> {
       clearError();
     }
 
+    // 回收站开着的时候,库的变化也得让回收站跟着重算一遍——
+    // 撤销、别的窗口删东西,都走这条路
+    if (filter === "trash") await refreshTrash();
     renderList();
   } catch (err) {
     showError(`列不出剪藏:${String(err)}`);
@@ -639,24 +861,75 @@ el<HTMLButtonElement>("btn-open").addEventListener("click", () => {
 
 /** 切筛选。搜索态下不切——搜出来的结果和自己的筛选无关,
  *  硬切会让用户以为"搜到的东西被筛没了",是搜索坏了。 */
-function setFilter(next: ListMode): void {
+async function setFilter(next: ListMode | "trash"): Promise<void> {
+  // 搜索结果跟着上一个视图。切到回收站不把它清掉,用户就会在回收站里
+  // 看见**库里**搜出来的结果——那看起来就像"删了还能搜到"
+  hits = null;
+  searchEl.value = "";
   filter = next;
   for (const [button, value] of [
     [filterAllEl, "all"],
     [filterUnreadEl, "unread"],
     [filterWeekEl, "week"],
     [filterArchivedEl, "archived"],
+    [filterTrashEl, "trash"],
   ] as const) {
     const on = value === next;
     button.classList.toggle("active", on);
     button.setAttribute("aria-selected", String(on));
   }
+  if (next === "trash") {
+    try {
+      await refreshTrash();
+    } catch (err) {
+      showError(`回收站读不出来:${String(err)}`);
+    }
+  }
   renderList();
+  // 换视图之后原来那篇多半不在新列表里了,详情页得跟着换,
+  // 否则会停在一篇"看得见却不在列表中"的文章上
+  if (activeFilename && !visibleFilenames().includes(activeFilename)) {
+    activeFilename = null;
+    renderEmptyDetail();
+  }
 }
-filterAllEl.addEventListener("click", () => setFilter("all"));
-filterUnreadEl.addEventListener("click", () => setFilter("unread"));
-filterWeekEl.addEventListener("click", () => setFilter("week"));
-filterArchivedEl.addEventListener("click", () => setFilter("archived"));
+filterAllEl.addEventListener("click", () => void setFilter("all"));
+filterUnreadEl.addEventListener("click", () => void setFilter("unread"));
+filterWeekEl.addEventListener("click", () => void setFilter("week"));
+filterArchivedEl.addEventListener("click", () => void setFilter("archived"));
+filterTrashEl.addEventListener("click", () => void setFilter("trash"));
+
+/** 清空是不可逆的,而且一次动的是**全部**。主按钮写成"取消"——
+ * 要用户多点一下才够得到那个红色的,总比反过来安全。 */
+function askEmptyTrash(): void {
+  if (trash.length === 0) return;
+  showToast(`彻底删掉回收站里的 ${trash.length} 篇?删了就找不回来了`, [
+    { label: "取消", primary: true, onClick: hideToast },
+    { label: "彻底删除", onClick: () => void doEmptyTrash() },
+  ]);
+}
+
+async function doEmptyTrash(): Promise<void> {
+  hideToast();
+  try {
+    const report = await api.emptyTrash();
+    trash = [];
+    activeFilename = null;
+    renderTrashList();
+    renderEmptyDetail();
+    if (report.failed.length > 0) {
+      // "清空"没清干净必须说出来。报一句成功了,用户会以为磁盘已经腾干净了
+      showError(
+        `清掉了 ${report.removed} 篇,但有 ${report.failed.length} 篇没删掉:` +
+          report.failed.map((f) => f.filename).join("、"),
+      );
+    } else {
+      showToast(`清掉了 ${report.removed} 篇`);
+    }
+  } catch (err) {
+    showError(`清空回收站失败:${String(err)}`);
+  }
+}
 
 el<HTMLButtonElement>("btn-export").addEventListener("click", async () => {
   try {
@@ -746,15 +1019,19 @@ document.addEventListener("keydown", (e) => {
     const next = moveSelection(visibleFilenames(), activeFilename, 1);
     // 移动就直接打开:稍后读是拿来"一篇篇读过去"的,让人多按一下回车
     // 只会把连着读变成点读
-    if (next) void openDetail(next);
+    if (next) void (filter === "trash" ? openTrashDetail(next) : openDetail(next));
     return;
   }
   if (key === "arrowup" || key === "k") {
     e.preventDefault();
     const prev = moveSelection(visibleFilenames(), activeFilename, -1);
-    if (prev) void openDetail(prev);
+    if (prev) void (filter === "trash" ? openTrashDetail(prev) : openDetail(prev));
     return;
   }
+
+  // 回收站里 r / a 说的全是"库里那篇",在这里按下去会去改一篇
+  // 根本不在列表里的剪藏——看起来像按了没反应,其实是按错了地方
+  if (filter === "trash") return;
 
   const current = activeFilename ? clips.find((c) => c.filename === activeFilename) : null;
   if (!current) return;

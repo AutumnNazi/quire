@@ -130,6 +130,40 @@ pub enum SaveOutcome {
     Duplicate { filename: String, title: String },
 }
 
+/// 回收站里的一条。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashItem {
+    pub filename: String,
+    /// 读不出 frontmatter 时是 `None`。**照样要显示、照样能彻底删**,
+    /// 否则用户既看不见它,也清不掉它。
+    pub summary: Option<ClipSummary>,
+    /// 放出来是为了让用户判断"这篇还有没有必要留着",顺便暴露一个事实:
+    /// 回收站不是免费的,它是占着磁盘的。
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashListing {
+    pub items: Vec<TrashItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeReport {
+    pub removed: usize,
+    /// 清不掉的条目。**"清空回收站"没能清干净,必须说出来。**
+    pub failed: Vec<PurgeFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeFailure {
+    pub filename: String,
+    pub reason: String,
+}
+
 pub struct Vault {
     root: PathBuf,
 }
@@ -496,11 +530,29 @@ impl Vault {
         Ok(())
     }
 
+    /// 彻底删掉一篇的图片目录。删完之后顺手把空壳收掉,
+    /// 否则 `assets/` 底下会积一堆空目录,用户打开剪藏目录一看还以为漏了东西。
+    fn remove_assets(&self, id: &str) -> Result<(), VaultError> {
+        let root = self.trash_dir().join(crate::assets::ASSETS_DIR).join(id);
+        if root.is_dir() {
+            fs::remove_dir_all(&root)?;
+        }
+        // 可能是这一篇删完之后这个 id 桶空了;也可能是之前就有空壳,顺手收掉
+        for parent in [
+            self.trash_dir().join(crate::assets::ASSETS_DIR),
+            self.trash_dir(),
+        ] {
+            if parent.is_dir() && fs::read_dir(&parent)?.next().is_none() {
+                let _ = fs::remove_dir(&parent);
+            }
+        }
+        Ok(())
+    }
+
     /// 读出剪藏的 id。图片目录按 id 命名,搬图片时要用。
     fn id_of(&self, filename: &str) -> Option<String> {
         self.id_of_in(&self.clips_dir().join(filename))
     }
-
     fn id_of_in(&self, path: &Path) -> Option<String> {
         let text = fs::read_to_string(path).ok()?;
         let (block, _) = frontmatter::split(&text)?;
@@ -549,6 +601,107 @@ impl Vault {
     }
 
     /// 在回收站里给 `filename` 找一个没人占的坑位,最多试 100 次。
+    /// 回收站里剩下什么。按剪藏时间倒序,和主列表一个次序。
+    ///
+    /// **读不出元数据的文件照样列出来**,`summary` 留 `None`。那正是最该被
+    /// 看见、也最该能被彻底删掉的一批——只显示"解析得动的",用户会以为
+    /// 回收站已经清空了,而实际上有东西躺在那儿既看不见也删不掉。
+    pub fn scan_trash(&self) -> Result<TrashListing, VaultError> {
+        let dir = self.trash_dir();
+        let mut items = Vec::new();
+        if !dir.exists() {
+            return Ok(TrashListing::default());
+        }
+        for entry in fs::read_dir(&dir)? {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // 文件可能在扫描过程中被用户自己从文件管理器里删了,
+            // 拿不到大小就当 0,别为了一条过期记录让整个列表打不开
+            let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            items.push(TrashItem {
+                filename: filename.to_string(),
+                summary: read_summary(&path, filename).ok(),
+                size_bytes,
+            });
+        }
+        items.sort_by(|a, b| match (&a.summary, &b.summary) {
+            (Some(x), Some(y)) => y.id.cmp(&x.id),
+            // 有元数据的排在前面,没元数据的按文件名排,免得每回刷新顺序都在跳
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.filename.cmp(&b.filename),
+        });
+        Ok(TrashListing { items })
+    }
+
+    /// 彻底删除一篇。**这条路没有撤销**,所以只能作用于回收站里的文件。
+    pub fn purge(&self, filename: &str) -> Result<(), VaultError> {
+        if !slug::is_safe_filename(filename) {
+            return Err(VaultError::UnsafeFilename(filename.to_string()));
+        }
+        let path = self.trash_dir().join(filename);
+        if !path.is_file() {
+            // 只在回收站里找。没这一层的话,一个拼错的文件名会静默返回成功,
+            // 而库里那篇还好好地在那儿——用户以为删了,其实没删
+            return Err(VaultError::NotFound(filename.to_string()));
+        }
+        let id = self.id_of_in(&path);
+        fs::remove_file(&path)?;
+        if let Some(id) = id {
+            self.remove_assets(&id)?;
+        }
+        Ok(())
+    }
+
+    /// 读回收站里某一篇的正文。**只读回收站**,`clips/` 里的读不到。
+    ///
+    /// 「彻底删除」是整个软件里唯一没有撤销的操作。看不见内容就按下去,
+    /// 那不叫确认,叫闭眼签字。
+    pub fn read_trash_clip(&self, filename: &str) -> Result<ClipContent, VaultError> {
+        if !slug::is_safe_filename(filename) {
+            return Err(VaultError::UnsafeFilename(filename.to_string()));
+        }
+        let path = self.trash_dir().join(filename);
+        let text =
+            fs::read_to_string(&path).map_err(|_| VaultError::NotFound(filename.to_string()))?;
+        let (block, body) =
+            frontmatter::split(&text).ok_or_else(|| VaultError::NotFound(filename.to_string()))?;
+        let fm = Frontmatter::parse(block);
+        Ok(ClipContent {
+            summary: summary_from(fm, filename.to_string()),
+            body: body.trim_start().to_string(),
+        })
+    }
+
+    /// 清空回收站,返回清掉几篇。
+    ///
+    /// 挨个 `purge` 而不是直接 `remove_dir_all`:图片目录是按 id 分桶的,
+    /// 挨个删才能保证 `assets/` 里不给任何一篇留孤儿图。扫不动的条目
+    /// 原样留着并记下来——**"清空"没能清干净,必须说出来。**
+    pub fn empty_trash(&self) -> Result<PurgeReport, VaultError> {
+        let listing = self.scan_trash()?;
+        let total = listing.items.len();
+        let mut failed = Vec::new();
+        for item in listing.items {
+            if let Err(e) = self.purge(&item.filename) {
+                failed.push(PurgeFailure {
+                    filename: item.filename,
+                    reason: e.to_string(),
+                });
+            }
+        }
+        Ok(PurgeReport {
+            removed: total - failed.len(),
+            failed,
+        })
+    }
+
     fn free_trash_slot(&self, filename: &str) -> Result<PathBuf, VaultError> {
         let dir = self.trash_dir();
         let candidate = dir.join(filename);
@@ -761,6 +914,182 @@ mod tests {
             .collect();
         assert_eq!(names, vec![a.filename]);
         drop(dir);
+    }
+
+    #[test]
+    fn 回收站里能翻到删掉的那篇() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let a = v.save(&input("https://a.com", "留着", "正文")).unwrap();
+        let b = v.save(&input("https://b.com", "扔掉的", "正文")).unwrap();
+        v.trash(&b.filename).unwrap();
+
+        let items = v.scan_trash().unwrap().items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].filename, b.filename);
+        let summary = items[0].summary.as_ref().expect("元数据应读得出来");
+        assert_eq!(summary.title, "扔掉的");
+        assert!(
+            items[0].size_bytes > 0,
+            "大小得报出来,用户要靠它判断值不值得留"
+        );
+        assert!(v
+            .scan_trash()
+            .unwrap()
+            .items
+            .iter()
+            .all(|i| i.filename != a.filename));
+        drop(dir);
+    }
+
+    #[test]
+    fn 空回收站列出来是空的() {
+        let (_d, v) = vault();
+        // 一次都没删过时 `.trash/` 根本不存在,不能因此报错
+        assert!(v.scan_trash().unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn 读不出元数据的也在回收站里() {
+        // 用户可能正拿记事本手动改这些文件。只显示"解析得动的",他会以为
+        // 回收站已经空了,而实际上有东西躺在那儿既看不见也删不掉
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        std::fs::create_dir_all(v.trash_dir()).unwrap();
+        std::fs::write(
+            v.trash_dir().join("2026-09-28-broken.md"),
+            "没有 frontmatter 的一段文字",
+        )
+        .unwrap();
+
+        let items = v.scan_trash().unwrap().items;
+        assert_eq!(items.len(), 1, "解析不出来不等于不存在");
+        assert!(items[0].summary.is_none());
+        drop(dir);
+    }
+
+    #[test]
+    fn 彻底删除之后回收站里没有了() {
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v
+            .save(&input("https://a.com", "确定不要了", "正文"))
+            .unwrap();
+        v.trash(&saved.filename).unwrap();
+
+        v.purge(&saved.filename).unwrap();
+        assert!(!v.trash_dir().join(&saved.filename).exists());
+        assert!(v.scan_trash().unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn 彻底删除只认回收站里的文件() {
+        // purge 没有撤销。少这一层的话,一个拼错的文件名会静默返回成功,
+        // 而库里那篇还好端端躺在那儿——用户以为删了,其实没删
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com", "还要留着", "正文")).unwrap();
+
+        assert!(matches!(
+            v.purge(&saved.filename).unwrap_err(),
+            VaultError::NotFound(_)
+        ));
+        assert!(
+            v.clips_dir().join(&saved.filename).exists(),
+            "库里的这篇不能被彻底删除"
+        );
+    }
+
+    #[test]
+    fn 彻底删除会连图片一起清掉() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com", "带图的", "正文")).unwrap();
+        let id = v.id_of(&saved.filename).unwrap();
+        let bucket = v.assets_dir().join(&id);
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("0.png"), b"\x89PNG").unwrap();
+        v.trash(&saved.filename).unwrap();
+
+        v.purge(&saved.filename).unwrap();
+        assert!(!bucket.exists(), "回收站里的图片桶也要没");
+        assert!(
+            !v.trash_dir().exists(),
+            "空了的回收站目录该收掉,免得剪藏目录里留个空壳"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn 彻底删除拒收不安全的文件名() {
+        let (_d, v) = vault();
+        for bad in ["../../.ssh/id_rsa.md", "sub/dir/x.md", "..\\..\\x.md", ""] {
+            assert!(
+                matches!(v.purge(bad).unwrap_err(), VaultError::UnsafeFilename(_)),
+                "{bad} 应该被白名单拦下"
+            );
+        }
+    }
+
+    #[test]
+    fn 回收站里能预览正文() {
+        // 「彻底删除」是唯一没有撤销的操作,看不见内容就按下去不叫确认,叫闭眼签字
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v
+            .save(&input("https://a.com", "待删的", "正文里的一句关键内容"))
+            .unwrap();
+        v.trash(&saved.filename).unwrap();
+
+        let content = v.read_trash_clip(&saved.filename).unwrap();
+        assert_eq!(content.body, "正文里的一句关键内容");
+        assert_eq!(content.summary.title, "待删的");
+    }
+
+    #[test]
+    fn 预览只认回收站里的文件() {
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com", "还在库里", "正文")).unwrap();
+        assert!(matches!(
+            v.read_trash_clip(&saved.filename).unwrap_err(),
+            VaultError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn 预览拒收不安全的文件名() {
+        let (_d, v) = vault();
+        assert!(matches!(
+            v.read_trash_clip("../../.ssh/id_rsa.md").unwrap_err(),
+            VaultError::UnsafeFilename(_)
+        ));
+    }
+
+    #[test]
+    fn 清空回收站会报告清不掉的那些() {
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        for i in 1..=3 {
+            let s = v
+                .save(&input(&format!("https://a.com/{i}"), "旧剪藏", "正文"))
+                .unwrap();
+            v.trash(&s.filename).unwrap();
+        }
+        assert_eq!(v.scan_trash().unwrap().items.len(), 3);
+
+        let report = v.empty_trash().unwrap();
+        assert_eq!(report.removed, 3);
+        assert!(report.failed.is_empty(), "正常情况不该有失败项");
+        assert!(v.scan_trash().unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn 清空空回收站不算错() {
+        let (_d, v) = vault();
+        let report = v.empty_trash().unwrap();
+        assert_eq!(report.removed, 0);
+        assert!(report.failed.is_empty());
     }
 
     #[test]

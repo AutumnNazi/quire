@@ -42,3 +42,23 @@ export interface VaultInfo {
    *  不然用户不知道自己被监听着。 */
   watching: boolean;
 }
+
+/** 回收站里的一条。字段名与 Rust 侧 `TrashItem` 一致。 */
+export interface TrashItem {
+  filename: string;
+  /** 读不出 frontmatter 时是 `null`。**照样显示、照样能彻底删**,
+   *  只显示解析得动的那些,用户会以为回收站空了,而实际上有东西清不掉。 */
+  summary: ClipSummary | null;
+  /** 报出来是让用户判断值不值得留着——回收站不是免费的,它占着磁盘。 */
+  sizeBytes: number;
+}
+
+export interface TrashListing {
+  items: TrashItem[];
+}
+
+/** 清空回收站的结果。`failed` 非空就意味着没清干净,界面必须说出来。 */
+export interface PurgeReport {
+  removed: number;
+  failed: Array<{ filename: string; reason: string }>;
+}

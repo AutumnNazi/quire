@@ -30,7 +30,10 @@ use chrono::Local;
 use clipboard::ClipboardCapture;
 use search::SearchHit;
 use tauri_plugin_dialog::DialogExt;
-use vault::{ClipContent, ClipInput, ClipSummary, SaveOutcome, ScanResult, SharedVault, Vault};
+use vault::{
+    ClipContent, ClipInput, ClipSummary, PurgeReport, SaveOutcome, ScanResult, SharedVault,
+    TrashListing, Vault,
+};
 
 /// 剪贴板轮询间隔。开启监控后一直在读剪贴板,太密会白耗 CPU,
 /// 太疏则用户复制完要干等。
@@ -126,6 +129,18 @@ fn search_clips(
     search::search(&vault, &query, limit).map_err(|e| e.to_string())
 }
 
+/// 搜回收站。界面上回收站是独立视图,搜索框跟着它走。
+#[tauri::command]
+fn search_trash(
+    query: String,
+    limit: Option<usize>,
+    state: State<AppState>,
+) -> Result<Vec<SearchHit>, String> {
+    let vault = current_vault(&state)?;
+    let limit = limit.unwrap_or(200).min(1000);
+    search::search_trash(&vault, &query, limit).map_err(|e| e.to_string())
+}
+
 /// 改已读 / 归档标志。传 `None` 表示这一项不动。
 #[tauri::command]
 fn set_clip_flags(
@@ -153,6 +168,35 @@ fn trash_clip(filename: String, state: State<AppState>) -> Result<(), String> {
 fn restore_clip(filename: String, state: State<AppState>) -> Result<ClipSummary, String> {
     let vault = current_vault(&state)?;
     vault.restore(&filename).map_err(|e| e.to_string())
+}
+
+/// 回收站里剩下什么。**读不出元数据的也在列表里**,只是没有标题——
+/// 那正是最该被看见、也最该能被清掉的一批。
+#[tauri::command]
+fn list_trash(state: State<AppState>) -> Result<TrashListing, String> {
+    let vault = current_vault(&state)?;
+    vault.scan_trash().map_err(|e| e.to_string())
+}
+
+/// 预览回收站里某一篇的正文。看不到内容就没法判断该不该永久删。
+#[tauri::command]
+fn read_trash_clip(filename: String, state: State<AppState>) -> Result<ClipContent, String> {
+    let vault = current_vault(&state)?;
+    vault.read_trash_clip(&filename).map_err(|e| e.to_string())
+}
+
+/// 彻底删除一篇。**没有撤销**,所以只作用于回收站里的文件。
+#[tauri::command]
+fn purge_clip(filename: String, state: State<AppState>) -> Result<(), String> {
+    let vault = current_vault(&state)?;
+    vault.purge(&filename).map_err(|e| e.to_string())
+}
+
+/// 清空回收站。返回里带着清不掉的那些——"清空"没能清干净必须说出来。
+#[tauri::command]
+fn empty_trash(state: State<AppState>) -> Result<PurgeReport, String> {
+    let vault = current_vault(&state)?;
+    vault.empty_trash().map_err(|e| e.to_string())
 }
 
 /// 把整个剪藏库拼成单个 Markdown,写到用户选的位置。
@@ -395,6 +439,11 @@ pub fn run() {
             search_clips,
             set_clip_flags,
             trash_clip,
+            list_trash,
+            read_trash_clip,
+            search_trash,
+            purge_clip,
+            empty_trash,
             restore_clip,
             export_vault,
             capture_clipboard,

@@ -26,6 +26,7 @@
 //! 代价是不支持拼音搜索——那是以后的事,不影响现在能用。
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use serde::Serialize;
 
@@ -56,6 +57,20 @@ impl SearchHit {
 
 /// 搜整个剪藏库。`query` 为空时返回空列表——空查询不是"全部",是"没搜"。
 pub fn search(vault: &Vault, query: &str, limit: usize) -> Result<Vec<SearchHit>, VaultError> {
+    search_dir(&vault.clips_dir(), query, limit)
+}
+
+/// 搜回收站。界面上回收站是一个独立视图,搜索框跟着它走——
+/// 搜的却是**库里**的东西,用户会以为"我明明删了它怎么还搜得到"。
+pub fn search_trash(
+    vault: &Vault,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>, VaultError> {
+    search_dir(&vault.trash_dir(), query, limit)
+}
+
+fn search_dir(dir: &Path, query: &str, limit: usize) -> Result<Vec<SearchHit>, VaultError> {
     // 查询先转小写再切,词条就是小写的了
     let query_lower = query.to_lowercase();
     let tokens = tokenize(&query_lower);
@@ -65,8 +80,7 @@ pub fn search(vault: &Vault, query: &str, limit: usize) -> Result<Vec<SearchHit>
     // 去重:同一个词出现两次不代表更相关
     let wanted: HashSet<&str> = tokens.iter().copied().collect();
 
-    let clips_dir = vault.clips_dir();
-    if !clips_dir.exists() {
+    if !dir.exists() {
         return Ok(Vec::new());
     }
 
@@ -74,7 +88,7 @@ pub fn search(vault: &Vault, query: &str, limit: usize) -> Result<Vec<SearchHit>
     // 前后各撑 60 个字符,单条不算便宜;截断前 1000 条都切一遍、最后只留 200 条,
     // 是这个函数最大的一笔冤枉开销。切出来还得原样扔掉 800 条。
     let mut scored: Vec<(ClipSummary, String, String, i64)> = Vec::new();
-    for entry in std::fs::read_dir(&clips_dir)? {
+    for entry in std::fs::read_dir(dir)? {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
@@ -337,6 +351,39 @@ mod tests {
             .expect("应保存成功");
         }
         (dir, v)
+    }
+
+    #[test]
+    fn 回收站搜的是回收站里的东西() {
+        // 界面上回收站是独立视图,搜索框跟着它走。搜的却是库里的东西的话,
+        // 用户会以为"我明明删了它怎么还搜得到"——那等于删了个寂寞
+        let (_d, v) = vault_with(&[
+            ("https://a.com/1", "在库里的那篇", "正文里提到编程这个词"),
+            ("https://b.com/2", "删掉的那篇", "正文里同样提到编程这个词"),
+        ]);
+        let trashed = v
+            .scan()
+            .unwrap()
+            .clips
+            .into_iter()
+            .find(|c| c.title == "删掉的那篇")
+            .unwrap()
+            .filename;
+        v.trash(&trashed).unwrap();
+
+        let in_lib = search(&v, "编程", 10).unwrap();
+        assert_eq!(in_lib.len(), 1, "库里那篇不该被算成删掉的");
+        assert_eq!(in_lib[0].summary.title, "在库里的那篇");
+
+        let in_trash = search_trash(&v, "编程", 10).unwrap();
+        assert_eq!(in_trash.len(), 1, "回收站里那篇得搜得到");
+        assert_eq!(in_trash[0].summary.title, "删掉的那篇");
+    }
+
+    #[test]
+    fn 空回收站搜不出东西也不报错() {
+        let (_d, v) = vault_with(&[]);
+        assert!(search_trash(&v, "编程", 10).unwrap().is_empty());
     }
 
     #[test]

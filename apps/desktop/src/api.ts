@@ -4,7 +4,15 @@ import type {
   ClipInput,
   SaveOutcome,
 } from "./clipboard";
-import type { ClipContent, ClipSummary, ScanResult, SearchHit, VaultInfo } from "./types";
+import type {
+  ClipContent,
+  ClipSummary,
+  PurgeReport,
+  ScanResult,
+  SearchHit,
+  TrashListing,
+  VaultInfo,
+} from "./types";
 
 /**
  * Tauri 命令的薄封装。
@@ -18,6 +26,9 @@ export const api = {
   readClip: (filename: string) => invoke<ClipContent>("read_clip", { filename }),
   searchClips: (query: string, limit?: number) =>
     invoke<SearchHit[]>("search_clips", { query, limit: limit ?? null }),
+  // 回收站是独立视图,搜索跟着它走
+  searchTrash: (query: string, limit?: number) =>
+    invoke<SearchHit[]>("search_trash", { query, limit: limit ?? null }),
 
   // 改已读/归档。read 或 archived 传 undefined 表示这一项不动,
   // 不能传 null——Rust 侧那边是 Option<bool>,null 过来会变成"没写"以外的乱东西。
@@ -26,6 +37,12 @@ export const api = {
   // 移进回收站,不是真删。后端只搬文件,用户不点撤销也还能自己去捞。
   trashClip: (filename: string) => invoke<void>("trash_clip", { filename }),
   restoreClip: (filename: string) => invoke<ClipSummary>("restore_clip", { filename }),
+
+  // 回收站:翻一遍、看内容、放回去、彻底删掉、清空
+  listTrash: () => invoke<TrashListing>("list_trash"),
+  readTrashClip: (filename: string) => invoke<ClipContent>("read_trash_clip", { filename }),
+  purgeClip: (filename: string) => invoke<void>("purge_clip", { filename }),
+  emptyTrash: () => invoke<PurgeReport>("empty_trash"),
   // 返回 null 表示用户在保存对话框点了取消,那不是故障。
   exportVault: () => invoke<string | null>("export_vault"),
   captureClipboard: () => invoke<ClipboardCapture>("capture_clipboard"),

@@ -123,10 +123,12 @@ body {
   background: var(--bg);
 }
 
-/* 断点定在实测的临界点上,别拍脑袋。量下来这行提示占 181px,剪藏目录占
-   63px,两者加起来工具栏在 1100px 刚好放得下,再窄就挤了。定高了(比如
-   1180)的话,默认窗口下这行提示根本不显示,那还不如不写。 */
-@media (max-width: 1080px) {
+/* 这行提示是**发现性提示**,不是功能。挤不下的时候该让的是它,不是筛选页签——
+   页签藏起来用户还以为功能没有,提示藏了他顶多晚点发现快捷键。
+   1080px 是上一轮量出来的临界点(提示 181px + 剪藏目录 63px,1100px 刚好放下);
+   后来多了一个「回收站」页签,约 +60px,所以抬到 1140px。
+   **这个数是算出来的不是量出来的**——下次工具栏再变动,记得重新量一遍。 */
+@media (max-width: 1140px) {
   .shortcut-hint { display: none; }
 }
 
@@ -543,3 +545,12 @@ kbd {
 }
 
 .prose hr { border: none; border-top: 1px solid var(--border); margin: 2em 0; }
+
+/* 回收站列表头:左边是"几篇、共多大",右边是清空。sticky 跟着 week-header,
+   免得条目一长就看不见上面那两行信息了。 */
+.trash-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
