@@ -231,6 +231,10 @@ mod platform {
         CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
         RegisterClipboardFormatW,
     };
+    // GlobalFree 在 windows-sys 0.60 里挪到了 Foundation,不在 Memory。
+    // 只有测试写剪贴板那条路用得到它,正式构建不需要,别让它空报个警告
+    #[cfg(test)]
+    use windows_sys::Win32::Foundation::GlobalFree;
     use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     // CF_UNICODETEXT 住在 Ole 命名空间下,这看着别扭却是 Windows API 的既定事实。
     // 它被定义成 u16,但下面几个 API 收的是 u32,得显式转。
@@ -352,12 +356,15 @@ mod platform {
         read_clipboard()
     }
 
-    /// 测试用:把一份 CF_HTML 原样写进真实剪贴板。
+    /// 测试用:把一份 CF_HTML 原样写进真实剪贴板。**返回有没有真写进去。**
     ///
-    /// 只在 `#[cfg(test)]` 下存在。写进去的东西对不对不靠自说自话——
-    /// `真实剪贴板往返` 那条测试写完立刻读回来比对,写错就是写错。
+    /// 这条返回值不是多余的:剪贴板是全局共享资源,别的程序正占着的时候
+    /// `OpenClipboard` 连着几次都会失败。之前这里打不开就静默 `return`,
+    /// 测试接着读回来拿到的是上一次的残留内容,报出来的却是
+    /// 「`assertion left == right failed`」——把环境占用说成了代码错误,
+    /// 排查的人得先怀疑半天自己的代码。写没写成必须让调用方知道。
     #[cfg(test)]
-    pub fn set_html_for_test(raw: &[u8]) {
+    pub fn set_html_for_test(raw: &[u8]) -> bool {
         use windows_sys::Win32::System::DataExchange::EmptyClipboard;
         use windows_sys::Win32::System::Memory::{GlobalAlloc, GMEM_MOVEABLE};
 
@@ -367,20 +374,26 @@ mod platform {
             let html_format = RegisterClipboardFormatW(name.as_ptr());
 
             if !open_with_retry() {
-                return;
+                return false;
             }
             EmptyClipboard();
             let hmem = GlobalAlloc(GMEM_MOVEABLE, raw.len());
-            if !hmem.is_null() {
-                let dst = GlobalLock(hmem);
-                if !dst.is_null() {
-                    std::ptr::copy_nonoverlapping(raw.as_ptr(), dst as *mut u8, raw.len());
-                    GlobalUnlock(hmem);
-                    // 所有权移交给系统,之后不能再解锁或释放这块内存
-                    SetClipboardData(html_format, hmem as HANDLE);
-                }
+            if hmem.is_null() {
+                CloseClipboard();
+                return false;
             }
+            let dst = GlobalLock(hmem);
+            if dst.is_null() {
+                GlobalFree(hmem);
+                CloseClipboard();
+                return false;
+            }
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), dst as *mut u8, raw.len());
+            GlobalUnlock(hmem);
+            // 所有权移交给系统,之后不能再解锁或释放这块内存
+            let ok = !SetClipboardData(html_format, hmem as HANDLE).is_null();
             CloseClipboard();
+            ok
         }
     }
 
@@ -479,12 +492,14 @@ mod platform {
 
     #[cfg(test)]
     fn open_with_retry() -> bool {
-        for attempt in 0..5 {
+        // 10 次 × 30ms ≈ 300ms。剪贴板被占通常是"别的程序正在复制"这种
+        // 转瞬即逝的事,80ms(5 × 20ms)偏短,实测会漏掉一部分
+        for attempt in 0..10 {
             if unsafe { OpenClipboard(ptr::null_mut()) } != 0 {
                 return true;
             }
-            if attempt < 4 {
-                std::thread::sleep(std::time::Duration::from_millis(20));
+            if attempt < 9 {
+                std::thread::sleep(std::time::Duration::from_millis(30));
             }
         }
         false
@@ -647,6 +662,25 @@ mod tests {
         let reason = format!(
             "{test_name}:本机剪贴板当前不可用(多半是别的程序占着,或 CI 的无人值守会话),\
              这不是代码问题。设 QUIRE_REQUIRE_CLIPBOARD=1 可要求它必须可用。"
+        );
+        if forced {
+            panic!("{reason}");
+        }
+        eprintln!("跳过 —— {reason}");
+        false
+    }
+
+    /// 写进真实剪贴板之后确认一下。**写不进去要按"环境占着"处理,
+    /// 不能报成断言失败**——测试接着读回来拿到的是上一次的残留内容,
+    /// 报出来的是「`left == right` failed」,把环境问题说成了代码问题,
+    /// 排查的人得先怀疑半天自己的代码,方向从一开始就错了。
+    fn require_written(written: bool, test_name: &str) -> bool {
+        if written {
+            return true;
+        }
+        let forced = std::env::var("QUIRE_REQUIRE_CLIPBOARD").is_ok();
+        let reason = format!(
+            "{test_name}:没能写进真实剪贴板(别的程序正占着它,或 CI 的无人值守会话)。             这是环境问题,不是这条链路坏了。设 QUIRE_REQUIRE_CLIPBOARD=1 可要求它必须成功。"
         );
         if forced {
             panic!("{reason}");
@@ -908,7 +942,9 @@ mod tests {
             &[("SourceURL", "https://example.com/post/1")],
             context,
         );
-        platform::set_html_for_test(raw.as_bytes());
+        if !require_written(platform::set_html_for_test(raw.as_bytes()), "真实剪贴板往返") {
+            return;
+        }
 
         let capture = capture_clipboard().expect("应能读回刚写进去的内容");
         assert_eq!(capture.url.as_deref(), Some("https://example.com/post/1"));
@@ -950,7 +986,12 @@ mod tests {
             ("source-url", "https://example.com/post/1"),
         ]);
         let raw = build_cf_html_nl("\r\n", &[], &ctx);
-        platform::set_html_for_test(raw.as_bytes());
+        if !require_written(
+            platform::set_html_for_test(raw.as_bytes()),
+            "扩展载荷经真实剪贴板仍完整",
+        ) {
+            return;
+        }
 
         let capture = capture_clipboard().expect("应能读回扩展载荷");
         assert_eq!(
