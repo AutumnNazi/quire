@@ -153,8 +153,8 @@ pnpm dev            # 开发模式
 ## 开发
 
 ```bash
-pnpm test           # Rust 测试(164 条)
-pnpm test:web       # 前端测试(63 条)
+pnpm test           # Rust 测试(174 条)
+pnpm test:web       # 前端测试(81 条)
 pnpm clippy         # 零警告
 pnpm typecheck      # 两个包的类型检查
 pnpm ext:build      # 浏览器扩展
