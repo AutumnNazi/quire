@@ -4,8 +4,12 @@ import {
   isUnread,
   isoWeekKey,
   moveSelection,
+  pruneSelection,
   reanchorAfterRemoval,
+  selectAll,
   selectClips,
+  selectRange,
+  toggleSelected,
   upsertClip,
   type ClipLike,
 } from "./list";
@@ -228,5 +232,58 @@ describe("标完已读之后接着读", () => {
 
   it("没选中过就挑第一篇", () => {
     expect(reanchorAfterRemoval(["a.md", "b.md"], -1)).toBe("a.md");
+  });
+});
+
+describe("多选", () => {
+  const list = ["a", "b", "c", "d"];
+
+  it("点一下选上,再点一下取消", () => {
+    const once = toggleSelected(new Set(), "b");
+    expect([...once]).toEqual(["b"]);
+    expect([...toggleSelected(once, "b")]).toEqual([]);
+  });
+
+  it("不改动传进来的那个集合", () => {
+    // 渲染会重算好几次,就地改的话总有一处会漏
+    const base = new Set(["a"]);
+    toggleSelected(base, "b");
+    expect([...base]).toEqual(["a"]);
+  });
+
+  it("按住 Shift 连选,两头都算上", () => {
+    const next = selectRange(list, "b", "d", new Set());
+    expect([...next].sort()).toEqual(["b", "c", "d"]);
+  });
+
+  it("往回连选也是同一个区间", () => {
+    const next = selectRange(list, "d", "b", new Set());
+    expect([...next].sort()).toEqual(["b", "c", "d"]);
+  });
+
+  it("连选是把区间替换掉,不是往上加", () => {
+    // 追加会攒出一堆用户早就忘了自己选过的东西
+    const next = selectRange(list, "b", "c", new Set(["a"]));
+    expect([...next].sort()).toEqual(["b", "c"]);
+  });
+
+  it("没有锚点时退化成只选当前这条", () => {
+    const next = selectRange(list, null, "c", new Set(["a"]));
+    expect([...next].sort()).toEqual(["a", "c"]);
+  });
+
+  it("锚点已经不在列表里了也不能整段乱选", () => {
+    const next = selectRange(["b", "c", "d"], "z", "d", new Set());
+    expect([...next]).toEqual(["d"]);
+  });
+
+  it("全选只选看得见的", () => {
+    expect([...selectAll(list)]).toEqual(list);
+  });
+
+  it("列表一变就把看不见的选中项清掉", () => {
+    // 用户对着一堆看不见的条目按删除,那是制造事故
+    const next = pruneSelection(new Set(["a", "z"]), list);
+    expect([...next]).toEqual(["a"]);
   });
 });

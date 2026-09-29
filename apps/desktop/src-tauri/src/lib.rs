@@ -31,7 +31,7 @@ use clipboard::ClipboardCapture;
 use search::SearchHit;
 use tauri_plugin_dialog::DialogExt;
 use vault::{
-    ClipContent, ClipInput, ClipSummary, PurgeReport, SaveOutcome, ScanResult, SharedVault,
+    BatchReport, ClipContent, ClipInput, ClipSummary, SaveOutcome, ScanResult, SharedVault,
     TrashListing, Vault,
 };
 
@@ -157,10 +157,27 @@ fn set_clip_flags(
 
 /// 移进回收站。**不真删**——剪藏工具里唯一能把用户东西弄没的操作,
 /// 没必要一按就没。真要清空,用户自己去 `clips/.trash/` 里翻。
+///
+/// 一篇就是一批里只有一篇,走同一条路:批量最容易出的事就是"悄悄少做了一半",
+/// 返回值必须能说出到底做了几篇、哪几篇没做成。
 #[tauri::command]
-fn trash_clip(filename: String, state: State<AppState>) -> Result<(), String> {
+fn trash_clips(filenames: Vec<String>, state: State<AppState>) -> Result<BatchReport, String> {
     let vault = current_vault(&state)?;
-    vault.trash(&filename).map_err(|e| e.to_string())
+    vault.trash_batch(&filenames).map_err(|e| e.to_string())
+}
+
+/// 一次改多篇的已读 / 归档。
+#[tauri::command]
+fn set_clip_flags_batch(
+    filenames: Vec<String>,
+    read: Option<bool>,
+    archived: Option<bool>,
+    state: State<AppState>,
+) -> Result<BatchReport, String> {
+    let vault = current_vault(&state)?;
+    vault
+        .set_flags_batch(&filenames, read, archived)
+        .map_err(|e| e.to_string())
 }
 
 /// 从回收站放回原位。
@@ -194,7 +211,7 @@ fn purge_clip(filename: String, state: State<AppState>) -> Result<(), String> {
 
 /// 清空回收站。返回里带着清不掉的那些——"清空"没能清干净必须说出来。
 #[tauri::command]
-fn empty_trash(state: State<AppState>) -> Result<PurgeReport, String> {
+fn empty_trash(state: State<AppState>) -> Result<BatchReport, String> {
     let vault = current_vault(&state)?;
     vault.empty_trash().map_err(|e| e.to_string())
 }
@@ -438,7 +455,8 @@ pub fn run() {
             read_clip,
             search_clips,
             set_clip_flags,
-            trash_clip,
+            trash_clips,
+            set_clip_flags_batch,
             list_trash,
             read_trash_clip,
             search_trash,

@@ -7,7 +7,7 @@ import type {
 import type {
   ClipContent,
   ClipSummary,
-  PurgeReport,
+  BatchReport,
   ScanResult,
   SearchHit,
   TrashListing,
@@ -35,14 +35,21 @@ export const api = {
   setClipFlags: (filename: string, read?: boolean, archived?: boolean) =>
     invoke<ClipSummary>("set_clip_flags", { filename, read: read ?? null, archived: archived ?? null }),
   // 移进回收站,不是真删。后端只搬文件,用户不点撤销也还能自己去捞。
-  trashClip: (filename: string) => invoke<void>("trash_clip", { filename }),
+  // 一篇就是一批里只有一篇,所以只有批量这一条命令
+  trashClips: (filenames: string[]) => invoke<BatchReport>("trash_clips", { filenames }),
+  setClipFlagsBatch: (filenames: string[], read?: boolean, archived?: boolean) =>
+    invoke<BatchReport>("set_clip_flags_batch", {
+      filenames,
+      read: read ?? null,
+      archived: archived ?? null,
+    }),
   restoreClip: (filename: string) => invoke<ClipSummary>("restore_clip", { filename }),
 
   // 回收站:翻一遍、看内容、放回去、彻底删掉、清空
   listTrash: () => invoke<TrashListing>("list_trash"),
   readTrashClip: (filename: string) => invoke<ClipContent>("read_trash_clip", { filename }),
   purgeClip: (filename: string) => invoke<void>("purge_clip", { filename }),
-  emptyTrash: () => invoke<PurgeReport>("empty_trash"),
+  emptyTrash: () => invoke<BatchReport>("empty_trash"),
   // 返回 null 表示用户在保存对话框点了取消,那不是故障。
   exportVault: () => invoke<string | null>("export_vault"),
   captureClipboard: () => invoke<ClipboardCapture>("capture_clipboard"),

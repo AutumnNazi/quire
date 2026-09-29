@@ -6,12 +6,18 @@ import { clipToMarkdown, MARKDOWN_PLACEHOLDER, renderMarkdown } from "./markdown
 import {
   groupByWeek,
   moveSelection,
+  pruneSelection,
   reanchorAfterRemoval,
+  selectAll,
   selectClips,
+  selectRange,
+  toggleSelected,
   upsertClip,
   type ListMode,
+  type Selection,
 } from "./list";
 import type {
+  BatchReport,
   ClipContent,
   ClipSummary,
   SearchHit,
@@ -61,6 +67,14 @@ root.innerHTML = `
     <aside class="list-pane">
       <div class="warn" id="warn" hidden></div>
       <div class="list" id="list"></div>
+      <div class="batch-bar" id="batch-bar" hidden>
+        <span class="count" id="batch-count"></span>
+        <button class="btn" id="batch-read">标已读</button>
+        <button class="btn" id="batch-unread">标未读</button>
+        <button class="btn" id="batch-archive">归档</button>
+        <button class="btn danger" id="batch-delete">删除</button>
+        <button class="btn ghost" id="batch-clear">取消</button>
+      </div>
     </aside>
     <section class="detail-pane" id="detail"></section>
   </main>
@@ -78,6 +92,8 @@ const el = <T extends HTMLElement>(id: string): T => {
 };
 
 const listEl = el<HTMLDivElement>("list");
+const batchBarEl = el<HTMLDivElement>("batch-bar");
+const batchCountEl = el<HTMLSpanElement>("batch-count");
 const detailEl = el<HTMLElement>("detail");
 const warnEl = el<HTMLDivElement>("warn");
 const vaultPathEl = el<HTMLSpanElement>("vault-path");
@@ -95,6 +111,10 @@ const filterTrashEl = el<HTMLButtonElement>("filter-trash");
 let clips: ClipSummary[] = [];
 /** 回收站里的东西。**进回收站视图时才去拉**,平时不占着一次 IPC 往返。 */
 let trash: TrashItem[] = [];
+/** 多选。空集合 = 没在选,界面上不出现批量操作条。 */
+let selected: Selection = new Set();
+/** Shift 连选的锚点。`null` 表示还没点过起点——这时按 Shift 只选当前那条。 */
+let selectionAnchor: string | null = null;
 /** 非空时列表显示的是检索结果,而不是全库。空数组和 null 要分清:
  *  null = 没在搜,空数组 = 搜了但一条没中,两者界面不一样。 */
 let hits: SearchHit[] | null = null;
@@ -177,6 +197,18 @@ function visibleFilenames(): string[] {
 }
 
 function renderList(): void {
+  renderListInner();
+  // 列表重画完才知道哪些还看得见。**先清后画**是不行的:那时列表已经被
+  // replaceChildren 清空了,算出来的"可见项"永远是空集,一选就被清光
+  selected = pruneSelection(selected, visibleFilenames());
+  for (const el of listEl.querySelectorAll<HTMLElement>(".clip.selected")) {
+    const name = el.dataset.filename;
+    if (!name || !selected.has(name)) el.classList.remove("selected");
+  }
+  renderBatchBar();
+}
+
+function renderListInner(): void {
   listEl.replaceChildren();
 
   // 回收站是**另一份数据**,不是 clips 的一个筛选。走前面的每条路径之前先岔开:
@@ -322,7 +354,8 @@ function trashItem(item: TrashItem): HTMLElement {
   meta.append(site, when);
   el.append(meta);
 
-  el.addEventListener("click", () => void openTrashDetail(item.filename));
+  if (selected.has(item.filename)) el.classList.add("selected");
+  el.addEventListener("click", (e) => onItemClick(e, item.filename));
   return el;
 }
 
@@ -367,8 +400,9 @@ function clipItem(
     item.append(excerpt);
   }
 
+  if (clip.filename && selected.has(clip.filename)) item.classList.add("selected");
   if (opts.readToggle === false) {
-    item.addEventListener("click", () => void (filter === "trash" ? openTrashDetail(clip.filename) : openDetail(clip.filename)));
+    item.addEventListener("click", (e) => onItemClick(e, clip.filename));
     return item;
   }
 
@@ -387,8 +421,37 @@ function clipItem(
   });
   item.append(toggle);
 
-  item.addEventListener("click", () => void (filter === "trash" ? openTrashDetail(clip.filename) : openDetail(clip.filename)));
+  item.addEventListener("click", (e) => onItemClick(e, clip.filename));
   return item;
+}
+
+/** 列表项点击。`Ctrl`/`Cmd` 是加选减选,`Shift` 是连选,都不打开正文——
+ *  用户按住这两个键是在"挑一堆",不是在"读一篇"。 */
+function onItemClick(event: MouseEvent, filename: string): void {
+  if (event.ctrlKey || event.metaKey) {
+    selected = toggleSelected(selected, filename);
+    selectionAnchor = filename;
+  } else if (event.shiftKey) {
+    selected = selectRange(visibleFilenames(), selectionAnchor, filename, selected);
+    renderList();
+    return;
+  } else {
+    selected = new Set();
+    selectionAnchor = null;
+  }
+  renderList();
+  // 只有"普通单击"才打开正文。按住 Ctrl 把最后一项取消掉、顺带把文章弹出来,
+  // 那是用户没要求的
+  void (filter === "trash" ? openTrashDetail(filename) : openDetail(filename));
+}
+
+/** 渲染批量操作条。**只在库视图里出现**——回收站和搜索结果各有各的一套动作,
+ *  把「标已读」摆在回收站上等于摆一个按了没反应的按钮。 */
+function renderBatchBar(): void {
+  const on = selected.size > 0 && filter !== "trash";
+  batchBarEl.hidden = !on;
+  if (!on) return;
+  batchCountEl.textContent = `已选 ${selected.size} 篇`;
 }
 
 /** 改已读标志。失败要说出来——静默失败的代价是用户以为标上了,
@@ -456,22 +519,32 @@ async function refreshOpenDetail(): Promise<void> {
  *  没有必要一按就没。真想清空,用户自己去 `clips/.trash/` 里翻,那时候他
  *  是想清楚了才翻的。 */
 async function trashClip(filename: string): Promise<void> {
-  try {
-    await api.trashClip(filename);
-    clips = clips.filter((c) => c.filename !== filename);
-    if (hits) hits = hits.filter((h) => h.summary.filename !== filename);
-    if (activeFilename === filename) {
-      activeFilename = null;
-      renderEmptyDetail();
-    }
-    renderList();
-    showToast("已移到回收站", [
-      { label: "撤销", primary: true, onClick: () => void undoTrash(filename) },
-      { label: "关闭", onClick: hideToast },
-    ]);
-  } catch (err) {
-    showError(`删除失败:${String(err)}`);
+  const report = await trashMany([filename]);
+  if (report.failed.length > 0) {
+    showError(`删除失败:${report.failed[0].reason}`);
+    return;
   }
+  showToast("已移到回收站", [
+    { label: "撤销", primary: true, onClick: () => void undoTrash(filename) },
+    { label: "关闭", onClick: hideToast },
+  ]);
+}
+
+/** 一次删多篇。**成功和失败必须分开报**:一次删 20 篇里有 2 篇没删成,
+ * 只报一句"已删除"的话,用户会以为回收站里那两篇还在,回头找时才发现。 */
+async function trashMany(filenames: string[]): Promise<BatchReport> {
+  if (filenames.length === 0) return { succeeded: [], failed: [] };
+  const report = await api.trashClips(filenames);
+  const gone = new Set(report.succeeded);
+  clips = clips.filter((c) => !gone.has(c.filename));
+  if (hits) hits = hits.filter((h) => !gone.has(h.summary.filename));
+  selected = new Set([...selected].filter((f) => !gone.has(f)));
+  if (activeFilename && gone.has(activeFilename)) {
+    activeFilename = null;
+    renderEmptyDetail();
+  }
+  renderList();
+  return report;
 }
 
 async function undoTrash(filename: string): Promise<void> {
@@ -862,9 +935,11 @@ el<HTMLButtonElement>("btn-open").addEventListener("click", () => {
 /** 切筛选。搜索态下不切——搜出来的结果和自己的筛选无关,
  *  硬切会让用户以为"搜到的东西被筛没了",是搜索坏了。 */
 async function setFilter(next: ListMode | "trash"): Promise<void> {
-  // 搜索结果跟着上一个视图。切到回收站不把它清掉,用户就会在回收站里
-  // 看见**库里**搜出来的结果——那看起来就像"删了还能搜到"
+  // 搜索结果和选区都跟着上一个视图。不清掉的话,用户会在回收站里
+  // 看见**库里**搜出来的结果,或者对着一个已经看不见的选区按删除
   hits = null;
+  selected = new Set();
+  selectionAnchor = null;
   searchEl.value = "";
   filter = next;
   for (const [button, value] of [
@@ -913,23 +988,89 @@ async function doEmptyTrash(): Promise<void> {
   hideToast();
   try {
     const report = await api.emptyTrash();
-    trash = [];
+    // 失败的还在回收站里,得留在列表上,不能一股脑清空本地状态
+    const failed = new Set(report.failed.map((f) => f.filename));
+    trash = trash.filter((t) => failed.has(t.filename));
     activeFilename = null;
     renderTrashList();
     renderEmptyDetail();
     if (report.failed.length > 0) {
       // "清空"没清干净必须说出来。报一句成功了,用户会以为磁盘已经腾干净了
       showError(
-        `清掉了 ${report.removed} 篇,但有 ${report.failed.length} 篇没删掉:` +
+        `清掉了 ${report.succeeded.length} 篇,但有 ${report.failed.length} 篇没删掉:` +
           report.failed.map((f) => f.filename).join("、"),
       );
     } else {
-      showToast(`清掉了 ${report.removed} 篇`);
+      showToast(`清掉了 ${report.succeeded.length} 篇`);
     }
   } catch (err) {
     showError(`清空回收站失败:${String(err)}`);
   }
 }
+
+/* ── 批量操作 ── */
+
+function selectedFiles(): string[] {
+  return [...selected];
+}
+
+/** 一次改多篇的标志。**逐条走 `set_flags` 的同一条路**,所以"不许弄坏
+ * 用户文件"那两条规矩在批量下照样成立。 */
+async function batchFlags(read: boolean | undefined, archived: boolean | undefined, what: string): Promise<void> {
+  const names = selectedFiles();
+  if (names.length === 0) return;
+  try {
+    const report = await api.setClipFlagsBatch(names, read, archived);
+    const done = new Set(report.succeeded);
+    // 成功的那些从选区里去掉,失败的留着——用户看得见"哪几篇没成",
+    // 可以再点一次重试,而不是操作完还得回头猜是哪几篇
+    selected = new Set([...selected].filter((f) => done.has(f)));
+    // 批量报告只带回文件名,不带改完的摘要。与其在内存里把标志拼回去
+    // (拼错了就是"界面说已读、文件里还是未读"),不如老实重扫一遍磁盘
+    await refreshList();
+    if (activeFilename) await refreshOpenDetail();
+    reportBatch(report, `${what}了 ${report.succeeded.length} 篇`);
+  } catch (err) {
+    showError(`${what}失败:${String(err)}`);
+  }
+}
+
+function reportBatch(report: BatchReport, done: string): void {
+  if (report.failed.length === 0) {
+    showToast(done);
+    return;
+  }
+  // 批量最容易出的事就是"悄悄少做了一半"。只报成功那几条的话,
+  // 用户会以为没做的那几篇也做了
+  showError(`${done},但有 ${report.failed.length} 篇没成功:${report.failed[0].reason}`);
+}
+
+el<HTMLButtonElement>("batch-read").addEventListener("click", () => void batchFlags(true, undefined, "标已读"));
+el<HTMLButtonElement>("batch-unread").addEventListener("click", () => void batchFlags(false, undefined, "标未读"));
+el<HTMLButtonElement>("batch-archive").addEventListener("click", () => void batchFlags(undefined, true, "归档"));
+el<HTMLButtonElement>("batch-clear").addEventListener("click", () => {
+  selected = new Set();
+  selectionAnchor = null;
+  renderList();
+});
+
+el<HTMLButtonElement>("batch-delete").addEventListener("click", () => {
+  const names = selectedFiles();
+  // 删除是不可逆的(要进回收站才能撤销),而且一次动的是全部——
+  // 主按钮写成"取消",要用户多点一下才够得到那个红色的
+  showToast(`把选中的 ${names.length} 篇移到回收站?`, [
+    { label: "取消", primary: true, onClick: hideToast },
+    {
+      label: "移到回收站",
+      onClick: () => {
+        hideToast();
+        void trashMany(names)
+          .then((report) => reportBatch(report, `已移到回收站 ${report.succeeded.length} 篇`))
+          .catch((err) => showError(`删除失败:${String(err)}`));
+      },
+    },
+  ]);
+});
 
 el<HTMLButtonElement>("btn-export").addEventListener("click", async () => {
   try {
@@ -1001,8 +1142,28 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
-  if (e.key === "Escape" && isTyping(e.target)) {
-    (e.target as HTMLElement).blur();
+  if (e.key === "Escape") {
+    if (isTyping(e.target)) {
+      (e.target as HTMLElement).blur();
+      return;
+    }
+    // 选着东西的时候按 Esc 是"取消选择",不是关窗口
+    if (selected.size > 0) {
+      selected = new Set();
+      selectionAnchor = null;
+      renderList();
+      return;
+    }
+  }
+
+  // 全选只选**看得见的**。看不见的跟着一起删掉,那是制造事故
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "a" && !isTyping(e.target)) {
+    if (filter !== "trash") {
+      e.preventDefault();
+      selected = selectAll(visibleFilenames());
+      selectionAnchor = null;
+      renderList();
+    }
     return;
   }
   if (e.key === "/" && !isTyping(e.target)) {

@@ -131,3 +131,57 @@ export function reanchorAfterRemoval(visible: string[], indexBefore: number): st
   if (visible.length === 0) return null;
   return visible[Math.min(Math.max(indexBefore, 0), visible.length - 1)];
 }
+
+/* ── 多选 ──
+ *
+ * 规则单独抽出来测,是因为这几条全是"用户以为选中了、其实没选中"那一类:
+ * 选错了不报错,只是结果不对,点界面根本验不出来。 */
+
+export type Selection = ReadonlySet<string>;
+
+/** 加选/减选。返回新集合,不改原的——渲染会重算好几次,就地改容易漏。 */
+export function toggleSelected(selected: Selection, filename: string): Set<string> {
+  const next = new Set(selected);
+  if (next.has(filename)) next.delete(filename);
+  else next.add(filename);
+  return next;
+}
+
+/** `Shift` 连选:从锚点选到当前这条,**两头都含**。
+ *
+ *  没有锚点就退化成"只选当前这条"——总比什么都不选强。 */
+export function selectRange(
+  visible: string[],
+  anchor: string | null,
+  target: string,
+  base: Selection,
+): Set<string> {
+  const from = anchor === null ? -1 : visible.indexOf(anchor);
+  const to = visible.indexOf(target);
+  if (from === -1 || to === -1) return new Set([...base, target]);
+  const [lo, hi] = from <= to ? [from, to] : [to, from];
+  const next = new Set(base);
+  // 从头重选这一段:Windows 资源管理器就是这个语义——连选是把区间**替换**掉,
+  // 追加会攒出一堆用户早就忘了自己选过的东西
+  for (let i = 0; i < from; i++) next.delete(visible[i]);
+  for (let i = to + 1; i < visible.length; i++) next.delete(visible[i]);
+  for (let i = lo; i <= hi; i++) next.add(visible[i]);
+  return next;
+}
+
+/** 全选当前可见的。看不见的不选——用户看不到的东西被"选中"之后
+ *  跟着一起删掉,那是制造事故,不是提高效率。 */
+export function selectAll(visible: string[]): Set<string> {
+  return new Set(visible);
+}
+
+/** 已经不在列表里的选中项顺手清掉。列表一变(筛选、删除、撤销)就得走一遍,
+ *  否则用户会对着一堆看不见的条目按删除。 */
+export function pruneSelection(selected: Selection, visible: string[]): Set<string> {
+  const onScreen = new Set(visible);
+  const next = new Set<string>();
+  for (const filename of selected) {
+    if (onScreen.has(filename)) next.add(filename);
+  }
+  return next;
+}

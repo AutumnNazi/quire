@@ -293,6 +293,7 @@ kbd {
 }
 
 .list-pane {
+  position: relative;
   border-right: 1px solid var(--border);
   background: var(--bg-sunken);
   overflow-y: auto;
@@ -554,3 +555,30 @@ kbd {
   justify-content: space-between;
   gap: 8px;
 }
+
+/* ── 多选 ── */
+
+/* 选中态不用改背景色:列表里已经有"当前打开"的高亮,两个高亮叠在一起
+   用户分不清。改成左边插一条竖线,和"打开"那层在视觉上分开。 */
+.clip.selected {
+  box-shadow: inset 3px 0 0 var(--accent);
+  background: var(--bg);
+}
+
+/* 批量操作条。贴在列表底部而不是浮在中间:用户是"选了一串 → 顺手做点什么",
+   按钮应该在视线不移开的地方。 */
+.batch-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-raised);
+  font-size: 12.5px;
+}
+
+.batch-bar[hidden] { display: none; }
+.batch-bar .count { color: var(--text-muted); margin-right: auto; }

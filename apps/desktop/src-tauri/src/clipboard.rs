@@ -403,6 +403,16 @@ mod platform {
                 html: None,
                 text: None,
             };
+            // **必须先把剪贴板打开再读。** `OpenClipboard` 成功之后别的进程就
+            // 改不动它,`GetClipboardData` 拿到的句柄在整个读的过程中都有效。
+            //
+            // 不开就读是个真会踩内存的错:浏览器之类随时可能 `EmptyClipboard`,
+            // 句柄当场失效,后面 `GlobalSize` 拿到的是垃圾长度,再拿它
+            // `from_raw_parts` 就是越界读写。表现是"单跑绿、全跑红",
+            // 还夹着一次堆损坏退出——以前一直当成是环境问题,其实是自己写的。
+            if !open_with_retry() {
+                return snapshot;
+            }
             unsafe {
                 let mut name: Vec<u16> = "HTML Format".encode_utf16().collect();
                 name.push(0);
@@ -413,10 +423,8 @@ mod platform {
                 if IsClipboardFormatAvailable(CF_UNICODETEXT_U32) != 0 {
                     snapshot.text = read_global_utf16(GetClipboardData(CF_UNICODETEXT_U32));
                 }
-                if open_with_retry() {
-                    EmptyClipboard();
-                    CloseClipboard();
-                }
+                EmptyClipboard();
+                CloseClipboard();
             }
             snapshot
         }

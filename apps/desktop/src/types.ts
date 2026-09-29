@@ -57,8 +57,10 @@ export interface TrashListing {
   items: TrashItem[];
 }
 
-/** 清空回收站的结果。`failed` 非空就意味着没清干净,界面必须说出来。 */
-export interface PurgeReport {
-  removed: number;
+/** 一批操作的结果。**批量最容易出的事就是"悄悄少做了一半"**:
+ *  一次改 30 篇,中间有一篇被占用,用户看到的还是"操作成功"。
+ *  所以 `failed` 非空就必须显示出来,不能只报成功那几条。 */
+export interface BatchReport {
+  succeeded: string[];
   failed: Array<{ filename: string; reason: string }>;
 }

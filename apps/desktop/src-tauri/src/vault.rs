@@ -149,11 +149,13 @@ pub struct TrashListing {
     pub items: Vec<TrashItem>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// 一批操作的结果。**批量最容易出的事就是"悄悄少做了一半"**:一次改 30 篇,
+/// 中间有一篇被占用、有一篇文件名不合法,用户看到的还是"操作成功"。
+/// 所以成败必须分开报,失败的连原因一起带回来。
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PurgeReport {
-    pub removed: usize,
-    /// 清不掉的条目。**"清空回收站"没能清干净,必须说出来。**
+pub struct BatchReport {
+    pub succeeded: Vec<String>,
     pub failed: Vec<PurgeFailure>,
 }
 
@@ -684,22 +686,65 @@ impl Vault {
     /// 挨个 `purge` 而不是直接 `remove_dir_all`:图片目录是按 id 分桶的,
     /// 挨个删才能保证 `assets/` 里不给任何一篇留孤儿图。扫不动的条目
     /// 原样留着并记下来——**"清空"没能清干净,必须说出来。**
-    pub fn empty_trash(&self) -> Result<PurgeReport, VaultError> {
+    pub fn empty_trash(&self) -> Result<BatchReport, VaultError> {
         let listing = self.scan_trash()?;
-        let total = listing.items.len();
-        let mut failed = Vec::new();
+        let mut report = BatchReport::default();
         for item in listing.items {
-            if let Err(e) = self.purge(&item.filename) {
-                failed.push(PurgeFailure {
-                    filename: item.filename,
-                    reason: e.to_string(),
-                });
-            }
+            self.record(&mut report, &item.filename, || self.purge(&item.filename));
         }
-        Ok(PurgeReport {
-            removed: total - failed.len(),
-            failed,
-        })
+        Ok(report)
+    }
+
+    /// 记一条批量结果。**一条失败不打断后面的**——打断的话,一次改 30 篇
+    /// 在第 3 篇卡住,用户看到的是"改了 3 篇",而剩下 27 篇到底是没改
+    /// 还是改了一半,他完全猜不出来。
+    fn record<F>(&self, report: &mut BatchReport, filename: &str, run: F)
+    where
+        F: FnOnce() -> Result<(), VaultError>,
+    {
+        match run() {
+            Ok(()) => report.succeeded.push(filename.to_string()),
+            Err(e) => report.failed.push(PurgeFailure {
+                filename: filename.to_string(),
+                reason: e.to_string(),
+            }),
+        }
+    }
+
+    /// 一次改多篇的已读 / 归档标志。
+    ///
+    /// 挨个 `set_flags`,不是先在内存里算一遍再统一写盘:每个文件的内容
+    /// 都不一样(用户自己加过字段、换行风格也不一样),只有走同一条
+    /// `set_flags` 路径才碰得到「不许弄坏用户文件」那两条规矩。
+    pub fn set_flags_batch(
+        &self,
+        filenames: &[String],
+        read: Option<bool>,
+        archived: Option<bool>,
+    ) -> Result<BatchReport, VaultError> {
+        if read.is_none() && archived.is_none() {
+            // 两项都不改等于什么都不做。报"全部成功"是在骗人
+            return Ok(BatchReport {
+                succeeded: filenames.to_vec(),
+                failed: Vec::new(),
+            });
+        }
+        let mut report = BatchReport::default();
+        for filename in filenames {
+            self.record(&mut report, filename, || {
+                self.set_flags(filename, read, archived).map(|_| ())
+            });
+        }
+        Ok(report)
+    }
+
+    /// 一次删多篇。**不真删**,挨个搬进回收站,一篇失败不影响其余。
+    pub fn trash_batch(&self, filenames: &[String]) -> Result<BatchReport, VaultError> {
+        let mut report = BatchReport::default();
+        for filename in filenames {
+            self.record(&mut report, filename, || self.trash(filename));
+        }
+        Ok(report)
     }
 
     fn free_trash_slot(&self, filename: &str) -> Result<PathBuf, VaultError> {
@@ -1079,7 +1124,7 @@ mod tests {
         assert_eq!(v.scan_trash().unwrap().items.len(), 3);
 
         let report = v.empty_trash().unwrap();
-        assert_eq!(report.removed, 3);
+        assert_eq!(report.succeeded.len(), 3);
         assert!(report.failed.is_empty(), "正常情况不该有失败项");
         assert!(v.scan_trash().unwrap().items.is_empty());
     }
@@ -1088,7 +1133,7 @@ mod tests {
     fn 清空空回收站不算错() {
         let (_d, v) = vault();
         let report = v.empty_trash().unwrap();
-        assert_eq!(report.removed, 0);
+        assert!(report.succeeded.is_empty());
         assert!(report.failed.is_empty());
     }
 
@@ -1871,5 +1916,155 @@ mod tests {
             v.save_checked(&again, false).unwrap(),
             SaveOutcome::Saved { .. }
         ));
+    }
+    #[test]
+    fn 批量标已读一篇不落() {
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        let names: Vec<String> = (1..=5)
+            .map(|i| {
+                v.save(&input(&format!("https://a.com/{i}"), "第{i}篇", "正文"))
+                    .unwrap()
+                    .filename
+            })
+            .collect();
+
+        let report = v.set_flags_batch(&names, Some(true), None).unwrap();
+        assert_eq!(report.succeeded.len(), 5);
+        assert!(report.failed.is_empty());
+        for c in v.scan().unwrap().clips {
+            assert!(c.read, "{} 应该是已读", c.filename);
+        }
+    }
+
+    #[test]
+    fn 批量里有一篇不合法不打断其余() {
+        // 一次改 30 篇在第 3 篇卡住,用户看到的是"改了 3 篇",而剩下 27 篇
+        // 到底改没改他完全猜不出来——所以一条失败不能打断后面的
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        let a = v.save(&input("https://a.com/1", "甲", "正文")).unwrap();
+        let b = v.save(&input("https://a.com/2", "乙", "正文")).unwrap();
+
+        let names = vec![
+            a.filename.clone(),
+            "不存在的剪藏.md".to_string(),
+            b.filename.clone(),
+        ];
+        let report = v.set_flags_batch(&names, Some(true), None).unwrap();
+        assert_eq!(
+            report.succeeded,
+            vec![a.filename.clone(), b.filename.clone()]
+        );
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].filename, "不存在的剪藏.md");
+        assert!(!report.failed[0].reason.is_empty(), "失败必须带原因");
+
+        let clips = v.scan().unwrap().clips;
+        assert!(clips.iter().all(|c| c.read), "两篇真的都改了");
+    }
+
+    #[test]
+    fn 批量标志同样走不许弄坏用户文件那两条规矩() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v
+            .save(&input("https://a.com/1", "标题", "正文\n\n第二段"))
+            .unwrap();
+        // 模拟用户手写过的文件:自己加的字段 + CRLF 换行
+        let path = dir.path().join("clips").join(&saved.filename);
+        let crlf = "\r\n".repeat(40);
+        let mut raw = std::fs::read_to_string(&path).unwrap().replace('\n', &crlf);
+        raw.push_str("my_own_field: 留着");
+        raw.push_str(&crlf);
+        std::fs::write(&path, raw).unwrap();
+
+        v.set_flags_batch(std::slice::from_ref(&saved.filename), Some(true), None)
+            .unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("my_own_field: 留着"),
+            "用户自己的字段不该被顺手整理掉"
+        );
+        assert!(after.contains(&crlf), "换行风格得原样还原");
+        assert!(after.contains("read: true"));
+    }
+
+    #[test]
+    fn 两项都不改就什么都不做() {
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com/1", "标题", "正文")).unwrap();
+        let before = std::fs::metadata(v.clips_dir().join(&saved.filename))
+            .unwrap()
+            .len();
+
+        v.set_flags_batch(std::slice::from_ref(&saved.filename), None, None)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(v.clips_dir().join(&saved.filename))
+                .unwrap()
+                .len(),
+            before,
+            "什么都不该改,就不该重写文件"
+        );
+    }
+
+    #[test]
+    fn 批量归档就是批量归档() {
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        let names: Vec<String> = (1..=3)
+            .map(|i| {
+                v.save(&input(&format!("https://a.com/{i}"), "第{i}篇", "正文"))
+                    .unwrap()
+                    .filename
+            })
+            .collect();
+
+        v.set_flags_batch(&names, None, Some(true)).unwrap();
+        assert!(v.scan().unwrap().clips.iter().all(|c| c.archived));
+    }
+
+    #[test]
+    fn 批量删除是搬进回收站不是真删() {
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        let names: Vec<String> = (1..=4)
+            .map(|i| {
+                v.save(&input(&format!("https://a.com/{i}"), "第{i}篇", "正文"))
+                    .unwrap()
+                    .filename
+            })
+            .collect();
+
+        let report = v.trash_batch(&names).unwrap();
+        assert_eq!(report.succeeded.len(), 4);
+        assert!(v.scan().unwrap().clips.is_empty(), "列表里应该空了");
+        assert_eq!(v.scan_trash().unwrap().items.len(), 4, "一篇都不能真丢");
+    }
+
+    #[test]
+    fn 批量删除里的失败项不拖累其余() {
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        let a = v.save(&input("https://a.com/1", "甲", "正文")).unwrap();
+        let b = v.save(&input("https://a.com/2", "乙", "正文")).unwrap();
+
+        let report = v
+            .trash_batch(&[
+                "没有这一篇.md".to_string(),
+                a.filename.clone(),
+                b.filename.clone(),
+            ])
+            .unwrap();
+        assert_eq!(
+            report.succeeded,
+            vec![a.filename.clone(), b.filename.clone()],
+            "两篇都该搬进回收站"
+        );
+        assert_eq!(report.failed.len(), 1);
+        assert!(v.scan().unwrap().clips.is_empty());
     }
 }
