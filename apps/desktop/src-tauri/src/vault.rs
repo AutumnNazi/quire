@@ -4,13 +4,12 @@
 //! 都必须满足一个前提:**任何时候删掉这个目录,用户的数据一个字节都不会丢**。
 //! 所以没有数据库、没有后台同步,搜索是每次现扫文件算出来的。
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, Datelike, Local, SecondsFormat};
+use chrono::{Datelike, Local, SecondsFormat};
 use serde::{Deserialize, Serialize};
 
 use crate::frontmatter::{self, Frontmatter};
@@ -280,61 +279,6 @@ impl Vault {
         Ok(summary_from(fm, filename.to_string()))
     }
 
-    /// 按 ISO 自然周汇总,最近的一周在最前,最多取 `weeks` 周。
-    ///
-    /// **用 ISO 周而不是「最近七天」**,因为回顾要的是"我第几周剪了几篇",
-    /// 一个滚动窗口没法回答这个问题——每周一打开软件看到的分组都不一样。
-    ///
-    /// 跨年那周是 ISO 规则的经典坑:归属年由**包含该周星期四**的那一年决定。
-    /// 2026-01-01 是周四,属于 2026 年第 1 周,不是 2025 年第 53 周。
-    /// 判错了用户元旦剪的东西会落到去年年底那栏里。交给 chrono 的
-    /// `iso_week`,自己手搓 `第几周 = (day_of_year + 6) / 7` 一定会错。
-    pub fn weekly_digest(&self, weeks: usize) -> Result<Vec<WeekDigest>, VaultError> {
-        let dir = self.clips_dir();
-        if !dir.exists() || weeks == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut buckets: BTreeMap<(i32, u32), WeekDigest> = BTreeMap::new();
-        for entry in fs::read_dir(&dir)? {
-            let Ok(entry) = entry else { continue };
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
-            }
-            let Ok(text) = fs::read_to_string(&path) else { continue };
-            let Some((block, _)) = frontmatter::split(&text) else { continue };
-            let fm = Frontmatter::parse(block);
-            if fm.id.is_empty() {
-                continue;
-            }
-            let Some(key) = iso_week_key(&fm.clipped_at) else {
-                continue;
-            };
-            let b = buckets.entry(key).or_insert_with(|| WeekDigest {
-                iso_year: key.0,
-                iso_week: key.1,
-                total: 0,
-                unread: 0,
-                read: 0,
-                clips: Vec::new(),
-            });
-            b.total += 1;
-            if fm.read {
-                b.read += 1;
-            } else {
-                b.unread += 1;
-            }
-            b.clips.push(fm.title);
-        }
-
-        let mut out: Vec<WeekDigest> = buckets.into_values().collect();
-        // BTreeMap 是按 (年, 周) 升序排的,反过来才是"最近的在最前"
-        out.sort_by(|a, b| b.iso_year.cmp(&a.iso_year).then_with(|| b.iso_week.cmp(&a.iso_week)));
-        out.truncate(weeks);
-        Ok(out)
-    }
-
     /// 把整个剪藏库拼成**一个** Markdown 文件。
     ///
     /// 刻意不做 zip、不做 json、不做任何自家格式。理由很直接:README 上写着
@@ -428,31 +372,6 @@ impl Vault {
             body: body.trim_start().to_string(),
         })
     }
-}
-
-/// 一周的汇总,给「每周回顾」用。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WeekDigest {
-    /// ISO 周年,比如 2026。注意不是跨年那一周的日历年。
-    pub iso_year: i32,
-    /// ISO 周序号 1..=53。
-    pub iso_week: u32,
-    pub total: usize,
-    pub unread: usize,
-    pub read: usize,
-    pub clips: Vec<String>,
-}
-
-/// 从 `clipped_at`(ISO 8601 带时区)取出 ISO 周年和周序号。
-///
-/// 存的是带偏移的本地时间,得**按本地时间**归周:晚上 11 点剪的东西
-/// 属于"我剪的那天"所在的那周,不是 UTC 那天。chrono 解析出的
-/// `DateTime<FixedOffset>` 保留原偏移,直接拿它问 iso_week 就行。
-fn iso_week_key(clipped_at: &str) -> Option<(i32, u32)> {
-    let parsed = DateTime::parse_from_rfc3339(clipped_at).ok()?;
-    let iso = parsed.iso_week();
-    Some((iso.year(), iso.week()))
 }
 
 /// 表格单元格里不能出现裸的 `|`,否则整张表会错位。换行会截断这一行,
@@ -764,79 +683,6 @@ mod tests {
     fn 改已读状态拒绝路径穿越() {
         let (_d, v) = vault();
         assert!(v.set_flags("../../evil.md", Some(true), None).is_err(), "不能写到 vault 外面");
-    }
-
-    #[test]
-    fn 周回顾把剪藏按自然周分组() {
-        // 边界最容易错的是跨年那一周。2026-01-01 是周四,它属于 2026 年的
-        // 第 1 周(ISO 规则:包含该周星期四的那一年才是归属年),不是 2025
-        // 年的第 53 周。判断错了,用户元旦剪的东西会跑到去年年底那栏里。
-        let (_d, v) = vault();
-        v.ensure_dirs().unwrap();
-        for (id, title, when) in [
-            ("m0000001", "元旦剪的", "2026-01-01T09:00:00+08:00"),
-            ("m0000002", "周日剪的", "2026-01-04T09:00:00+08:00"),
-            ("m0000003", "下周一剪的", "2026-01-05T09:00:00+08:00"),
-        ] {
-            fs::write(
-                v.clips_dir().join(format!("{id}.md")),
-                format!("---\nid: \"{id}\"\ntitle: \"{title}\"\nurl: \"https://a.com/\"\nsite: \"a.com\"\nclipped_at: \"{when}\"\nread: false\n---\n\n正文\n"),
-            )
-            .unwrap();
-        }
-
-        let weeks = v.weekly_digest(8).unwrap();
-        assert_eq!(weeks.len(), 2, "元旦那周和下周一应该分成两周");
-        assert!(weeks[0].clips.contains(&"下周一剪的".to_string()), "最近的一周排在最前");
-        assert!(weeks[1].clips.contains(&"元旦剪的".to_string()));
-        assert!(weeks[1].clips.contains(&"周日剪的".to_string()), "周日应和元旦同属一周");
-        assert_eq!(weeks[0].unread, 1, "没读过的要数出来,这是回顾的重点");
-    }
-
-    #[test]
-    fn 周回顾数得清已读和未读() {
-        let (_d, v) = vault();
-        v.ensure_dirs().unwrap();
-        fs::write(
-            v.clips_dir().join("a.md"),
-            "---\nid: \"aaaa0001\"\ntitle: \"读过的\"\nurl: \"https://a.com/\"\nsite: \"a.com\"\nclipped_at: \"2026-03-02T09:00:00+08:00\"\nread: true\n---\n\n正文\n",
-        )
-        .unwrap();
-        fs::write(
-            v.clips_dir().join("b.md"),
-            "---\nid: \"bbbb0001\"\ntitle: \"没读的\"\nurl: \"https://b.com/\"\nsite: \"b.com\"\nclipped_at: \"2026-03-02T10:00:00+08:00\"\nread: false\n---\n\n正文\n",
-        )
-        .unwrap();
-
-        let weeks = v.weekly_digest(8).unwrap();
-        assert_eq!(weeks[0].total, 2);
-        assert_eq!(weeks[0].unread, 1);
-        assert_eq!(weeks[0].read, 1);
-    }
-
-    #[test]
-    fn 周回顾按周数截断() {
-        let (_d, v) = vault();
-        v.ensure_dirs().unwrap();
-        // 三个相隔一周的周一,分属三个 ISO 周
-        for (i, day) in ["2026-03-02", "2026-03-09", "2026-03-16"].iter().enumerate() {
-            fs::write(
-                v.clips_dir().join(format!("w{i}.md")),
-                format!("---\nid: \"w00000{i}\"\ntitle: \"第{i}周\"\nurl: \"https://a.com/\"\nsite: \"a.com\"\nclipped_at: \"{day}T09:00:00+08:00\"\n---\n\n正文\n"),
-            )
-            .unwrap();
-        }
-
-        assert_eq!(v.weekly_digest(1).unwrap().len(), 1, "只取最近一周");
-        assert_eq!(v.weekly_digest(10).unwrap().len(), 3, "周数够就全给");
-    }
-
-    #[test]
-    fn 周回顾不把读不出来的文件算进去() {
-        let (_d, v) = vault();
-        v.ensure_dirs().unwrap();
-        fs::write(v.clips_dir().join("bad.md"), "没有 frontmatter").unwrap();
-        assert!(v.weekly_digest(8).unwrap().is_empty(), "坏文件不该造出一周来");
     }
 
     #[test]

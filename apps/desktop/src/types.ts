@@ -42,13 +42,3 @@ export interface VaultInfo {
    *  不然用户不知道自己被监听着。 */
   watching: boolean;
 }
-
-/** 一周的汇总,字段名与 Rust 侧 `WeekDigest` 一致。 */
-export interface WeekDigest {
-  isoYear: number;
-  isoWeek: number;
-  total: number;
-  unread: number;
-  read: number;
-  clips: string[];
-}

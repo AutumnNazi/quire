@@ -4,7 +4,7 @@ import type {
   ClipInput,
   SavedClip,
 } from "./clipboard";
-import type { ClipContent, ClipSummary, ScanResult, SearchHit, VaultInfo, WeekDigest } from "./types";
+import type { ClipContent, ClipSummary, ScanResult, SearchHit, VaultInfo } from "./types";
 
 /**
  * Tauri 命令的薄封装。
@@ -23,7 +23,6 @@ export const api = {
   // 不能传 null——Rust 侧那边是 Option<bool>,null 过来会变成"没写"以外的乱东西。
   setClipFlags: (filename: string, read?: boolean, archived?: boolean) =>
     invoke<ClipSummary>("set_clip_flags", { filename, read: read ?? null, archived: archived ?? null }),
-  weeklyDigest: (weeks?: number) => invoke<WeekDigest[]>("weekly_digest", { weeks: weeks ?? null }),
   // 返回 null 表示用户在保存对话框点了取消,那不是故障。
   exportVault: () => invoke<string | null>("export_vault"),
   captureClipboard: () => invoke<ClipboardCapture>("capture_clipboard"),

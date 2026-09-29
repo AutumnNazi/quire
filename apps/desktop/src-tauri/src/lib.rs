@@ -29,7 +29,7 @@ use clipboard::ClipboardCapture;
 use search::SearchHit;
 use chrono::Local;
 use tauri_plugin_dialog::DialogExt;
-use vault::{ClipContent, ClipInput, ClipSummary, SavedClip, ScanResult, SharedVault, Vault, WeekDigest};
+use vault::{ClipContent, ClipInput, ClipSummary, SavedClip, ScanResult, SharedVault, Vault};
 
 /// 剪贴板轮询间隔。开启监控后一直在读剪贴板,太密会白耗 CPU,
 /// 太疏则用户复制完要干等。
@@ -124,14 +124,6 @@ fn set_clip_flags(
 ) -> Result<ClipSummary, String> {
     let vault = current_vault(&state)?;
     vault.set_flags(&filename, read, archived).map_err(|e| e.to_string())
-}
-
-/// 每周回顾。按 ISO 自然周汇总,最近的一周在最前。
-#[tauri::command]
-fn weekly_digest(weeks: Option<usize>, state: State<AppState>) -> Result<Vec<WeekDigest>, String> {
-    let vault = current_vault(&state)?;
-    let weeks = weeks.unwrap_or(8).min(52);
-    vault.weekly_digest(weeks).map_err(|e| e.to_string())
 }
 
 /// 把整个剪藏库拼成单个 Markdown,写到用户选的位置。
@@ -314,7 +306,6 @@ pub fn run() {
             read_clip,
             search_clips,
             set_clip_flags,
-            weekly_digest,
             export_vault,
             capture_clipboard,
             save_clip,
