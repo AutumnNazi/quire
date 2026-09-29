@@ -740,6 +740,12 @@ async function boot(): Promise<void> {
   // 用户会看到"扩展显示剪藏成功,列表里却没有"
   await listen("clip-saved", () => void refreshList());
   await listen("vault-changed", () => void refreshList());
+  // 图片是后台下的,下完了才通知。这条提示是**特意要说出来的**:
+  // Quire 一直说自己不联网,现在剪藏这一刻会真的去连图片服务器,
+  // 悄悄做和写在脸上是两回事
+  await listen<{ filename: string; count: number }>("clip-saved-images", (e) => {
+    showToast(`已剪藏,${e.payload.count} 张图片也存到本地了`);
+  });
   await listen<ClipboardCapture>("clipboard-changed", (event) => {
     pendingCapture = event.payload;
     const preview =

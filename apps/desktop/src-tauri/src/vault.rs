@@ -386,14 +386,20 @@ impl Vault {
         if !from.is_file() {
             return Err(VaultError::NotFound(filename.to_string()));
         }
+        // **id 要在搬之前读。** 文件一旦挪进回收站,`id_of` 就读不到了,
+        // 图片会原地不动,删一篇就在 assets/ 里留一窝孤儿图
+        let id = self.id_of(filename);
         fs::create_dir_all(self.trash_dir())?;
         // 回收站里重名不能覆盖。剪藏文件名是时间+随机 id 撞上的概率极低,
         // 但"极低"不是"不会"——悄悄覆盖掉用户的东西是最不能忍的一类错。
         fs::rename(&from, self.free_trash_slot(filename)?)?;
+        if let Some(id) = id {
+            self.move_assets(&id, true)?;
+        }
         Ok(())
     }
 
-    /// 把回收站里的剪藏放回原位。返回放回去之后的摘要,省得前端再全量扫一次盘。
+    /// 从回收站放回原位。返回放回去之后的摘要,省得前端再全量扫一次盘。
     pub fn restore(&self, filename: &str) -> Result<ClipSummary, VaultError> {
         if !slug::is_safe_filename(filename) {
             return Err(VaultError::UnsafeFilename(filename.to_string()));
@@ -407,10 +413,79 @@ impl Vault {
         if to.exists() {
             return Err(VaultError::AlreadyExists(filename.to_string()));
         }
+        let id = self.id_of_in(&self.trash_dir().join(filename));
         fs::create_dir_all(self.clips_dir())?;
         fs::rename(&from, &to)?;
+        if let Some(id) = id {
+            self.move_assets(&id, false)?;
+        }
         read_summary(&to, filename)
             .map_err(|reason| VaultError::Unreadable(filename.to_string(), reason))
+    }
+
+    /// 把一篇剪藏的图片目录搬进回收站 / 搬回来。找不到就当没有——
+    /// 还没做图片本地化的剪藏本来就没有这个目录,不该因此报错。
+    fn move_assets(&self, id: &str, to_trash: bool) -> Result<(), VaultError> {
+        let live = self.assets_dir().join(id);
+        let trashed = self.trash_dir().join(crate::assets::ASSETS_DIR).join(id);
+        let (from, to) = if to_trash { (&live, &trashed) } else { (&trashed, &live) };
+        if !from.is_dir() {
+            return Ok(());
+        }
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(from, to)?;
+        Ok(())
+    }
+
+    /// 读出剪藏的 id。图片目录按 id 命名,搬图片时要用。
+    fn id_of(&self, filename: &str) -> Option<String> {
+        self.id_of_in(&self.clips_dir().join(filename))
+    }
+
+    fn id_of_in(&self, path: &Path) -> Option<String> {
+        let text = fs::read_to_string(path).ok()?;
+        let (block, _) = frontmatter::split(&text)?;
+        let id = Frontmatter::parse(block).id;
+        if id.is_empty() { None } else { Some(id) }
+    }
+
+    /// 图片目录。平铺在 clips/ 下面、按剪藏 id 分桶。`scan()` 只看
+    /// `clips/` 一层且只认 `.md`,所以它天然不落进列表。
+    pub fn assets_dir(&self) -> PathBuf {
+        self.clips_dir().join(crate::assets::ASSETS_DIR)
+    }
+
+    /// 把一篇剪藏里的远程图片下到本地,并把正文里的地址换成相对路径。
+    ///
+    /// **调用方负责把它放到后台线程。** 这一步可能要下几十兆、走好几秒,
+    /// 挡在保存流程前面的话,`Ctrl+V` 一下等三秒,这个工具就没人用了。
+    pub fn localize_images<F>(&self, filename: &str, fetch: F) -> Result<(usize, usize), String>
+    where
+        F: Fn(&str) -> Result<(Option<String>, Vec<u8>), String>,
+    {
+        if !slug::is_safe_filename(filename) {
+            return Err(format!("文件名不合法: {filename}"));
+        }
+        let path = self.clips_dir().join(filename);
+        let text = fs::read_to_string(&path).map_err(|e| format!("读不出剪藏: {e}"))?;
+        let (block, body) =
+            frontmatter::split(&text).ok_or_else(|| format!("剪藏格式不对: {filename}"))?;
+        let id = Frontmatter::parse(block).id;
+
+        let (new_body, ok, failed) =
+            crate::assets::localize(body, &id, &self.assets_dir(), fetch)?;
+        // 一张都没换成功就别动文件,省掉一次无谓的写盘
+        if new_body == body {
+            return Ok((ok, failed));
+        }
+        // **frontmatter 一个字节都不碰。** 只把正文那一段换掉——它是从
+        // 原文尾部切出来的,前面那截原样拼回去,用户的字段、换行风格、
+        // 字段顺序都不会被顺带"整理"掉。
+        let head = &text[..text.len() - body.len()];
+        write_atomic(&path, format!("{head}{new_body}").as_bytes()).map_err(|e| e.to_string())?;
+        Ok((ok, failed))
     }
 
     /// 在回收站里给 `filename` 找一个没人占的坑位,最多试 100 次。
@@ -633,6 +708,125 @@ mod tests {
         let missing = "20260101-aaaaaaaa-none-com.md";
         assert!(matches!(v.trash(missing), Err(VaultError::NotFound(_))));
         assert!(matches!(v.restore(missing), Err(VaultError::NotFound(_))));
+        drop(dir);
+    }
+
+    #[test]
+    fn 图片落到本地后正文指向它() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v
+            .save(&input(
+                "https://a.com/post",
+                "带图的",
+                "![封面](https://cdn.example.com/a.png)\n\n正文。\n",
+            ))
+            .unwrap();
+
+        let (ok, failed) = v
+            .localize_images(&saved.filename, |url| {
+                assert!(url.starts_with("https://cdn.example.com/"), "{url}");
+                Ok((Some("image/png".to_string()), b"\x89PNG fake".to_vec()))
+            })
+            .unwrap();
+
+        assert_eq!((ok, failed), (1, 0));
+        let text = fs::read_to_string(v.clips_dir().join(&saved.filename)).unwrap();
+        assert!(text.contains("assets/"), "正文该指向本地图片,实际:\n{text}");
+        assert!(!text.contains("cdn.example.com"), "不该还留着远程地址:\n{text}");
+        assert!(v.assets_dir().join(&saved.id).join("0.png").exists(), "图片得真的落盘");
+        assert!(text.contains("正文。"), "正文别的地方不能动");
+        drop(dir);
+    }
+
+    #[test]
+    fn 图片本地化不能动frontmatter() {
+        // set_flags 那条规矩在这里同样成立:只换正文,头部一个字节都不碰
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let path = {
+            let saved = v
+                .save(&input("https://a.com/post", "带图的", "![a](https://cdn.x.com/a.png)\n"))
+                .unwrap();
+            // 手工塞一个用户自己的字段,模拟"用户在 Quire 之外改过文件"
+            let p = v.clips_dir().join(&saved.filename);
+            let text = fs::read_to_string(&p).unwrap().replace("tags: []\n", "tags: [手写的]\nmine: 1\n");
+            fs::write(&p, text).unwrap();
+            let head = fs::read_to_string(&p).unwrap().split("---").nth(1).unwrap().to_string();
+            v.localize_images(&saved.filename, |_| {
+                Ok((Some("image/png".to_string()), b"x".to_vec()))
+            })
+            .unwrap();
+            let after = fs::read_to_string(&p).unwrap();
+            assert_eq!(after.split("---").nth(1).unwrap(), head, "frontmatter 被动了:\n{after}");
+            p
+        };
+        assert!(path.exists());
+        drop(dir);
+    }
+
+    #[test]
+    fn 图片下不下来时正文原封不动() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v
+            .save(&input("https://a.com/post", "下不来", "![a](https://cdn.x.com/a.png)\n"))
+            .unwrap();
+        let before = fs::read_to_string(v.clips_dir().join(&saved.filename)).unwrap();
+
+        let (ok, failed) = v
+            .localize_images(&saved.filename, |_| Err("连不上".to_string()))
+            .unwrap();
+
+        assert_eq!((ok, failed), (0, 1));
+        assert_eq!(
+            fs::read_to_string(v.clips_dir().join(&saved.filename)).unwrap(),
+            before,
+            "一张都没下成就不该碰用户的文件"
+        );
+        assert!(!v.assets_dir().join(&saved.id).exists(), "不该留下空目录");
+        drop(dir);
+    }
+
+    #[test]
+    fn 删剪藏时图片跟着走() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com/post", "带图的", "![a](https://cdn.x.com/a.png)\n")).unwrap();
+        v.localize_images(&saved.filename, |_| Ok((Some("image/png".into()), b"x".to_vec()))).unwrap();
+        assert!(v.assets_dir().join(&saved.id).join("0.png").exists());
+
+        v.trash(&saved.filename).unwrap();
+        assert!(!v.assets_dir().join(&saved.id).exists(), "图片该跟着进回收站,别留孤儿");
+        assert!(v.trash_dir().join(crate::assets::ASSETS_DIR).join(&saved.id).join("0.png").exists());
+
+        v.restore(&saved.filename).unwrap();
+        assert!(v.assets_dir().join(&saved.id).join("0.png").exists(), "撤销时图片也得回来");
+        assert!(!v.trash_dir().join(crate::assets::ASSETS_DIR).join(&saved.id).exists());
+        drop(dir);
+    }
+
+    #[test]
+    fn 回收站里没有图片的剪藏删起来照样正常() {
+        // 手工放进去的 .md、没经过图片本地化的老剪藏,都没有 assets 目录
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com/post", "老剪藏", "没有图。\n")).unwrap();
+        assert!(v.trash(&saved.filename).is_ok());
+        assert!(v.restore(&saved.filename).is_ok());
+        drop(dir);
+    }
+
+    #[test]
+    fn 图片目录不该混进列表() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let saved = v.save(&input("https://a.com/post", "带图的", "![a](https://cdn.x.com/a.png)\n")).unwrap();
+        v.localize_images(&saved.filename, |_| Ok((Some("image/png".into()), b"x".to_vec()))).unwrap();
+
+        let names: Vec<String> = v.scan().unwrap().clips.into_iter().map(|c| c.filename).collect();
+        assert_eq!(names, vec![saved.filename], "assets/ 目录不该出现在列表里");
+        assert!(v.scan().unwrap().unreadable.is_empty(), "assets/ 也不该被报成读不出元数据");
         drop(dir);
     }
 

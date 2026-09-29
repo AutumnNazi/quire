@@ -8,6 +8,7 @@
 //! 现在改走剪贴板,那个服务没有任何消费者了——留着就等于在你机器上常驻一个
 //! 监听端口,给同浏览器的恶意网页留了个可攻击面。直接拆掉,比加防护干净。
 
+pub mod assets;
 pub mod clipboard;
 pub mod frontmatter;
 pub mod ids;
@@ -55,9 +56,16 @@ pub struct VaultInfo {
     pub watching: bool,
 }
 
+/// 后台把图片下完之后的通知,让界面能告诉用户"图也存下来了"。
+#[derive(Clone, Serialize)]
+struct ImagesLocalized {
+    filename: String,
+    count: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ClipSavedNotice {
+struct ClipSavedNotice {
     pub id: String,
     pub filename: String,
 }
@@ -195,7 +203,49 @@ fn save_clip(
             filename: saved.filename.clone(),
         },
     );
+    spawn_image_localization(app, vault, saved.filename.clone());
     Ok(saved)
+}
+
+/// 后台把文章里的图片下到本地,下完再发一次 `clip-saved-images`。
+///
+/// **必须放后台。** 图片本地化可能要下几十兆、走好几秒,挡在保存流程前面
+/// 的话,`Ctrl+V` 按下去要等三秒才看到东西——剪藏工具的全部意义就是那一下
+/// 得是快的,为了几张图把它拖慢不划算。
+fn spawn_image_localization(app: AppHandle, vault: Arc<Vault>, filename: String) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .user_agent("Quire/0.1 (local-first read-later)")
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                // 建不出客户端就是没网之类的环境问题,静默跳过即可:
+                // 图片没存下来不该挡住剪藏本身
+                let _ = e;
+                return;
+            }
+        };
+        let result = vault.localize_images(&filename, |url| {
+            let resp = client.get(url).send().map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("HTTP {}", resp.status()));
+            }
+            let ct = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let bytes = resp.bytes().map_err(|e| e.to_string())?.to_vec();
+            Ok((ct, bytes))
+        });
+        if let Ok((saved, _)) = result {
+            if saved > 0 {
+                let _ = app.emit("clip-saved-images", ImagesLocalized { filename, count: saved });
+            }
+        }
+    });
 }
 
 /// 开关剪贴板监控。默认关闭:被动监听会连你复制的密码、验证码、快递单号

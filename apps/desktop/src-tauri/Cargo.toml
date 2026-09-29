@@ -23,6 +23,16 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 # 只为拿系统文档目录,几十 KB,不值当自己拼路径(Windows 上 Documents 会被 OneDrive 重定向)
 dirs = "6"
+# 下载文章里的图片存到本地。reqwest 的默认 TLS 已经是 rustls(纯 Rust),
+# 不拉 OpenSSL,Windows / macOS / Linux 都不用装系统包。
+# 图片本地化跑在自己的后台线程里,用阻塞客户端最省事,不必把整个下载
+# 流程摊平成 async。blocking 会带进 tokio 的同步部分,只在这一个点上用。
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "rustls",
+    "http2",
+    "charset",
+] }
 
 # 读剪贴板的 CF_HTML 格式。版本与 Tauri 传递依赖的那个对齐,免得同一份代码编两遍。
 [target.'cfg(windows)'.dependencies]
