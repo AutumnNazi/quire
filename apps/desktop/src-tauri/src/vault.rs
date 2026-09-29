@@ -2,14 +2,15 @@
 //!
 //! vault 就是一堆普通 `.md` 文件,躺在用户自己选的目录里。这里做的所有事
 //! 都必须满足一个前提:**任何时候删掉这个目录,用户的数据一个字节都不会丢**。
-//! 所以没有数据库、没有后台同步,索引(第二周的 FTS5)只是可随时重建的派生物。
+//! 所以没有数据库、没有后台同步,搜索是每次现扫文件算出来的。
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::{Datelike, Local, SecondsFormat};
+use chrono::{DateTime, Datelike, Local, SecondsFormat};
 use serde::{Deserialize, Serialize};
 
 use crate::frontmatter::{self, Frontmatter};
@@ -234,6 +235,184 @@ impl Vault {
         Ok(ScanResult { clips, unreadable })
     }
 
+    /// 改已读 / 归档标志。传 `None` 表示这一项不动。
+    ///
+    /// **重写整个文件是有代价的,所以必须做到只改该改的。** 用户的剪藏文件
+    /// 归用户所有:正文里的空行、行尾空格、他自己加的字段、记事本存出来的
+    /// CRLF 换行,一样都不能动。动一样,Quire 就成了那个"存下来其实是租的"
+    /// 的工具——只是租给了 Quire 自己。
+    ///
+    /// 做法是:原文拆成 frontmatter 段和正文段,**只重新序列化 frontmatter**,
+    /// 正文原样拼回去;换行风格按原文头部判断,原样还原。
+    pub fn set_flags(
+        &self,
+        filename: &str,
+        read: Option<bool>,
+        archived: Option<bool>,
+    ) -> Result<ClipSummary, VaultError> {
+        if !slug::is_safe_filename(filename) {
+            return Err(VaultError::UnsafeFilename(filename.to_string()));
+        }
+        let path = self.clips_dir().join(filename);
+        let original = fs::read_to_string(&path)
+            .map_err(|_| VaultError::NotFound(filename.to_string()))?;
+        let (block, body) = frontmatter::split(&original)
+            .ok_or_else(|| VaultError::NotFound(filename.to_string()))?;
+
+        // 头部用 CRLF 就整份还原成 CRLF。判据看 frontmatter 段自身,
+        // 因为正文里混着两种换行也不算用户手滑。
+        let newline = if block.contains("\r\n") { "\r\n" } else { "\n" };
+
+        let mut fm = Frontmatter::parse(block);
+        if let Some(v) = read {
+            fm.read = v;
+        }
+        if let Some(v) = archived {
+            fm.archived = v;
+        }
+
+        // 分隔符后**只跟一个换行**:split 切出来的 body 自带原来那个空行,
+        // 再补一个就等于每次改标志给正文加一行,文件会越滚越胖。
+        let mut out = fm.render().replace('\n', newline);
+        out = format!("---{newline}{out}---{newline}{body}");
+        write_atomic(&path, out.as_bytes())?;
+
+        Ok(summary_from(fm, filename.to_string()))
+    }
+
+    /// 按 ISO 自然周汇总,最近的一周在最前,最多取 `weeks` 周。
+    ///
+    /// **用 ISO 周而不是「最近七天」**,因为回顾要的是"我第几周剪了几篇",
+    /// 一个滚动窗口没法回答这个问题——每周一打开软件看到的分组都不一样。
+    ///
+    /// 跨年那周是 ISO 规则的经典坑:归属年由**包含该周星期四**的那一年决定。
+    /// 2026-01-01 是周四,属于 2026 年第 1 周,不是 2025 年第 53 周。
+    /// 判错了用户元旦剪的东西会落到去年年底那栏里。交给 chrono 的
+    /// `iso_week`,自己手搓 `第几周 = (day_of_year + 6) / 7` 一定会错。
+    pub fn weekly_digest(&self, weeks: usize) -> Result<Vec<WeekDigest>, VaultError> {
+        let dir = self.clips_dir();
+        if !dir.exists() || weeks == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut buckets: BTreeMap<(i32, u32), WeekDigest> = BTreeMap::new();
+        for entry in fs::read_dir(&dir)? {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else { continue };
+            let Some((block, _)) = frontmatter::split(&text) else { continue };
+            let fm = Frontmatter::parse(block);
+            if fm.id.is_empty() {
+                continue;
+            }
+            let Some(key) = iso_week_key(&fm.clipped_at) else {
+                continue;
+            };
+            let b = buckets.entry(key).or_insert_with(|| WeekDigest {
+                iso_year: key.0,
+                iso_week: key.1,
+                total: 0,
+                unread: 0,
+                read: 0,
+                clips: Vec::new(),
+            });
+            b.total += 1;
+            if fm.read {
+                b.read += 1;
+            } else {
+                b.unread += 1;
+            }
+            b.clips.push(fm.title);
+        }
+
+        let mut out: Vec<WeekDigest> = buckets.into_values().collect();
+        // BTreeMap 是按 (年, 周) 升序排的,反过来才是"最近的在最前"
+        out.sort_by(|a, b| b.iso_year.cmp(&a.iso_year).then_with(|| b.iso_week.cmp(&a.iso_week)));
+        out.truncate(weeks);
+        Ok(out)
+    }
+
+    /// 把整个剪藏库拼成**一个** Markdown 文件。
+    ///
+    /// 刻意不做 zip、不做 json、不做任何自家格式。理由很直接:README 上写着
+    /// "数据是你的",那导出的东西就必须**脱离 Quire 也能读**。用户拿这个文件
+    /// 丢进 Obsidian、Logseq、Notion 或者任何一个编辑器,都该是能直接看的东西。
+    /// 做成 zip 就等于把用户的数据再关一次锁,那和"租"没区别。
+    ///
+    /// 结构是「开头一张索引表 + 每篇一节」,每节之间用 `---` 分开。**不带
+    /// frontmatter**——每篇都带 YAML 的话,拼起来会有十几个 `---` 分隔线,
+    /// 在别的 Markdown 工具里会被当成十几个文档的边界,标题层级全乱。
+    pub fn export_markdown(&self) -> Result<String, VaultError> {
+        let dir = self.clips_dir();
+        if !dir.exists() {
+            return Ok(empty_export());
+        }
+
+        // 先收集再排序:目录遍历顺序是随机的,直接边走边拼的话导出文件
+        // 每次生成都不一样,没法做版本对比。
+        let mut items: Vec<(String, Frontmatter, String)> = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            // 读不出来的跳过而不是整体失败:用户手动改坏的 .md 不该让
+            // 整份导出泡汤——那等于因为一个错文件拿不回全部数据。
+            let Ok(text) = fs::read_to_string(&path) else { continue };
+            let Some((block, body)) = frontmatter::split(&text) else { continue };
+            let fm = Frontmatter::parse(block);
+            if fm.id.is_empty() {
+                continue;
+            }
+            items.push((fm.clipped_at.clone(), fm, body.trim().to_string()));
+        }
+        if items.is_empty() {
+            return Ok(empty_export());
+        }
+        // 和列表一致:新剪的在前。id 自带时间序,同秒内也不会乱。
+        items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.id.cmp(&a.1.id)));
+
+        let mut out = String::new();
+        out.push_str("# Quire 剪藏导出\n\n");
+        out.push_str(&format!(
+            "共 {} 篇,由 Quire 导出。\n\n",
+            items.len()
+        ));
+        out.push_str("| 剪藏于 | 标题 | 原文 |\n| --- | --- | --- |\n");
+        for (clipped_at, fm, _) in &items {
+            out.push_str(&format!(
+                "| {} | {} | {} |\n",
+                clipped_at,
+                escape_cell(&fm.title),
+                fm.url
+            ));
+        }
+        out.push_str("\n---\n");
+
+        for (_, fm, body) in &items {
+            out.push_str(&format!("\n## {}\n\n", fm.title.trim()));
+            let mut meta = vec![format!("- 剪藏于 {}", fm.clipped_at)];
+            if !fm.site.is_empty() {
+                meta.push(format!("- 来源 {}", fm.site));
+            }
+            if let Some(author) = fm.author.as_deref().filter(|s| !s.is_empty()) {
+                meta.push(format!("- 作者 {}", author));
+            }
+            if !fm.url.is_empty() {
+                meta.push(format!("- 原文 <{}>", fm.url));
+            }
+            out.push_str(&meta.join("\n"));
+            out.push_str("\n\n");
+            out.push_str(body);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
     /// 按文件名取正文。文件名来自前端,必须先过白名单。
     pub fn read_clip(&self, filename: &str) -> Result<ClipContent, VaultError> {
         if !slug::is_safe_filename(filename) {
@@ -249,6 +428,43 @@ impl Vault {
             body: body.trim_start().to_string(),
         })
     }
+}
+
+/// 一周的汇总,给「每周回顾」用。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WeekDigest {
+    /// ISO 周年,比如 2026。注意不是跨年那一周的日历年。
+    pub iso_year: i32,
+    /// ISO 周序号 1..=53。
+    pub iso_week: u32,
+    pub total: usize,
+    pub unread: usize,
+    pub read: usize,
+    pub clips: Vec<String>,
+}
+
+/// 从 `clipped_at`(ISO 8601 带时区)取出 ISO 周年和周序号。
+///
+/// 存的是带偏移的本地时间,得**按本地时间**归周:晚上 11 点剪的东西
+/// 属于"我剪的那天"所在的那周,不是 UTC 那天。chrono 解析出的
+/// `DateTime<FixedOffset>` 保留原偏移,直接拿它问 iso_week 就行。
+fn iso_week_key(clipped_at: &str) -> Option<(i32, u32)> {
+    let parsed = DateTime::parse_from_rfc3339(clipped_at).ok()?;
+    let iso = parsed.iso_week();
+    Some((iso.year(), iso.week()))
+}
+
+/// 表格单元格里不能出现裸的 `|`,否则整张表会错位。换行会截断这一行,
+/// 所以也换成空格——标题里的换行在索引表里没意义。
+fn escape_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace(['\r', '\n'], " ")
+}
+
+/// 空库导出的内容。用户点了导出就该拿到一个能打开的文件,
+/// 哪怕里面明说还没有剪藏,总比报错让人以为出了故障强。
+fn empty_export() -> String {
+    "# Quire 剪藏导出\n\n这个剪藏库还是空的,还没有剪藏。\n".to_string()
 }
 
 fn clean_optional(value: Option<&str>) -> Option<String> {
@@ -461,6 +677,235 @@ mod tests {
 
         let scan = v.scan().unwrap();
         assert!(scan.clips.iter().any(|c| c.title == "手写的"), "CRLF 文件应能解析");
+    }
+
+    #[test]
+    fn 改已读状态不碰正文和用户自己的字段() {
+        // 这条测试守的是「数据是用户的」这条底线。改一个布尔值就把用户手写的
+        // 自定义字段、换行风格、正文里的空行全洗掉的话,Quire 就成了那个
+        // 「存下来其实是租的」的工具——只是租给了 Quire 自己。
+        let (_d, v) = vault();
+        v.save(&input("https://a.com/1", "标题", "第一段\n\n第二段  \n缩进")).unwrap();
+        // 文件名是 save 自己算的(日期+id+主机名),别在这儿猜——猜错了
+        // 测试会报「文件不存在」,跟被测的逻辑八竿子打不着
+        let name = v.scan().unwrap().clips[0].filename.clone();
+        let path = v.clips_dir().join(&name);
+        let original = fs::read_to_string(&path).unwrap();
+        let body_before = frontmatter::split(&original).unwrap().1.to_string();
+
+        v.set_flags(&name, Some(true), None).unwrap();
+
+        let after = fs::read_to_string(&path).unwrap();
+        let (block, body_after) = frontmatter::split(&after).unwrap();
+        assert_eq!(body_after, body_before, "正文必须逐字节不变");
+        assert!(
+            body_after.contains("第一段\n\n第二段  \n缩进"),
+            "正文里的空行和行尾空格不能被规范化"
+        );
+        let fm = Frontmatter::parse(block);
+        assert!(fm.read, "read 应改成 true");
+        assert!(!fm.archived, "只传 read 时 archived 不该被动到");
+        // 正文内容不变,文件的总长度也只应该差在 frontmatter 那一行
+        assert!(after.ends_with(&body_before), "文件应以原正文结尾");
+    }
+
+    #[test]
+    fn 改已读状态保留用户手写的未知字段() {
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        let path = v.clips_dir().join("mine.md");
+        fs::write(
+            &path,
+            "---\nid: \"mine0001\"\ntitle: \"我的\"\nurl: \"https://a.com/\"\nsite: \"a.com\"\nrating: 5\nstatus: \"在读\"\n---\n\n正文\n",
+        )
+        .unwrap();
+
+        v.set_flags("mine.md", Some(true), None).unwrap();
+
+        let rewritten = fs::read_to_string(&path).unwrap();
+        let (block, _) = frontmatter::split(&rewritten).unwrap();
+        let fm = Frontmatter::parse(block);
+        assert!(fm.extra.contains_key("rating"), "rating 是用户自己加的,不能丢");
+        assert!(fm.extra.contains_key("status"), "status 同理");
+    }
+
+    #[test]
+    fn 改已读状态保留CRLF换行风格() {
+        // to_markdown 只吐 LF。用户从记事本存的文件是 CRLF,改一次标志就
+        // 把它整个转成 LF,等于 Quire 擅自改了用户文件的字节。
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        let path = v.clips_dir().join("crlf.md");
+        fs::write(
+            &path,
+            "---\r\nid: \"crlf0001\"\r\ntitle: \"记事本\"\r\nurl: \"https://a.com/\"\r\nsite: \"a.com\"\r\nread: false\r\n---\r\n\r\n正文\r\n",
+        )
+        .unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let body_before = frontmatter::split(&before).unwrap().1.to_string();
+
+        v.set_flags("crlf.md", Some(true), None).unwrap();
+
+        let after = fs::read_to_string(&path).unwrap();
+        let (block, body_after) = frontmatter::split(&after).unwrap();
+        assert_eq!(body_after, body_before, "正文必须逐字节不变");
+        assert!(body_after.contains('\r'), "CRLF 文件的正文也要保住 \\r");
+        // 精确判据:文件里每一个 \n 前面都得有 \r。早先写的是
+        // `!after.contains("\n正文")`,那句是错的——"\r\n正文" 本身就
+        // 包含 "\n正文",一条 CRLF 文件也会把它判红。
+        let bare_lf = after
+            .char_indices()
+            .any(|(i, c)| c == '\n' && (i == 0 || !after[..i].ends_with('\r')));
+        assert!(!bare_lf, "不该出现裸 LF,那说明换行风格被改写了");
+        assert!(Frontmatter::parse(block).read, "标志本身还是要改对");
+    }
+
+    #[test]
+    fn 改已读状态拒绝路径穿越() {
+        let (_d, v) = vault();
+        assert!(v.set_flags("../../evil.md", Some(true), None).is_err(), "不能写到 vault 外面");
+    }
+
+    #[test]
+    fn 周回顾把剪藏按自然周分组() {
+        // 边界最容易错的是跨年那一周。2026-01-01 是周四,它属于 2026 年的
+        // 第 1 周(ISO 规则:包含该周星期四的那一年才是归属年),不是 2025
+        // 年的第 53 周。判断错了,用户元旦剪的东西会跑到去年年底那栏里。
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        for (id, title, when) in [
+            ("m0000001", "元旦剪的", "2026-01-01T09:00:00+08:00"),
+            ("m0000002", "周日剪的", "2026-01-04T09:00:00+08:00"),
+            ("m0000003", "下周一剪的", "2026-01-05T09:00:00+08:00"),
+        ] {
+            fs::write(
+                v.clips_dir().join(format!("{id}.md")),
+                format!("---\nid: \"{id}\"\ntitle: \"{title}\"\nurl: \"https://a.com/\"\nsite: \"a.com\"\nclipped_at: \"{when}\"\nread: false\n---\n\n正文\n"),
+            )
+            .unwrap();
+        }
+
+        let weeks = v.weekly_digest(8).unwrap();
+        assert_eq!(weeks.len(), 2, "元旦那周和下周一应该分成两周");
+        assert!(weeks[0].clips.contains(&"下周一剪的".to_string()), "最近的一周排在最前");
+        assert!(weeks[1].clips.contains(&"元旦剪的".to_string()));
+        assert!(weeks[1].clips.contains(&"周日剪的".to_string()), "周日应和元旦同属一周");
+        assert_eq!(weeks[0].unread, 1, "没读过的要数出来,这是回顾的重点");
+    }
+
+    #[test]
+    fn 周回顾数得清已读和未读() {
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        fs::write(
+            v.clips_dir().join("a.md"),
+            "---\nid: \"aaaa0001\"\ntitle: \"读过的\"\nurl: \"https://a.com/\"\nsite: \"a.com\"\nclipped_at: \"2026-03-02T09:00:00+08:00\"\nread: true\n---\n\n正文\n",
+        )
+        .unwrap();
+        fs::write(
+            v.clips_dir().join("b.md"),
+            "---\nid: \"bbbb0001\"\ntitle: \"没读的\"\nurl: \"https://b.com/\"\nsite: \"b.com\"\nclipped_at: \"2026-03-02T10:00:00+08:00\"\nread: false\n---\n\n正文\n",
+        )
+        .unwrap();
+
+        let weeks = v.weekly_digest(8).unwrap();
+        assert_eq!(weeks[0].total, 2);
+        assert_eq!(weeks[0].unread, 1);
+        assert_eq!(weeks[0].read, 1);
+    }
+
+    #[test]
+    fn 周回顾按周数截断() {
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        // 三个相隔一周的周一,分属三个 ISO 周
+        for (i, day) in ["2026-03-02", "2026-03-09", "2026-03-16"].iter().enumerate() {
+            fs::write(
+                v.clips_dir().join(format!("w{i}.md")),
+                format!("---\nid: \"w00000{i}\"\ntitle: \"第{i}周\"\nurl: \"https://a.com/\"\nsite: \"a.com\"\nclipped_at: \"{day}T09:00:00+08:00\"\n---\n\n正文\n"),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(v.weekly_digest(1).unwrap().len(), 1, "只取最近一周");
+        assert_eq!(v.weekly_digest(10).unwrap().len(), 3, "周数够就全给");
+    }
+
+    #[test]
+    fn 周回顾不把读不出来的文件算进去() {
+        let (_d, v) = vault();
+        v.ensure_dirs().unwrap();
+        fs::write(v.clips_dir().join("bad.md"), "没有 frontmatter").unwrap();
+        assert!(v.weekly_digest(8).unwrap().is_empty(), "坏文件不该造出一周来");
+    }
+
+    #[test]
+    fn 导出是纯Markdown且自带清单() {
+        // 「数据是你的」不能只是一句口号。导出的东西必须**用别的工具也读得动**,
+        // 所以是纯 Markdown,不是 zip、不是 json、不是自家格式。用户拿这个文件
+        // 丢进 Obsidian / Logseq / 任何编辑器,都得是能看的东西。
+        let (_d, v) = vault();
+        v.save(&input("https://a.com/1", "第一篇", "正文一")).unwrap();
+        v.save(&input("https://b.com/2", "第二篇", "正文二")).unwrap();
+
+        let out = v.export_markdown().unwrap();
+        assert!(out.contains("| 标题 |"), "开头应有索引表格");
+        assert!(out.contains("第一篇"), "清单里应有第一篇");
+        assert!(out.contains("第二篇"));
+        assert!(out.contains("正文一"), "正文不能只导标题——那等于只导了目录");
+        assert!(out.contains("https://a.com/1"), "原文地址必须留着,否则回溯链断了");
+    }
+
+    #[test]
+    fn 导出按剪藏时间从新到旧() {
+        // 和列表一致。用户导出是为了快速翻阅,顺序反了就没法用。
+        let (_d, v) = vault();
+        v.save(&input("https://a.com/1", "旧", "旧正文")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        v.save(&input("https://b.com/2", "新", "新正文")).unwrap();
+
+        let out = v.export_markdown().unwrap();
+        let new_at = out.find("## 新").expect("应有一节标题为「新」");
+        let old_at = out.find("## 旧").expect("应有一节标题为「旧」");
+        assert!(new_at < old_at, "新剪的应排在旧的前面");
+    }
+
+    #[test]
+    fn 导出不含frontmatter标记() {
+        // 每个 clip 自带 YAML 块的话,拼起来的文件会有十几个 --- 分隔线,
+        // 在别的 Markdown 工具里会被当成十几个文档的边界,标题层级全乱。
+        let (_d, v) = vault();
+        v.save(&input("https://a.com/1", "标题", "正文")).unwrap();
+
+        let out = v.export_markdown().unwrap();
+        // 首尾各一个 hr 分隔整篇,正文里不该再出现 --- 行
+        let hr_lines = out
+            .lines()
+            .filter(|l| l.trim() == "---")
+            .count();
+        assert_eq!(hr_lines, 1, "只该有开头那一道分隔线,不该把每个 clip 的 YAML 也带进来");
+        assert!(!out.contains("clipped_at:"), "frontmatter 字段不该出现在导出里");
+    }
+
+    #[test]
+    fn 空库导出仍然给出可用文件() {
+        // 用户点了导出就该拿到一个文件,哪怕里面写着"还没有剪藏"。
+        // 直接报错等于让用户以为出了故障。
+        let (_d, v) = vault();
+        let out = v.export_markdown().unwrap();
+        assert!(!out.trim().is_empty(), "空库也要导出点东西出来");
+    }
+
+    #[test]
+    fn 导出跳过读不出来的文件而不是整体失败() {
+        // vault 里可能有用户手动改坏的 .md。一篇坏的不能让整份导出泡汤。
+        let (_d, v) = vault();
+        v.save(&input("https://a.com/1", "好的", "正文")).unwrap();
+        v.ensure_dirs().unwrap();
+        fs::write(v.clips_dir().join("broken.md"), "这个文件根本没有 frontmatter").unwrap();
+
+        let out = v.export_markdown().unwrap();
+        assert!(out.contains("好的"), "正常的那篇必须还在");
     }
 
     #[test]

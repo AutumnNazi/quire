@@ -27,7 +27,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use clipboard::ClipboardCapture;
 use search::SearchHit;
-use vault::{ClipInput, ClipContent, SavedClip, ScanResult, SharedVault, Vault};
+use chrono::Local;
+use tauri_plugin_dialog::DialogExt;
+use vault::{ClipContent, ClipInput, ClipSummary, SavedClip, ScanResult, SharedVault, Vault, WeekDigest};
 
 /// 剪贴板轮询间隔。开启监控后一直在读剪贴板,太密会白耗 CPU,
 /// 太疏则用户复制完要干等。
@@ -110,6 +112,57 @@ fn search_clips(
     // 上限是防手滑的闸,不是业务规则。一次要一万条,界面也渲染不动。
     let limit = limit.unwrap_or(200).min(1000);
     search::search(&vault, &query, limit).map_err(|e| e.to_string())
+}
+
+/// 改已读 / 归档标志。传 `None` 表示这一项不动。
+#[tauri::command]
+fn set_clip_flags(
+    filename: String,
+    read: Option<bool>,
+    archived: Option<bool>,
+    state: State<AppState>,
+) -> Result<ClipSummary, String> {
+    let vault = current_vault(&state)?;
+    vault.set_flags(&filename, read, archived).map_err(|e| e.to_string())
+}
+
+/// 每周回顾。按 ISO 自然周汇总,最近的一周在最前。
+#[tauri::command]
+fn weekly_digest(weeks: Option<usize>, state: State<AppState>) -> Result<Vec<WeekDigest>, String> {
+    let vault = current_vault(&state)?;
+    let weeks = weeks.unwrap_or(8).min(52);
+    vault.weekly_digest(weeks).map_err(|e| e.to_string())
+}
+
+/// 把整个剪藏库拼成单个 Markdown,写到用户选的位置。
+///
+/// 走对话框让用户自己定存哪、叫什么名——导出是用户的动作,
+/// 替他在某个目录里造个文件等于替他做决定。
+#[tauri::command]
+fn export_vault(app: AppHandle, state: State<AppState>) -> Result<Option<String>, String> {
+    let vault = current_vault(&state)?;
+    let markdown = vault.export_markdown().map_err(|e| e.to_string())?;
+
+    let picked = app
+        .dialog()
+        .file()
+        .set_file_name(default_export_name())
+        .add_filter("Markdown", &["md"])
+        .blocking_save_file();
+    let Some(picked) = picked else {
+        return Ok(None); // 用户点了取消,不是故障
+    };
+    let Some(path) = picked.into_path().ok() else {
+        return Err("选中的不是一个可写的文件位置".into());
+    };
+    std::fs::write(&path, markdown).map_err(|e| format!("写入失败: {e}"))?;
+    Ok(Some(path.display().to_string()))
+}
+
+/// 导出文件名带上日期。同一周导两次不会互相覆盖,而用户回头翻的时候
+/// 也知道是哪一份。
+fn default_export_name() -> String {
+    format!("Quire-剪藏导出-{}.md", Local::now().format("%Y-%m-%d"))
 }
 
 /// 读一次剪贴板。前端拿到 HTML 后转成 Markdown,再调 [`save_clip`] 落盘。
@@ -260,6 +313,9 @@ pub fn run() {
             list_clips,
             read_clip,
             search_clips,
+            set_clip_flags,
+            weekly_digest,
+            export_vault,
             capture_clipboard,
             save_clip,
             set_clipboard_watch,
