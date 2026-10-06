@@ -10,7 +10,7 @@ import {
   t,
   wireText,
 } from "./i18n";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 
 /** 读源码。**不能走 `import.meta.url`**——jsdom 环境会把它换成 http URL,
@@ -59,15 +59,25 @@ const en = catalog("en");
  *  正则扫不到。改从 Rust 源码里抠 `WireError::new("…")`:这样加一条
  *  错误类型却忘了配文案,测试一定红。 */
 function usedKeys(): Set<string> {
-  const main = source("src", "main.ts");
+  // **扫 `src` 下所有模块,不只 `main.ts`。** 从 main 里往外抽模块是常事
+  // (`list.ts` / `note.ts` / `clip-item.ts` 都是这么来的),而那些模块
+  // 照样在引用文案。只认 main 的话,抽出去那部分的键会被判成孤儿,
+  // 下一个人照着删掉,运行时界面上就甩出一串英文代号
+  //
+  // 排除两样:`i18n.ts` 自己是词典(全算"用过"就没意义了),
+  // `*.test.ts` 里引的键是测试在验文案,不代表界面用得上
   const used = new Set<string>();
+  const modules = readdirSync(resolve(process.cwd(), "src"))
+    .filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts") && f !== "i18n.ts")
+    .map((f) => source("src", f))
+    .join("\n");
   // 前缀写全了:少写一个,那个命名空间下的键就整体漏扫。
   // **点号后面不许只收 ASCII**——收窄了的话,有人打错一个中文字,
   // 这个键会被整个漏掉,测试照样绿,而运行时界面上只会甩出那串字
-  const key = '"(toolbar|filter|list|clip|trash|detail|toast|confirm|error|watch|batch|lang|tag)\\.[^"]+"';
+  const key = '"(toolbar|filter|list|clip|trash|detail|toast|confirm|error|watch|batch|lang|tag|search|import|export|history|firstRun|status|shortcut|stats)\\.[^"]+"';
   // 两头的引号是匹配的一部分,键本身不带
-  for (const m of main.matchAll(new RegExp(key, "g"))) used.add(m[0].slice(1, -1));
-  for (const m of main.matchAll(/data-i18n(?:-html|-title|-aria|-placeholder)?="([^"]+)"/g)) {
+  for (const m of modules.matchAll(new RegExp(key, "g"))) used.add(m[0].slice(1, -1));
+  for (const m of modules.matchAll(/data-i18n(?:-html|-title|-aria|-placeholder)?="([^"]+)"/g)) {
     used.add(m[1]);
   }
   for (const file of ["vault.rs", "lib.rs", "clipboard.rs"]) {
@@ -76,6 +86,13 @@ function usedKeys(): Set<string> {
     // 只认全名的话 `app.internal` 会被当成没人用的键
     for (const m of rust.matchAll(/(?:WireError|Self)::new\("([^"]+)"\)/g)) {
       used.add(`error.${m[1]}`);
+    }
+    // **代号映射表。** `fetch_error_wire` 那类函数把错误种类配成字符串
+    // 字面量再传给 `WireError::new(code)`,上面那条规则扫不到——它只认
+    // 直接写在 new() 里的字面量。少了这条,那批代号会全被判成
+    // "界面里没人用",然后 rot 掉,运行时界面上甩出一串英文
+    for (const m of rust.matchAll(/=>\s*"([a-z]+[A-Za-z.]+)"/g)) {
+      if (m[1].includes(".")) used.add(`error.${m[1]}`);
     }
   }
   return used;
@@ -223,17 +240,17 @@ describe("applyI18n", () => {
     }
   });
 
-  it("带 kbd 的空态走 innerHTML,其余走 textContent", () => {
-    const before = getLocale();
-    const host = document.createElement("div");
-    try {
-      setLocale("en");
-      host.innerHTML = `<p data-i18n-html="list.empty.body"></p>`;
-      applyI18n(host);
-      // <kbd> 得是活的标签,不然快捷键在界面上就没了
-      expect(host.querySelectorAll("kbd").length).toBeGreaterThan(0);
-    } finally {
-      setLocale(before);
+  /** 引导文案里**不许再出现 `<kbd>` 标签**。原来那条测试是反着写的——
+   *  它确认空态走了 innerHTML 才放心,理由是 `<kbd>` 要是活的标签。
+   *
+   *  那个前提已经不成立了:空态改走 DOM 之后,`<kbd>` 就不该再由文案提供。
+   *  引号带来的风险是真的(标签栏那段是用户自己起的名字),而快捷键的视觉
+   *  提示不值得用 innerHTML 去换 —— 需要 <kbd> 样式的地方直接建元素
+   */
+  it("引导文案里不再有 kbd 标签", () => {
+    for (const key of ["list.empty.body", "firstRun.paste", "firstRun.watch"]) {
+      expect(zh[key]).not.toContain("<kbd>");
+      expect(en[key]).not.toContain("<kbd>");
     }
   });
 });

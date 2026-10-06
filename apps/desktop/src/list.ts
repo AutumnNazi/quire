@@ -10,6 +10,7 @@ export interface ClipLike {
   clippedAt: string;
   read: boolean;
   archived: boolean;
+  starred: boolean;
   /** 列表改的是同一个对象的副本,靠它认人。 */
   filename?: string;
 }
@@ -19,7 +20,7 @@ export interface ClipLike {
  *  `week` 不是「筛掉一部分」,而是换个排布方式,所以它和 all/unread 不是
  *  同一类东西——`selectClips` 不接它,只由 `groupByWeek` 处理。放进同一个
  *  联合类型里,调用方就得在每个 switch 里补一个永远走不到的分支。 */
-export type ListFilter = "all" | "unread" | "archived";
+export type ListFilter = "all" | "today" | "unread" | "archived" | "starred";
 export type ListMode = ListFilter | "week";
 
 /** 一周的分组。ISO 周只在这一处实现——后端曾经也有一份 `weekly_digest`,
@@ -31,9 +32,47 @@ export interface WeekGroup<T> {
   clips: T[];
 }
 
-/** 未读队列:归档过的一律不算,不然「全部读完」这个念头永远达不成。 */
-export function isUnread(clip: ClipLike): boolean {
+/** 未读队列:归档过的一律不算,不然「全部读完」这个念头永远达不成。
+ *
+ *  参数收的是**它真正用到的两项**,不是整个 `ClipLike`。统计那边
+ *  (`stats.ts`)手里的篇没有标题也不需要标题——为了能调这个函数
+ *  而在 `StatsClip` 里挂一个用不上的 `title`,那是让类型去迁就函数 */
+export function isUnread(clip: { read: boolean; archived: boolean }): boolean {
   return !clip.read && !clip.archived;
+}
+
+/** 还欠着多少篇。
+ *
+ *  **界面上那个数字走这里,不走 `clips.filter(...)`。** 筛选列表和按钮上的
+ *  数字各写一份判定的话,改了一处另一处没跟上,用户看到的「未读 8」点进去
+ *  却是 11 篇——那比没有数字更糟,他会以为这软件算不准 */
+export function unreadCount(clips: ClipLike[]): number {
+  return clips.filter(isUnread).length;
+}
+
+/** 「今天」按**本地日历日**算,不是"24 小时内"。
+ *
+ *  **差在凌晨那一条。** 晚上 11 点存的一篇,凌晨 1 点看一眼,按"24 小时内"
+ *  它还在今天,按日历日它已经算昨天了——而用户凌晨剪藏时想的是"我刚存的那篇"。
+ *  更要紧的是反过来:早上 9 点存的一篇,晚上 11 点看,按 24 小时内还在,
+ *  可用户会觉得"这都半天前了,还算今天?"
+ *
+ *  `now` 由调用方传进来:这个函数在测试里要能钉住"今天是哪天",
+ *  直接调 `new Date()` 的话测试没法复现边界 */
+export function isToday(clip: ClipLike, now: Date): boolean {
+  const t = new Date(clip.clippedAt);
+  // **解析不了就不算今天。** 一篇日期坏掉的剪藏,宁可从"今天"里漏掉,
+  // 也不要因为 `NaN` 的比较结果是 false 而被塞进任何一天
+  // 后面三个比较对 NaN 一律是 false,所以这一行**删掉结果也一样**。
+  // 留着是因为它把"为什么返回 false"写成了显式的,而不是依赖
+  // `NaN != NaN` 这个巧合——将来谁把比较换成 `==` 或加一个宽松分支,
+  // 这里就是那道拦住他的东西
+  if (Number.isNaN(t.getTime())) return false;
+  return (
+    t.getFullYear() === now.getFullYear() &&
+    t.getMonth() === now.getMonth() &&
+    t.getDate() === now.getDate()
+  );
 }
 
 /** 按剪藏时间倒序,新的在前。同毫秒时用标题兜底,保证顺序稳定。 */
@@ -89,9 +128,18 @@ export function groupByWeek<T extends ClipLike>(clips: T[]): WeekGroup<T>[] {
 export function selectClips<T extends ClipLike>(clips: T[], filter: ListFilter): T[] {
   // 归档是「挪到一边」不是「删掉」,所以必须有个地方能翻回来。
   // 没有归档视图的话,用户点完归档东西就凭空消失了,那是数据丢失的观感。
+  // 收藏是**跨状态**的:收藏了的照样能同时是"未读"。
+  // 所以它不能像归档那样"挪到一边",而是"挑出来看"——
+  // 用户存到几百篇之后,真正的问题不是找不到,是"哪几篇值得再看一遍找不到"
+  // 「今天」的基准时间**每次调用现取**。取一次传给 selectClips 看着更省,
+  // 但那得让签名多一个参数,而每个调用点都要决定传什么——
+  // 忘传的那个编译器不管,界面上就是一片空
+  const now = new Date();
   const kept =
-    filter === "unread" ? clips.filter(isUnread)
+    filter === "today" ? clips.filter((c) => isToday(c, now))
+    : filter === "unread" ? clips.filter(isUnread)
     : filter === "archived" ? clips.filter((c) => c.archived)
+    : filter === "starred" ? clips.filter((c) => c.starred)
     : clips;
   return [...kept].sort(byClippedAtDesc);
 }
@@ -212,3 +260,37 @@ export function withTag(current: string[], tag: string): string[] {
 export function withoutTag(current: string[], tag: string): string[] {
   return current.filter((t) => t !== tag);
 }
+
+/* ── 一屏画多少 ── */
+
+/**
+ * 一次往列表里塞多少条。
+ *
+ * **别拿它当业务规则,它是画布的容量。** 列表每一条都是十来个 DOM 节点
+ * 加几个事件监听,库里上千篇的时候一次全画出来,滚一下就是几千个节点
+ * 一起参与布局。用户存到几百篇正是这个软件**成功**的样子,不该在那一刻
+ * 变卡
+ *
+ * 200 这个数不是拍脑袋:一屏大约能扫 15–20 条,200 条够翻十几屏,
+ * 而节点总数压在两千上下——这是任何浏览器都能随手重排的量
+ */
+export const LIST_PAGE = 200;
+
+/** 一屏要画哪些、后面还压着多少。
+ *
+ *  **`limit` 是"最多画几条",不是一个页码。** 页码语义下点「第 3 页」得先
+ *  跳走再跳回来,而用户点「显示更多」想的是"接着往下看";而且往回翻时
+ *  得判断当前在第几页,判断错了列表就跳一下
+ *
+ *  切筛选、切标签、搜索之后**都得把 limit 拨回 `LIST_PAGE`**。忘了拨的话,
+ *  用户在上一个视图里点过两次「显示更多」,切过去第一眼看到的就是
+ *  一个已经翻了两屏的列表——而他根本还没翻过
+ */
+export function listWindow<T>(items: T[], limit: number): { shown: T[]; hidden: number } {
+  // 负数当没点过。**不是防御性编程,是防一个真会出现的值**:
+  // 调用方拿 `limit - perPage` 往回退时,很容易退回负数
+  const want = Math.max(0, limit);
+  const shown = items.slice(0, want);
+  return { shown, hidden: items.length - shown.length };
+}
+

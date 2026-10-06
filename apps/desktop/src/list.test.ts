@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   groupByWeek,
+  isToday,
   isUnread,
   isoWeekKey,
   moveSelection,
@@ -11,14 +12,17 @@ import {
   selectClips,
   selectRange,
   toggleSelected,
+  unreadCount,
   upsertClip,
+  listWindow,
+  LIST_PAGE,
   withTag,
   withoutTag,
   type ClipLike,
 } from "./list";
 
 function clip(partial: Partial<ClipLike> & { clippedAt: string; filename?: string }): ClipLike {
-  return { title: "t", read: false, archived: false, filename: partial.filename ?? partial.title, ...partial };
+  return { title: "t", read: false, archived: false, starred: false, filename: partial.filename ?? partial.title, ...partial };
 }
 
 describe("未读判定", () => {
@@ -342,5 +346,190 @@ describe("增删标签", () => {
 
   it("摘不存在的标签不动它", () => {
     expect(withoutTag(["a"], "z")).toEqual(["a"]);
+  });
+});
+
+describe("收藏筛选", () => {
+  it("只挑出收藏了的", () => {
+    const clips = [
+      clip({ title: "甲", clippedAt: "2026-03-02T09:00:00", starred: true }),
+      clip({ title: "乙", clippedAt: "2026-03-01T09:00:00" }),
+    ];
+    expect(selectClips(clips, "starred").map((c) => c.title)).toEqual(["甲"]);
+  });
+
+  it("收藏**不**影响是不是未读", () => {
+    // 收藏是跨状态的:一篇可以既收藏、又还没读。
+    // 如果收藏把它从"未读"里踢掉了,用户标星的瞬间这篇就从队列里消失了,
+    // 那等于收藏顺手做了归档的事
+    const starred = clip({ title: "甲", clippedAt: "2026-03-02T09:00:00", starred: true });
+    expect(isUnread(starred)).toBe(true);
+    expect(selectClips([starred], "unread").map((c) => c.title)).toEqual(["甲"]);
+  });
+
+  it("收藏也不影响归档", () => {
+    // 归档是"读完挪走",收藏是"一直留着"。两个同时为真是合法的
+    const both = clip({
+      title: "甲",
+      clippedAt: "2026-03-02T09:00:00",
+      read: true,
+      archived: true,
+      starred: true,
+    });
+    expect(selectClips([both], "starred").map((c) => c.title)).toEqual(["甲"]);
+    expect(selectClips([both], "archived").map((c) => c.title)).toEqual(["甲"]);
+  });
+
+  it("一个都没收藏时是空列表,不是全库", () => {
+    const clips = [clip({ title: "甲", clippedAt: "2026-03-02T09:00:00" })];
+    expect(selectClips(clips, "starred")).toEqual([]);
+  });
+});
+
+describe("「今天」按日历日判定", () => {
+  // **基准时间由测试给死。** 直接 `new Date()` 的话测试没法复现边界:
+  // 跑在 23:59 和跑在 00:01 是两个结果,而 CI 什么时候跑是随机的
+  const now = new Date("2026-03-05T12:00:00");
+
+  it("今天早上剪的算今天", () => {
+    expect(isToday(clip({ clippedAt: "2026-03-05T08:00:00" }), now)).toBe(true);
+  });
+
+  it("今天深夜剪的也算今天", () => {
+    expect(isToday(clip({ clippedAt: "2026-03-05T23:30:00" }), now)).toBe(true);
+  });
+
+  it("昨天的不算", () => {
+    expect(isToday(clip({ clippedAt: "2026-03-04T23:59:00" }), now)).toBe(false);
+  });
+
+  /** **凌晨那一篇归今天,不归昨天。** 晚上 11 点存的、凌晨 1 点看的,
+   *  按「24 小时内」它已经过期了,可用户凌晨剪藏时想的是「我刚存的那篇」。
+   *  这是选日历日而不是滚动 24 小时的主要理由 */
+  it("凌晨剪的还归今天,不因为过了午夜就变成昨天", () => {
+    const afterMidnight = new Date("2026-03-05T01:00:00");
+    expect(isToday(clip({ clippedAt: "2026-03-05T01:00:00" }), afterMidnight)).toBe(true);
+    expect(isToday(clip({ clippedAt: "2026-03-04T23:30:00" }), afterMidnight)).toBe(false);
+  });
+
+  /** 月份和年份都要比。** 只比「日」的话,去年的今天会出现在今年的今天里 */
+  it("去年的同一天不算今天", () => {
+    expect(isToday(clip({ clippedAt: "2025-03-05T08:00:00" }), now)).toBe(false);
+  });
+
+  it("上个月的不算", () => {
+    expect(isToday(clip({ clippedAt: "2026-02-05T08:00:00" }), now)).toBe(false);
+  });
+
+  /** 日期坏掉的剪藏**宁可从「今天」里漏掉**。`NaN` 的比较一律是 false,
+   *  塞进任何一天都是错的 */
+  it("日期坏掉的不算今天", () => {
+    expect(isToday(clip({ clippedAt: "压根不是日期" }), now)).toBe(false);
+    expect(isToday(clip({ clippedAt: "" }), now)).toBe(false);
+  });
+
+  /** 空偏移(`Z`)按**本地时区**算。带偏移的按偏移算完再比本地日历日——
+   *  「今天剪的」对用户永远是"他所在时区的今天" */
+  it("带时区偏移的按换算后的本地时间算", () => {
+    // UTC 的 2026-03-04T20:00 在 UTC+8 是 3 月 5 日凌晨 4 点
+    expect(isToday(clip({ clippedAt: "2026-03-04T20:00:00Z" }), now)).toBe(
+      new Date("2026-03-04T20:00:00Z").getDate() === 5,
+    );
+  });
+});
+
+/**
+ * 工具栏「未读」按钮上那个数字。
+ *
+ * **它得和「未读」筛出来的条数一样。** 不一样的话用户点一下数字、
+ * 看到的列表条数对不上,他会认为这软件算不准——那比不显示数字糟糕得多,
+ * 因为一个不显示的数字不会引发任何信任问题
+ */
+describe("未读计数", () => {
+  it("和「未读」筛出来的条数一致", () => {
+    const clips = [
+      clip({ clippedAt: "2026-03-01T09:00:00", title: "甲" }),
+      clip({ clippedAt: "2026-03-01T09:00:00", title: "乙", read: true }),
+      clip({ clippedAt: "2026-03-01T09:00:00", title: "丙", archived: true }),
+      clip({ clippedAt: "2026-03-01T09:00:00", title: "丁" }),
+    ];
+    expect(unreadCount(clips)).toBe(selectClips(clips, "unread").length);
+  });
+
+  it("归档过的不算,读过的不算", () => {
+    expect(
+      unreadCount([
+        clip({ clippedAt: "2026-03-01T09:00:00", title: "甲" }),
+        clip({ clippedAt: "2026-03-01T09:00:00", title: "乙", read: true }),
+        clip({ clippedAt: "2026-03-01T09:00:00", title: "丙", archived: true }),
+      ]),
+    ).toBe(1);
+  });
+
+  it("空库是 0", () => {
+    expect(unreadCount([])).toBe(0);
+  });
+});
+
+
+describe("一屏画多少", () => {
+  const many = (n: number): number[] => Array.from({ length: n }, (_, i) => i);
+
+  it("比一屏少的时候全画出来,不报还有", () => {
+    // 库里一共就 12 篇,却挂着一条「还有 0 篇」,用户会以为下面还有东西
+    const { shown, hidden } = listWindow(many(12), LIST_PAGE);
+    expect(shown).toHaveLength(12);
+    expect(hidden).toBe(0);
+  });
+
+  it("正好一屏也不报还有", () => {
+    const { shown, hidden } = listWindow(many(LIST_PAGE), LIST_PAGE);
+    expect(shown).toHaveLength(LIST_PAGE);
+    expect(hidden).toBe(0);
+  });
+
+  it("超出一屏就截住,并且说得出还剩多少", () => {
+    // **这是整个上限的立身之本。** 截住了却不说,用户存了八百篇
+    // 只看到两百,会以为剩下的丢了
+    const { shown, hidden } = listWindow(many(800), LIST_PAGE);
+    expect(shown).toHaveLength(LIST_PAGE);
+    expect(hidden).toBe(800 - LIST_PAGE);
+  });
+
+  it("放行更多之后接着往下画,从头画的不重样", () => {
+    // 第二屏画的是 200..399,不是又把 0..199 画一遍——
+    // 重样的话界面上会出现两遍同样的东西
+    const { shown } = listWindow(many(800), LIST_PAGE * 2);
+    expect(shown).toHaveLength(LIST_PAGE * 2);
+    expect(shown[0]).toBe(0);
+    expect(shown[LIST_PAGE * 2 - 1]).toBe(LIST_PAGE * 2 - 1);
+  });
+
+  it("放到全放完时不再报还有", () => {
+    const { shown, hidden } = listWindow(many(300), 9999);
+    expect(shown).toHaveLength(300);
+    expect(hidden).toBe(0);
+  });
+
+  it("上限是 0 时不画,但压着的全都算数", () => {
+    // 截断的回退路径。**不能说"画了 0 条、还剩 0 条"**——
+    // 那是一个空白列表配一句"到底了",用户会以为库是空的
+    const { shown, hidden } = listWindow(many(30), 0);
+    expect(shown).toEqual([]);
+    expect(hidden).toBe(30);
+  });
+
+  it("上限成了负数也不炸", () => {
+    // 调用方拿 `limit - perPage` 往回退时很容易退成负数。
+    // 负数传给 slice 会从屁股后面切——切出来的是**最后几条**,
+    // 那比报错更难查:列表看着是满的,只是顺序全乱了
+    const { shown, hidden } = listWindow(many(30), -5);
+    expect(shown).toEqual([]);
+    expect(hidden).toBe(30);
+  });
+
+  it("空库怎么切都是空的", () => {
+    expect(listWindow([], LIST_PAGE)).toEqual({ shown: [], hidden: 0 });
+    expect(listWindow([], 0)).toEqual({ shown: [], hidden: 0 });
   });
 });

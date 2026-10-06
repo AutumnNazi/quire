@@ -319,12 +319,18 @@ mod platform {
         if handle.is_null() {
             return None;
         }
-        let size = GlobalSize(handle);
-        if size == 0 {
-            return None;
-        }
+        // **先 GlobalLock 再 GlobalSize,顺序不能反。**
+        // 锁住之前这块内存是可能被搬动/换掉的,`GlobalSize` 拿到的长度
+        // 未必对应锁住之后的实际内容;拿这个长度去 `from_raw_parts`
+        // 就是越界读写。锁住之后内存不能被搬走,问出来的长度才作数。
+        // 这正是 `STATUS_HEAP_CORRUPTION` 的来源
         let ptr = GlobalLock(handle);
         if ptr.is_null() {
+            return None;
+        }
+        let size = GlobalSize(handle);
+        if size == 0 {
+            GlobalUnlock(handle);
             return None;
         }
         let bytes = std::slice::from_raw_parts(ptr as *const u8, size).to_vec();
@@ -336,12 +342,14 @@ mod platform {
         if handle.is_null() {
             return None;
         }
-        let size = GlobalSize(handle);
-        if size < 2 {
-            return None;
-        }
+        // 顺序同上:先锁,后问大小
         let ptr = GlobalLock(handle);
         if ptr.is_null() {
+            return None;
+        }
+        let size = GlobalSize(handle);
+        if size < 2 {
+            GlobalUnlock(handle);
             return None;
         }
         let units = std::slice::from_raw_parts(ptr as *const u16, size / 2);

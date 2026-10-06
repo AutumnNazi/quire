@@ -19,6 +19,21 @@
   --font-read: "Georgia", "Songti SC", "SimSun", serif;
 }
 
+/* `hidden` 靠的是 UA 样式表里的 `display: none`,**特异性极低**——任何一条
+   `.类名 { display: flex }` 都能把它盖掉,那条属性就成了摆设。
+   四个元素中招过:.toast 和 .batch-bar 之前按元素补过 [hidden],
+   .tag-bar 和 .batch-tag-panel 漏了。后者的后果是左侧栏底部常驻一条
+   空白条——空 div,带着上边框和底色,内容永远是空,看着像渲染坏了。
+   补不过来了:**每加一个带 display 的元素都得记得补一次**。所以改成
+   一条全局兜底。
+   `!important` 不是保险起见,是必需:这条规则排在文件很前面,而
+   .batch-tag-panel / .tag-bar / .toast / .batch-bar 全排在它后面。
+   同特异性时后来者胜,少了 `!important`,这条规则当下就是死的。
+   `css.test.ts` 把这件事和漏网的元素一起盯着。 */
+[hidden] {
+  display: none !important;
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #1a1a19;
@@ -56,6 +71,54 @@ body {
   flex-direction: column;
 }
 
+/* 批量标签面板。**展开在批量条下面而不是弹窗**:弹窗会把列表盖住,
+   用户勾着标签想看筛出来哪些,盖住了就没法看。 */
+.batch-tag-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-raised);
+}
+
+.batch-tag-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* 列表里的星。**摆成按钮而不是一个静态符号**:用户在列表里一眼就想取消
+   收藏,让他得先点开文章再翻开关,那叫让人多绕两步。
+   点它不冒泡——不然会连带打开这一篇,而用户只是想取消个星 */
+.star-toggle {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  border: 0;
+  background: none;
+  /* 变量名写错不会报错,只会静默变成 transparent——星就看不见了。
+     全仓库的灰色一律叫 --text-muted */
+  color: var(--text-muted);
+  font-size: 15px;
+  line-height: 1;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+
+.star-toggle.on {
+  color: var(--accent);
+}
+
+.star-toggle:hover {
+  color: var(--accent);
+}
+
+/* 详情页收藏开着时给一点底色,免得点完看不出变了 */
+.btn.ghost.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 /* ── 标签 ── */
 
 /* 标签栏。横向排、可以换行,顶在列表上面。**不占工具栏**:
@@ -69,10 +132,24 @@ body {
 }
 
 .tag-bar-empty,
+/* 「还有 N 个」。**是个按钮不是一个字**——以前这是个 `<span>`,
+   名字挂在 title 上,于是第十三个标签等于不存在:没有人会为了看一个标签
+   去悬停一个没有暗示的文字 */
 .tag-bar-more {
   margin: 0;
-  font-size: 12px;
+  padding: 2px 9px;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  background: transparent;
   color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.tag-bar-more:hover {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .tag-chip {
@@ -109,6 +186,60 @@ body {
   background: var(--accent-soft);
   border-color: var(--accent);
   color: var(--accent);
+}
+
+/* 批注框。**放在正文上面**:写批注的时机是"想起来为什么存它",
+   那是在打开的一瞬间,不是读完之后。 */
+.note-editor {
+  max-width: 42rem;
+  margin: 18px 0 4px;
+}
+
+.note-label {
+  display: block;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.note-text {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-sunken);
+  color: var(--text);
+  font: inherit;
+  /* 批注是用户自己敲的字,排版跟正文一致,别让等宽字显得像日志 */
+  font-family: var(--font-read);
+  font-size: 15px;
+  line-height: 1.6;
+  resize: vertical;
+}
+
+.note-text:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--bg-raised);
+}
+
+/* 存失败了。**不能只是安静地留着字**——用户得知道这段还没存上,
+   否则关掉软件就丢了。红色左边框 + 提示行,比弹窗轻,又不至于漏看 */
+.note-text[data-state="error"] {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.note-hint {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.note-text[data-state="error"] + .note-hint {
+  color: var(--danger);
 }
 
 /* 详情页里的标签编辑器。**放在正文上面而不是下面**:打标签是读完一篇
@@ -156,7 +287,7 @@ body {
 .toolbar {
   display: flex;
   align-items: center;
-  /* 窗口拖到最窄(720px)时内容要 831px,放不下。**宁可横向滚也不能让按钮
+  /* 窗口拖到最窄(720px)时内容要 892px,放不下。**宁可横向滚也不能让按钮
      消失**——消失的按钮用户还以为功能没有,滚动条他至少知道得往那边翻。 */
   overflow-x: auto;
   scrollbar-width: none;
@@ -195,8 +326,170 @@ body {
 
 .spacer { flex: 1; }
 
+/* ── 这库里有什么 ── */
+.stats-panel {
+  width: min(420px, 90vw);
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1px;
+  /* 用底色当分隔线:四格之间那道缝是网格自己露出来的,
+     比给每格描边少改一处 */
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-bottom: 20px;
+}
+
+.stats-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  background: var(--bg);
+}
+
+.stats-num {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text);
+  /* 数字等宽,四格对齐时列不会抖 */
+  font-variant-numeric: tabular-nums;
+}
+
+.stats-label {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.stats-block {
+  margin-bottom: 20px;
+}
+
+.stats-block-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 0 0 8px;
+}
+
+.stats-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.stats-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 72px;
+  padding-bottom: 1px;
+  border-bottom: 1px solid var(--border);
+}
+
+.stats-bar {
+  flex: 1;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+}
+
+.stats-bar-fill {
+  width: 100%;
+  min-height: 0;
+  background: var(--accent);
+  border-radius: 2px 2px 0 0;
+  opacity: 0.75;
+}
+
+.stats-bar:hover .stats-bar-fill {
+  opacity: 1;
+}
+
+.stats-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.stats-rank {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.stats-rank-row {
+  display: grid;
+  /* 名字给一个固定宽度:横杠的起点对齐了,长短才比得出来 */
+  grid-template-columns: minmax(0, 96px) 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 2px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: none;
+  border: 0;
+  border-radius: var(--radius);
+  text-align: left;
+}
+
+button.stats-rank-row {
+  cursor: pointer;
+}
+
+button.stats-rank-row:hover {
+  background: var(--bg-sunken);
+}
+
+.stats-rank-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.stats-rank-bar {
+  display: block;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--bg-sunken);
+  overflow: hidden;
+}
+
+.stats-rank-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  opacity: 0.7;
+  border-radius: 4px;
+}
+
+.stats-rank-n {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.stats-more {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
 /* 快捷键提示。**摆出来**,不然没人知道还能这么用——一个藏得严严实实的
-   快捷键等于没有。窗口窄了先让它消失,别把上面的按钮挤变形。 */
+   快捷键等于没有。窗口窄了先让它消失,别把上面的按钮挤变形。
+
+   **它同时是打开完整面板的入口(点它 / 按 `?`)。** 做成 `<button>` 之后
+   得把浏览器给按钮的默认皮(边框、底色、内边距)全剥掉,不然工具栏上会
+   多出一个突兀的小方块——而它长得越像一个按钮,越有人会想"这能点吧" */
 .shortcut-hint {
   display: flex;
   align-items: center;
@@ -204,9 +497,21 @@ body {
      要多占 30 多像素,而这行提示刚好是那个宽度下最容易被挤没的东西 */
   gap: 5px;
   flex: none;
+  font: inherit;
   font-size: 11.5px;
   color: var(--text-muted);
   white-space: nowrap;
+  background: none;
+  border: 0;
+  padding: 2px 4px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.shortcut-hint:hover,
+.shortcut-hint[aria-expanded="true"] {
+  color: var(--text);
+  background: var(--bg-sunken);
 }
 
 .shortcut-hint kbd {
@@ -219,12 +524,65 @@ body {
   background: var(--bg);
 }
 
+/* ── 快捷键面板 ── */
+/* 分组的标题跟正文拉开一档:一长条键位表扫不动,分组是唯一的抓手 */
+.shortcut-panel {
+  /* 比历史抽屉窄。里面全是短行,铺满屏宽会显得空 */
+  width: min(420px, 90vw);
+}
+
+.shortcut-group {
+  margin-bottom: 18px;
+}
+
+.shortcut-group-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 0 0 6px;
+}
+
+.shortcut-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 5px 0;
+  font-size: 13px;
+}
+
+.shortcut-keys {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.shortcut-keys kbd {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg-sunken);
+  color: var(--text);
+}
+
+.shortcut-label {
+  color: var(--text);
+  text-align: right;
+}
+
 /* 这行提示是**发现性提示**,不是功能。挤不下的时候该让的是它,不是筛选页签——
    页签藏起来用户还以为功能没有,提示藏了他顶多晚点发现快捷键。
    1080px 是上一轮量出来的临界点(提示 181px + 剪藏目录 63px,1100px 刚好放下);
-   后来多了一个「回收站」页签,约 +60px,所以抬到 1140px。
+   后来多了一个「回收站」页签,约 +60px,所以抬到 1140px;
+   这一轮又多了「统计」按钮,约 +61px(50px 按钮 + 12px 间距),抬到 1200px。
    **这个数是算出来的不是量出来的**——下次工具栏再变动,记得重新量一遍。 */
-@media (max-width: 1140px) {
+@media (max-width: 1200px) {
   .shortcut-hint { display: none; }
 }
 
@@ -295,7 +653,6 @@ body {
   z-index: 10;
 }
 
-.toast[hidden] { display: none; }
 
 .toast-text {
   overflow: hidden;
@@ -304,7 +661,6 @@ body {
 }
 
 .toast-actions { display: flex; gap: 6px; }
-.toast-actions[hidden] { display: none; }
 
 .btn.close {
   border-color: transparent;
@@ -505,6 +861,24 @@ kbd {
   overflow: hidden;
 }
 
+/* ── 「还有 N 篇」── */
+/* **不能做成一行灰字了事。** 用户得一眼看出这是"还没画完",
+   而不是"库里就这些"——把两者看混了,他会以为东西丢了。
+   所以左边是话、右边是一个真能点的按钮 */
+.list-more {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-top: 1px dashed var(--border);
+}
+
+.list-more-note {
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
 /* ── 空状态 ── */
 .empty {
   padding: 48px 32px;
@@ -512,6 +886,105 @@ kbd {
   font-size: 13px;
   line-height: 1.7;
   text-align: center;
+}
+
+/* 搜不到那一屏。**左对齐**,跟上面那个居中的空态不一样:
+   用户刚敲了词、按了回车,他还在"干活"的状态里,突然给他一段居中的
+   大段安慰话,像是被请出了工作台 */
+.empty-search-miss {
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.search-miss-recent {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.search-miss-recent-label {
+  width: 100%;
+  margin: 0;
+  color: var(--text-muted);
+}
+
+/* 「你搜过这些」的词条。**摆成能点的样子而不是一串文字**——
+   用户搜不到的时候要的是"点一下就回到那个词",不是"抄下来再贴一次" */
+.search-miss-chip {
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.search-miss-chip:hover {
+  border-color: var(--accent);
+}
+
+/* 近似命中那一批的说明。**跟结果列表之间要有明确的界线**——
+   用户得知道"上面这行说的是下面这些",而不是把它当成又一个条目 */
+.fuzzy-notice {
+  padding: 8px 12px;
+  margin-bottom: 6px;
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* 每条近似结果上的标。**塞在标题前面、跟标题同一行**:
+   用户看的是"这一条跟别的哪儿不一样",不是标题本身。
+   挂到卡片外层会另起一行,那行字把标题往下顶,扫列表时更费劲 */
+.clip-fuzzy {
+  padding: 0 5px;
+  margin-right: 5px;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.5;
+  vertical-align: 2px;
+  white-space: nowrap;
+}
+
+/* 首次引导那两步。**居中、留白给得足一点**——新用户盯着这一屏时,
+   左右满屏的内容只会让他觉得这是个功能列表,而这里该给他的印象是
+   "现在该做一件事" */
+.first-run-step {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  max-width: 32em;
+  margin: 10px auto 0;
+  text-align: left;
+  line-height: 1.6;
+}
+
+.first-run-num {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 12px;
+  line-height: 20px;
+  text-align: center;
+}
+
+.first-run-ask {
+  margin-top: 18px;
 }
 
 .empty-title {
@@ -534,6 +1007,41 @@ kbd {
   font-size: 24px;
   line-height: 1.35;
   font-weight: 650;
+}
+
+/* 标题可改,但不能一眼看上去就是个输入框——不然每点开一篇都像在填表。
+   平时收起虚线,鼠标划过去或者键盘聚焦才显出来 */
+.detail-title {
+  cursor: text;
+  border-bottom: 1px dashed transparent;
+  transition: border-color 120ms ease;
+}
+
+.detail-title:hover,
+.detail-title:focus-visible {
+  border-bottom-color: var(--border);
+  outline: none;
+}
+
+/* 编辑态得接得上标题的排版,否则一点就「跳一下」 */
+.detail-title-input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 0 10px;
+  padding: 0 0 2px;
+  border: none;
+  border-bottom: 1px solid var(--accent);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 24px;
+  line-height: 1.35;
+  font-weight: 650;
+}
+
+.detail-title-input:focus {
+  outline: none;
 }
 
 .detail-meta {
@@ -668,6 +1176,159 @@ kbd {
   gap: 8px;
 }
 
+/* 头部那句"其中 N 篇已隔离"和主信息是同一层级的两件事,并排放会被误读成
+   一句话。缩一点、淡一点,让它读起来像注解而不是标题。 */
+.trash-header-note {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-right: auto;
+}
+
+/* 「已隔离」徽标摆在元信息行最前面。它是**能不能撤回**的唯一提示,
+   位置靠后就会被当成站点名的一部分扫过去。底色用警示色但不用红——
+   红在这套界面里已经被"真删"占着了,两处用同一个颜色就分不出轻重了。 */
+.trash-quarantined {
+  display: inline-block;
+  padding: 0 6px;
+  margin-right: 6px;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-radius: 3px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--warn-text);
+  white-space: nowrap;
+}
+
+/* 搜索命中的底色。**用强调色不用黄色**——黄色和"已读/未读"那层的暖色
+   太近,两处叠在一起用户会以为那是已读标记。用背景而不是前景色,是因为
+   前景色一改,落在深色主题上的对比度就得重新算一遍 */
+.clip-excerpt mark.hit,
+.clip-title mark.hit {
+  background: var(--accent-soft);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+/* 剪藏历史抽屉。**从右边滑出来,不是居中弹窗**——它是"顺手看一眼"的
+   东西,不是需要用户停下手里活来对待的对话框。居中弹窗会遮住列表,
+   而用户看一眼的目的恰恰是挑一个然后回到列表 */
+.history-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(360px, 90vw);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 24px rgb(0 0 0 / 8%);
+}
+
+.history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.history-head h2 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.history-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 10px;
+}
+
+.history-item {
+  padding: 10px 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.history-text {
+  margin: 0 0 4px;
+  /* 长文本截断但**不藏**:clip 会把溢出部分整个切掉,连行尾都不留,
+     用户看着像本来就这么短 */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.history-meta {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.history-more {
+  padding: 8px 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.history-clear {
+  margin-top: 10px;
+  width: 100%;
+}
+
+/* ── 状态:库里有多少东西没做完 ── */
+
+.status-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0 16px;
+}
+
+.status-section h3 {
+  margin: 14px 14px 6px;
+  font-size: 12px;
+  font-weight: 550;
+  color: var(--text-muted);
+}
+
+/* 每一行**是个按钮**:点了直接打开那篇。只报问题不给动作,
+   用户看完还是不知道该拿它怎么办 */
+.status-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  padding: 8px 14px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.status-row:hover {
+  background: var(--accent-soft);
+}
+
+.status-row-label {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-row-detail {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
 /* ── 多选 ── */
 
 /* 选中态不用改背景色:列表里已经有"当前打开"的高亮,两个高亮叠在一起
@@ -692,7 +1353,6 @@ kbd {
   font-size: 12.5px;
 }
 
-.batch-bar[hidden] { display: none; }
 .batch-bar .count { color: var(--text-muted); margin-right: auto; }
 
 /* ── 阅读进度 ── */
@@ -731,4 +1391,82 @@ kbd {
   border-radius: 9px;
   padding: 0 6px;
   pointer-events: none;
+}
+
+/* ── 改标签对话框 ── */
+
+.rename-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: stretch;
+  justify-content: center;
+  padding: 24px;
+  background: rgb(0 0 0 / 45%);
+}
+
+.rename-dialog h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.rename-dialog p {
+  margin: 0;
+}
+
+.rename-input {
+  padding: 8px 10px;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-raised, #fff);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.rename-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.rename-dialog .hint {
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+
+.rename-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
+/* ── 搜索范围选择器 ── */
+
+.search-scope select {
+  padding: 4px 6px;
+  font: inherit;
+  font-size: 0.9em;
+  color: var(--text);
+  background: var(--bg-raised, #fff);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.search-scope select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }

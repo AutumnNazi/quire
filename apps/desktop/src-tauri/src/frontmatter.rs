@@ -72,8 +72,15 @@ pub struct Frontmatter {
     pub excerpt: Option<String>,
     pub cover: Option<String>,
     pub tags: Vec<String>,
+    /// 用户自己写的批注。空串表示"没写",**不写进文件**,省得每篇
+    /// 都挂一行 `note: ` 的噪音。
+    pub note: String,
     pub read: bool,
     pub archived: bool,
+    /// 用户手动标的"这个值得回头看"。**和归档是两码事**:归档是"读完了
+    /// 挪到一边",收藏是"一直留着,别混在未读堆里"。用户存到几百篇之后,
+    /// 真正的问题不是找不到,是"哪几篇值得再看一遍找不到"——收藏治的是这个
+    pub starred: bool,
     /// 读到哪儿了,0.0–1.0。**存 0 就不往文件里写**,省得每篇都挂一行噪音。
     pub progress: f32,
     pub extra: BTreeMap<String, Value>,
@@ -93,6 +100,106 @@ pub fn split(input: &str) -> Option<(&str, &str)> {
         offset += line.len();
     }
     None
+}
+
+/// 块标量的缩进。渲染时也用它,两边必须一致,否则往返一圈批注就歪了。
+const BLOCK_INDENT: &str = "  ";
+
+/// 读块序列:`tags:` 下面那些 `- 重要` 行。返回空列表表示"没写"。
+///
+/// **只认 `-` 开头的行。** 这就是安全的全部理由:块序列的行必然以 `-` 起头,
+/// 而下一行的 `read: false` 不带 `-`,循环自然停在那里,后面的键不会被吃掉。
+///
+/// 缩进量不挑——YAML 允许块序列与键齐平,也允许缩进多格,两种都是标准写法。
+/// `-` 后面可以跟引号串,跟块标量一个规矩地解掉引号
+fn parse_block_sequence<'a, I>(lines: &mut std::iter::Peekable<I>) -> Vec<String>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let mut items: Vec<String> = Vec::new();
+    while let Some(next) = lines.peek() {
+        let next = next.trim_end_matches('\r');
+        let trimmed = next.trim_start();
+        // 空行属于块序列内部(YAML 允许),但只在还有内容时才算,
+        // 免得把文件末尾的空行当成一个空标签
+        if trimmed.is_empty() {
+            if items.is_empty() {
+                break;
+            }
+            lines.next();
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix('-') else {
+            break;
+        };
+        lines.next();
+        let rest = rest.trim();
+        if rest.is_empty() {
+            continue;
+        }
+        items.push(
+            match (rest.len() >= 2, rest.starts_with('"'), rest.ends_with('"')) {
+                (true, true, true) => unescape(&rest[1..rest.len() - 1]),
+                (true, _, _) if rest.starts_with('\'') && rest.ends_with('\'') => {
+                    rest[1..rest.len() - 1].to_string()
+                }
+                _ => rest.to_string(),
+            },
+        );
+    }
+    items
+}
+
+/// 读 `note: |` / `note: |-` 这样的块标量,把属于块的那些行吃掉。
+///
+/// 返回 `None` 表示**不是**块标量,调用方该走普通的单行解析。
+///
+/// 只认字面块 `|` 和去尾换行变体 `|-`。折叠块 `>` 不支持:写进去再读
+/// 出来会变成另一种排版,用户看到自己写的内容被改了那是我们的锅。
+///
+/// `|` 和 `|-` 在这里读出来**是一样的**——末尾的换行一律不要。
+/// 批注是界面上敲出来的文本,结尾空行没有含义,真按 YAML 的 chomping
+/// 规则留着,反倒会让"看着一样的东西存出来不一样"
+fn parse_block_scalar<'a, I>(marker: &str, lines: &mut std::iter::Peekable<I>) -> Option<String>
+where
+    I: Iterator<Item = &'a str>,
+{
+    if marker != "|" && marker != "|-" {
+        return None;
+    }
+    // 块在**缩进回落到第 0 列**时结束——frontmatter 里的键都在第 0 列。
+    // 空行算块的一部分(用户分段是自然的),但它后面若接一个第 0 列的键,
+    // 块就在这里收尾
+    let mut collected: Vec<&str> = Vec::new();
+    while let Some(next) = lines.peek() {
+        let next = next.trim_end_matches('\r');
+        if next.trim().is_empty() {
+            lines.next();
+            collected.push("");
+            continue;
+        }
+        if !next.starts_with(BLOCK_INDENT) {
+            break;
+        }
+        lines.next();
+        collected.push(next.strip_prefix(BLOCK_INDENT).unwrap_or(next));
+    }
+    let mut text = collected.join("\n");
+    while text.ends_with('\n') {
+        text.pop();
+    }
+    Some(text)
+}
+
+/// 写块标量的内容部分(不含 `note: ` 前缀,也不含结尾换行)。内容每行缩进两格
+fn render_block_scalar(s: &str) -> String {
+    let mut out = String::from("|");
+    for line in s.trim_end_matches('\n').split('\n') {
+        out.push('\n');
+        out.push_str(BLOCK_INDENT);
+        out.push_str(line);
+    }
+    out
 }
 
 fn parse_value(raw: &str) -> Value {
@@ -202,7 +309,8 @@ impl Frontmatter {
     /// 从 frontmatter 段解析出已知字段,其余原样进 `extra`。
     pub fn parse(block: &str) -> Self {
         let mut fm = Frontmatter::default();
-        for line in block.lines() {
+        let mut lines = block.lines().peekable();
+        while let Some(line) = lines.next() {
             let line = line.trim_end_matches('\r');
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -215,6 +323,30 @@ impl Frontmatter {
             if key.is_empty() {
                 continue;
             }
+
+            // 块状标签列表要在进通用解析之前截住。`tags:` 右边是空的,
+            // 真正的内容在下面那些 `- xxx` 行里,不截住的话
+            // `parse_value("")` 给出空列表,而 parse 又永不报错——
+            // 用户文件里明明有标签,Quire 读出来是空的,下次改标志就写回
+            // `tags: []`,标签**永久消失**。这是全仓库唯一的静默数据丢失路径。
+            //
+            // `tags: [...]` 内联写法不走这里,那是 Quire 自己写出来的形状
+            if key == "tags" && matches!(parse_value(raw), Value::Empty) {
+                fm.tags = parse_block_sequence(&mut lines);
+                continue;
+            }
+
+            // 批注的块标量要在进通用解析之前截住:块里的每一行都是内容,
+            // 不是 `键: 值`。放进下面那个循环里,`作者: 我` 这种行会被
+            // 当成新字段,用户的批注就被拆散了
+            if key == "note" {
+                fm.note = match parse_block_scalar(raw.trim(), &mut lines) {
+                    Some(text) => text,
+                    None => opt_str(&parse_value(raw)).unwrap_or_default(),
+                };
+                continue;
+            }
+
             let value = parse_value(raw);
 
             // 已知键落到强类型字段,未知键原样留存
@@ -231,6 +363,7 @@ impl Frontmatter {
                 "tags" => fm.tags = value.as_list().map(|v| v.to_vec()).unwrap_or_default(),
                 "read" => fm.read = value.as_bool().unwrap_or(false),
                 "archived" => fm.archived = value.as_bool().unwrap_or(false),
+                "starred" => fm.starred = value.as_bool().unwrap_or(false),
                 // 钳到 0..=1。文件是用户的,手改成 `progress: 明天` 或
                 // `progress: 3.7` 都得能扛住,不能让一个坏值顺着列表流到界面上
                 "progress" => fm.progress = value.as_f64().unwrap_or(0.0).clamp(0.0, 1.0) as f32,
@@ -289,8 +422,21 @@ impl Frontmatter {
                 .unwrap_or_default(),
         );
         push("tags", &render_value(&Value::List(self.tags.clone())));
+        // 没写批注就留个裸键,和 author / cover 缺席时一个写法。
+        // 写了才落盘,免得每篇都挂一行空噪音
+        if self.note.is_empty() {
+            push("note", "");
+        } else if self.note.contains('\n') {
+            push("note", &render_block_scalar(&self.note));
+        } else {
+            push("note", &format!("\"{}\"", escape(&self.note)));
+        }
         push("read", &self.read.to_string());
         push("archived", &self.archived.to_string());
+        // 和 progress 同一个路子:没收藏就不写这行,免得每篇都挂一行 `starred: false`
+        if self.starred {
+            push("starred", "true");
+        }
         if self.progress > 0.0 {
             push("progress", &format!("{:.2}", self.progress));
         }
@@ -323,6 +469,78 @@ fn opt_str(v: &Value) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// 收藏是**只写 true** 的那一类。绝大多数剪藏没收藏,
+    /// 每篇都挂一行 `starred: false` 是纯噪音,用户打开文件会以为那是个正经字段
+    #[test]
+    fn 没收藏就不写这一行() {
+        let fm = sample();
+        assert!(!fm.render().contains("starred"), "没收藏不该写这行");
+    }
+
+    #[test]
+    fn 收藏了就落盘() {
+        let fm = Frontmatter {
+            starred: true,
+            ..sample()
+        };
+        assert!(fm.render().contains("starred: true"), "收藏了得写进文件");
+    }
+
+    #[test]
+    fn 收藏能读回来() {
+        let fm = Frontmatter::parse("id: x
+title: \"t\"
+starred: true
+");
+        assert!(fm.starred, "读不回来的话收藏就是个假功能");
+    }
+
+    /// 老用户的文件里根本没有这一行。**必须当没收藏,而不是当出错**
+    #[test]
+    fn 老文件没这一行也不算收藏() {
+        let fm = Frontmatter::parse("id: x
+title: \"t\"
+read: false
+");
+        assert!(!fm.starred);
+    }
+
+    /// 收藏的往返不能动别的字段。这是「不许弄坏用户文件」那条底线
+    #[test]
+    fn 收藏往返其余字段不变() {
+        let original = sample();
+        let mut starred = original.clone();
+        starred.starred = true;
+        let text = starred.to_markdown("# 正文
+");
+        let (block, body) = split(&text).unwrap();
+        let back = Frontmatter::parse(block);
+        assert!(back.starred);
+        assert_eq!(back.title, original.title);
+        assert_eq!(back.url, original.url);
+        assert_eq!(back.tags, original.tags);
+        assert_eq!(back.note, original.note);
+        // split 返回的正文段本来就带前导换行(现有的往返测试也是这个形状)
+        assert_eq!(body, "
+# 正文
+", "正文得逐字节不变");
+    }
+
+    /// 收藏这一行要排在 `read` / `archived` 旁边,键顺序固定——
+    /// 不然同样的数据每次导出产出不同字节
+    #[test]
+    fn 收藏那一行位置固定() {
+        let fm = Frontmatter {
+            starred: true,
+            ..sample()
+        };
+        let r = fm.render();
+        let at_star = r.find("starred:").unwrap();
+        let at_read = r.find("read:").unwrap();
+        assert!(at_read < at_star, "收藏排在已读后面");
+    }
+
+
     fn sample() -> Frontmatter {
         Frontmatter {
             id: "m8x2k9a4".into(),
@@ -335,11 +553,125 @@ mod tests {
             excerpt: Some("一段摘要,用来在列表里当副标题。".into()),
             cover: None,
             tags: vec!["rust".into(), "编程".into()],
+            note: String::new(),
             read: false,
             archived: false,
+            starred: false,
             progress: 0.0,
             extra: BTreeMap::new(),
         }
+    }
+
+    // ── 批注 ──
+    //
+    // 批注是用户自己写的话,会换行、会带冒号、会带缩进。所以它不能只走
+    // 引号字符串那一套:一行 `"第一行\n第二行"` 机器读得懂,人打开
+    // .md 只看到一长条带 `\n` 的乱码。写成 YAML 块标量 `note: |`,
+    // 任何 YAML 工具都认,人也能直接读——这是「数据是你的」这条承诺
+    // 在格式上的落点,不是随手挑的写法。
+
+    #[test]
+    fn 单行批注往返不变() {
+        let mut fm = sample();
+        fm.note = "回头再看看这个思路".into();
+        let md = fm.to_markdown("b");
+        let (block, _) = split(&md).unwrap();
+        assert_eq!(Frontmatter::parse(block).note, "回头再看看这个思路");
+    }
+
+    #[test]
+    fn 多行批注渲染成块标量() {
+        let mut fm = sample();
+        fm.note = "第一行\n第二行".into();
+        let rendered = fm.render();
+        assert!(rendered.contains("\nnote: |\n"), "多行得用块标量:{rendered}");
+        assert!(rendered.contains("  第一行\n  第二行\n"), "内容缩进两格");
+    }
+
+    #[test]
+    fn 多行批注往返不变() {
+        let mut fm = sample();
+        fm.note = "第一行\n第二行\n第三行".into();
+        let md = fm.to_markdown("b");
+        let (block, _) = split(&md).unwrap();
+        assert_eq!(Frontmatter::parse(block).note, fm.note);
+    }
+
+    /// 用户自己拿文本编辑器、或者在 Obsidian 里手写批注是常事。
+    /// 手写出来的块标量必须读得懂,不然 Quire 就成了那种"只能自己写、
+    /// 自己读"的数据格式
+    #[test]
+    fn 手写的块标量能读进来() {
+        let block = "title: \"t\"\nnote: |\n  第一行\n  第二行\nread: false\n";
+        assert_eq!(Frontmatter::parse(block).note, "第一行\n第二行");
+    }
+
+    /// 批注里出现 `作者: 我` 这种行,不能被当成 frontmatter 的新键。
+    /// 当成了新键,用户的批注就被拆得七零八落,还凭空多出一堆字段
+    #[test]
+    fn 块标量里的冒号不当成新键() {
+        let block =
+            "title: \"t\"\nnote: |\n  作者: 我\n  链接: https://a.com\nread: false\n";
+        let fm = Frontmatter::parse(block);
+        assert_eq!(fm.note, "作者: 我\n链接: https://a.com");
+        assert!(!fm.extra.contains_key("作者"), "批注里的行不是字段");
+        assert!(!fm.extra.contains_key("链接"));
+    }
+
+    /// `|-` 是不带尾部换行的块标量。用户从别处粘一段进来,末尾
+    /// 那个换行不该被当成内容的一部分
+    #[test]
+    fn 减号块标量不带尾部换行() {
+        let block = "title: \"t\"\nnote: |-\n  只有一行\nread: false\n";
+        assert_eq!(Frontmatter::parse(block).note, "只有一行");
+    }
+
+    /// 块标量里允许有空行。用户写批注时分段是自然的,
+    /// 把空行当"块结束了"会让后半截批注变成一堆野字段
+    #[test]
+    fn 块标量里的空行不结束块() {
+        let block = "title: \"t\"\nnote: |\n  上面一段\n\n  下面一段\nread: false\n";
+        assert_eq!(Frontmatter::parse(block).note, "上面一段\n\n下面一段");
+    }
+
+    #[test]
+    fn 空批注往返不变() {
+        let mut fm = sample();
+        fm.note = String::new();
+        let md = fm.to_markdown("b");
+        let (block, _) = split(&md).unwrap();
+        assert_eq!(Frontmatter::parse(block).note, "");
+        assert!(!fm.render().contains("\nnote: |\n"), "空批注不该占块标量");
+    }
+
+    #[test]
+    fn 批注里的引号和反斜杠能原样存回() {
+        let mut fm = sample();
+        fm.note = r#"他说"这是重点"\而且很复杂"#.into();
+        let md = fm.to_markdown("b");
+        let (block, _) = split(&md).unwrap();
+        assert_eq!(Frontmatter::parse(block).note, fm.note);
+    }
+
+    #[test]
+    fn 批注行首的空格原样保留() {
+        let mut fm = sample();
+        fm.note = "正常行\n    缩进四格\n再一行".into();
+        let md = fm.to_markdown("b");
+        let (block, _) = split(&md).unwrap();
+        assert_eq!(Frontmatter::parse(block).note, fm.note);
+    }
+
+    /// 手写的块标量 + Quire 写出来的文件,字段顺序可能不一样。
+    /// 渲染一次再解析,批注一个字都不能变
+    #[test]
+    fn 手写块标量渲染后仍是同一个批注() {
+        let block = "note: |\n  手写的批注\ntitle: \"t\"\nread: true\n";
+        let mut fm = Frontmatter::parse(block);
+        fm.note.push_str("\n再补一句");
+        let md = fm.to_markdown("b");
+        let (again, _) = split(&md).unwrap();
+        assert_eq!(Frontmatter::parse(again).note, "手写的批注\n再补一句");
     }
 
     #[test]
@@ -445,6 +777,92 @@ title: \"t\"
         assert_eq!(fm.progress, 0.0);
     }
 
+    // ── 块状标签列表 ──
+    //
+    // `tags:` 下面缩进写 `- 重要`,是 YAML 列表**最标准**的写法,Obsidian
+    // 存出来的就是这个形状,用户从别的工具导入的笔记也多半是这个形状。
+    //
+    // 不认它,`parse_value("")` 会给一个空列表,而 `parse` 又是**永不报错**
+    // 的——于是用户文件里明明有标签,Quire 读出来是空的。用户下一次点
+    // 「标记已读」,`tags: []` 就被写回磁盘,标签**永久消失**,而且
+    // `scan()` 的 unreadable 机制完全兜不住(它只报解析失败,不报解析错)。
+
+    #[test]
+    fn 缩进块状标签能读出来() {
+        let block = "title: \"t\"\ntags:\n  - 重要\n  - 待读\nread: false\n";
+        assert_eq!(Frontmatter::parse(block).tags, vec!["重要", "待读"]);
+    }
+
+    /// YAML 允许块序列和键齐平写,这也算标准。不是所有人手写都会缩进
+    #[test]
+    fn 齐平的块状标签也能读() {
+        let block = "title: \"t\"\ntags:\n- 重要\n- 待读\nread: false\n";
+        assert_eq!(Frontmatter::parse(block).tags, vec!["重要", "待读"]);
+    }
+
+    #[test]
+    fn 块状标签里的引号和空格原样保留() {
+        let block = "title: \"t\"\ntags:\n  - \"带 空格\"\n  - '单引号'\n  - 裸串\n";
+        assert_eq!(Frontmatter::parse(block).tags, vec!["带 空格", "单引号", "裸串"]);
+    }
+
+    /// 用户手写的标签里带引号是很正常的(`- "他说\"这是重点\""`),
+    /// 解不开的话标签栏上就是一串带反斜杠的乱码。`set_tags` 写出去的标签
+    /// 早就洗掉了引号,可**读**的这条路要扛得住用户自己写的
+    #[test]
+    fn 块状标签里的转义要解开() {
+        let block = "tags:\n  - \"他说\\\"这是重点\\\"\"\n  - \"换行\\n也在里面\"\n";
+        assert_eq!(
+            Frontmatter::parse(block).tags,
+            vec!["他说\"这是重点\"", "换行\n也在里面"]
+        );
+    }
+
+    /// 块状标签读出来之后,写回去还是那几个。渲染成内联还是块状都行,
+    /// **数据不能少**——那才是要命的地方
+    #[test]
+    fn 块状标签往返不丢() {
+        let block = "title: \"t\"\ntags:\n  - 重要\n  - 待读\n";
+        let fm = Frontmatter::parse(block);
+        let again = Frontmatter::parse(&fm.render());
+        assert_eq!(again.tags, vec!["重要", "待读"]);
+    }
+
+    /// 块状列表不能把后面那个键吃掉。吃掉了的话 `read` 会变成空,
+    /// 未读队列就乱了
+    #[test]
+    fn 块状标签不吃掉后面的键() {
+        let block = "title: \"t\"\ntags:\n  - 重要\nread: true\narchived: true\n";
+        let fm = Frontmatter::parse(block);
+        assert_eq!(fm.tags, vec!["重要"]);
+        assert!(fm.read, "read 还在");
+        assert!(fm.archived, "archived 还在");
+    }
+
+    #[test]
+    fn 空的块状标签就是空列表() {
+        let block = "title: \"t\"\ntags:\nread: false\n";
+        assert!(Frontmatter::parse(block).tags.is_empty());
+    }
+
+    /// 原来就支持的内联写法一个字都不能退化
+    #[test]
+    fn 内联标签写法照旧() {
+        assert_eq!(
+            Frontmatter::parse("tags: [\"rust\", \"编程\"]\n").tags,
+            vec!["rust", "编程"]
+        );
+        assert!(Frontmatter::parse("tags: []\n").tags.is_empty());
+        assert!(Frontmatter::parse("title: \"t\"\n").tags.is_empty());
+    }
+
+    /// 缩进很深也能认。YAML 允许任意缩进量
+    #[test]
+    fn 缩进几格都认() {
+        let block = "tags:\n      - 重要\n        - 待读\n";
+        assert_eq!(Frontmatter::parse(block).tags, vec!["重要", "待读"]);
+    }
+
     #[test]
     fn 进度是零就不写进文件() {
         // 每篇都多一行 progress: 0 是纯噪音,用户打开文件会以为那是个字段
@@ -487,4 +905,6 @@ progress: -1
             "负数当没读过"
         );
     }
+
+
 }

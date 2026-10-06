@@ -10,6 +10,9 @@
 
 declare module "node:fs" {
   export function readFileSync(path: string, encoding: string): string;
+  /** 列目录。`i18n.test.ts` 拿它扫 `src` 下所有模块——
+   *  只认 `main.ts` 的话,从 main 里抽出去的模块引的文案会被判成孤儿 */
+  export function readdirSync(path: string): string[];
 }
 
 declare module "node:path" {

@@ -12,6 +12,18 @@ rust-version = "1.82"
 name = "quire_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# 真起一次 Win32 剪贴板监听的那种测试。**默认不开,而且不能开。**
+#
+# 那条测试碰 `AppHandle`,而 `AppHandle` 一进测试二进制,本机 link 出来的
+# exe 就在加载阶段 STATUS_ENTRYPOINT_NOT_FOUND——连 "running 1 test" 都
+# 来不及打印,整轮测试直接归零。这不是 `#[ignore]` 能躲的:`#[ignore]`
+# 只是不执行,代码照样被链接进去。
+#
+# 所以它必须是**根本不编译**。想跑就显式叫:
+#   cargo test --features live-clipwatch -- --ignored clipwatch
+live-clipwatch = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -19,6 +31,16 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
+# 配置文件是三个标量的 JSON。**它早就编进二进制了**(Tauri 自己要用),
+# 声明成直接依赖不增加一个字节。自己手搓一个配置格式反而更不划算:
+# 路径里什么字符都可能出现,手写转义迟早漏一个
+serde_json = "1"
+# FTS5 全文索引。**`bundled` 从 C 源码编 SQLite**,不找系统库——
+# 用户的 Windows / macOS / Linux 上不一定装了 sqlite3,也不该要求他们装。
+# 代价是构建慢一截、二进制大几 MB,换来"下下来就能用、装完就能搜"。
+#
+# 索引是**纯缓存**:删了只是退回逐文件扫描,剪藏一个字节都不会少
+rusqlite = { version = "0.37", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 # 只为拿系统文档目录,几十 KB,不值当自己拼路径(Windows 上 Documents 会被 OneDrive 重定向)
@@ -34,6 +56,13 @@ reqwest = { version = "0.13", default-features = false, features = [
     "charset",
 ] }
 
+# 盯着剪藏库。**这是"local-first"承诺里的一环**:用户的文件在磁盘上、
+# 随时可能用别的工具改,而 Quire 之前看不见这些改动,只能靠 F5。
+#
+# 只要默认的 recommended 后端:macOS 上是 FSEvents、Linux 上 inotify、
+# Windows 上 ReadDirectoryChangesW,都是系统原生的事件,不是轮询。
+notify = "8"
+
 # 读剪贴板的 CF_HTML 格式。版本与 Tauri 传递依赖的那个对齐,免得同一份代码编两遍。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
@@ -42,6 +71,15 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_Memory",
     # CF_UNICODETEXT 常量在这里,尽管它跟 OLE 八竿子打不着
     "Win32_System_Ole",
+    # 剪贴板变更监听:注册一个消息窗口,系统一改剪贴板就发 WM_CLIPBOARDUPDATE,
+    # 不用再每 700ms 去问一次
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    # `RegisterClassW` 被 windows-sys 归在 GDI 下面,尽管它跟图形毫无关系。
+    # 不开这个 feature 的症状是 "unresolved import RegisterClassW",
+    # 而这个模块里其它符号(CreateWindowExW 之类)全都好着——
+    # 同一个模块里一部分有一部分没有,这种报错最容易让人怀疑活儿
+    "Win32_Graphics_Gdi",
 ] }
 
 # macOS 从 NSPasteboard 读剪贴板。objc2-app-kit 提供 AppKit 绑定
