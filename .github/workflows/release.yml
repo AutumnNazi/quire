@@ -1,0 +1,232 @@
+# Release:打 tag 之后出安装包,挂到 GitHub Release 上。
+#
+# ## 触发
+#   git tag v0.1.0 && git push origin v0.1.0
+# 或者在 Actions 页面手动跑(workflow_dispatch),指定 tag。
+#
+# ## 发的是草稿,不是公开 Release
+# `draft: true`。理由很直接:macOS 那个包**没在真机上验证过**,Windows 那个
+# 也不代表每个人都装得上。先当草稿发出来,你看过、装过、确认没问题,再点
+# 发布。要一步到位就把它改成 false,但那意味着第一次跑就可能对外发出去。
+#
+# ## 版本号必须和 tag 对得上
+# tag 是 v0.2.0 而 tauri.conf.json 里还是 0.1.0,包里的版本就是错的,
+# 而**装上去之后界面上看不出哪里不对**。所以下面第一步就把它卡住。
+#
+# ## macOS / Linux 的包是"没验证过"的
+# 本机只有 Windows。macOS 的剪贴板实现(NSPasteboard 那条)一次都没在真机上
+# 跑过,README 里也标着。所以这两个平台的产物挂了 ⚠️ 未在真机验证 的标注,
+# 别让下的人以为那是验证过的包。
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag,例如 v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check-version:
+    # 单独一个 job,先花 20 秒把版本号对不对验掉。
+    # 合进 build 里的话,三个平台各跑一遍才报错,白烧 runner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: tag 里的版本号要跟 tauri.conf.json 一致
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          CONF_VERSION=$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")
+          echo "tag = $TAG,配置里的版本 = $CONF_VERSION"
+          if [ "$TAG" != "v$CONF_VERSION" ]; then
+            echo "::error::tag 是 $TAG,但 tauri.conf.json 里写的是 $CONF_VERSION。"
+            echo "::error::改完配置记得一并打 tag,不然装上去的版本号是错的,而界面上看不出来。"
+            exit 1
+          fi
+
+  build:
+    needs: check-version
+    strategy:
+      # 有一个平台挂了就得知道。macOS 挂了就只剩一个 Windows 包,
+      # 悄悄发出去等于对外承诺"三个平台都有"
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows x64
+            args: --bundles nsis,msi
+          - os: macos-14
+            name: macOS Apple Silicon
+            target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin --bundles dmg
+          - os: macos-13
+            name: macOS Intel
+            target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin --bundles dmg
+          - os: ubuntu-22.04
+            name: Linux x64
+            args: --bundles deb,appimage
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Linux 上要 GTK / WebKitGTK 的开发头文件,runner 镜像里没有。
+      # 22.04 而不是 latest:24.04 的 WebKitGTK 大版本变了,glib-sys 编译不过
+      - name: 装 Linux 系统依赖(Tauri 需要)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      # corepack 必须在 setup-node **之前**启用。`cache: pnpm` 会让 setup-node
+      # 自己调一次 pnpm 去定位依赖目录,那时 pnpm 还没进 PATH
+      - name: 装 pnpm
+        run: corepack enable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # `targets` 不能写成 `${{ matrix.target }}`——矩阵里没给 target 的那两行
+      # 展开成空串,官方 action 拿到空值会报错。拆成两个步骤用 if 分开
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.target == ''
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.target != ''
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+          key: ${{ matrix.target || 'host' }}
+
+      - name: 装依赖
+        run: pnpm install --frozen-lockfile
+
+      # 打包前先把测试跑一遍。发出去的包不该是"测试没过但先发了再说"
+      - name: 类型检查与测试
+        run: |
+          pnpm typecheck
+          pnpm test:web
+          pnpm clippy
+
+      - name: 打包
+        run: pnpm --filter @quire/desktop tauri build ${{ matrix.args }}
+
+      # 产物散在 target/{release,<target>/release}/bundle/ 下面,层级三平台不一样。
+      # 统一拍平到一个目录,每份前面加平台名——重名的话挂到 Release 上会互相盖掉
+      - name: 收集产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="artifacts-out"
+          mkdir -p "$OUT"
+          SLUG=$(echo "${{ matrix.name }}" | tr ' /' '--')
+          if [ -n "${{ matrix.target }}" ]; then
+            SRC="apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          else
+            SRC="apps/desktop/src-tauri/target/release/bundle"
+          fi
+          echo "从 $SRC 收"
+          find "$SRC" -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' \
+            -o -name '*.deb' -o -name '*.AppImage' -o -name '*.app.tar.gz' \) \
+            -exec cp {} "$OUT/" \;
+          ls -la "$OUT"
+          [ -n "$(ls -A "$OUT")" ] || { echo "::error::一个产物都没收到,发个空 Release 等于没发"; exit 1; }
+          ( cd "$OUT" && for f in *; do mv "$f" "$SLUG-$f"; done )
+          echo "收集完:" && ls -la "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: artifacts-out/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+          merge-multiple: true
+
+      - name: 确认三平台都到齐了
+        run: |
+          set -euo pipefail
+          MISSING=""
+          for slug in "Windows-x64" "macOS-Apple-Silicon" "macOS-Intel" "Linux-x64"; do
+            ls all | grep -q "^$slug-" || MISSING="$MISSING $slug"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::这些平台没有产物:$MISSING"
+            echo "::error::要么先发一个只有 Windows 的草稿(删掉 matrix 里其余三行),"
+            echo "::error::要么去 Actions 日志看那几个 job 为什么挂了。悄悄发个残缺的 Release 更糟。"
+            exit 1
+          fi
+          echo "四个平台的产物都在。"
+
+      # 写一份人看的清单。Release 页面默认只有一排文件名,
+      # 用户得自己猜哪个是哪个、能不能在他那台机器上装
+      - name: 写发布说明
+        run: |
+          cat > release-notes.md <<'EOF'
+          ## 下载
+
+          | 平台 | 文件 |
+          | --- | --- |
+          | Windows x64 | `Windows-x64-*-setup.exe`(双击即装)或 `Windows-x64-*.msi` |
+          | macOS Apple Silicon(M1/M2/M3/M4) | `macOS-Apple-Silicon-*.dmg` |
+          | macOS Intel | `macOS-Intel-*.dmg` |
+          | Linux x64 | `Linux-x64-*.deb`(Debian/Ubuntu)或 `Linux-x64-*.AppImage`(免安装) |
+
+          ## ⚠️ macOS 和 Linux 的包没在真机上验证过
+
+          Quire 的剪藏功能在这两个平台上是**照着文档写的,没在真实机器上跑过**。
+          装之前先拿一篇网页试一下剪藏,有问题来提 issue。
+
+          Windows 的包验证得多一些,但也不是每个人都能装上。
+
+          ## 装完先做这一步
+
+          装好之后打开软件,点工具栏上的剪藏库路径,把它指到你自己的文件夹。
+          Quire 不会替你建一个默认位置——**你的剪藏放在哪,由你定**。
+
+          剪藏库里全是普通的 `.md` 文件,frontmatter 之外就是正文。
+          索引随时可以删,重建也不丢东西。
+          EOF
+
+      # draft: true —— 第一次跑不直接对外发,见文件头的说明
+      - name: 建 Release(草稿)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: Quire ${{ inputs.tag || github.ref_name }}
+          body_path: release-notes.md
+          draft: true
+          prerelease: false
+          files: all/*
