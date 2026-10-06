@@ -3,6 +3,7 @@
 // 于是每一次剪藏都报"抽不出正文"。
 import Defuddle from "defuddle/full";
 import { buildPayload, type Extracted } from "./extract";
+import { t } from "./i18n";
 
 interface ClipRequest {
   type: "quire-clip";
@@ -39,7 +40,7 @@ function clipCurrentPage(): ClipReply {
   const markdown = (result.contentMarkdown ?? "").trim();
   if (!markdown) {
     // 登录页、搜索结果页、纯图片站都走这条路
-    return { ok: false, error: "这一页抽不出正文,可能是登录页或纯图片页" };
+    return { ok: false, error: t("error_no_content") };
   }
 
   const payload = buildPayload(result as Extracted, {
@@ -50,7 +51,7 @@ function clipCurrentPage(): ClipReply {
   });
 
   if (!writeToClipboard(payload.html, payload.markdown)) {
-    return { ok: false, error: "浏览器拒绝了写入剪贴板" };
+    return { ok: false, error: t("error_clipboard") };
   }
   return { ok: true, title: payload.metas.find(([k]) => k === "quire-title")?.[1] };
 }

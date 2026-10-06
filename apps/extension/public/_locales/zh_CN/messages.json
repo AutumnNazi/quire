@@ -1,0 +1,33 @@
+{
+  "extension_name": {
+    "message": "Quire 剪藏",
+    "description": "扩展列表、商店里显示的名字"
+  },
+  "extension_description": {
+    "message": "把整篇文章连同标题、作者、发布时间、封面图放进剪贴板,交给 Quire 桌面端存成 Markdown。",
+    "description": "扩展详情页的说明"
+  },
+  "action_title": {
+    "message": "剪藏整页到剪贴板",
+    "description": "扩展图标的悬浮提示"
+  },
+  "toast_saved": {
+    "message": "已放进剪贴板:$title$",
+    "description": "剪藏成功。标题取自页面",
+    "placeholders": {
+      "title": { "content": "$1" }
+    }
+  },
+  "error_no_content": {
+    "message": "这一页抽不出正文,可能是登录页或纯图片页",
+    "description": "Defuddle 抽出来的正文是空的"
+  },
+  "error_clipboard": {
+    "message": "浏览器拒绝了写入剪贴板",
+    "description": "execCommand(\"copy\") 返回了 false"
+  },
+  "error_page_blocked": {
+    "message": "这个页面不让扩展运行(试试普通网页,地址别是 chrome:// 开头)",
+    "description": "内容脚本没注入:chrome:// 、扩展商店、PDF 查看器"
+  }
+}
