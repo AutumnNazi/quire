@@ -687,6 +687,7 @@ mod tests {
     /// 自己的解析代码,方向从第一步就错了。
     ///
     /// `canary` 是只出现在我们写的那份里的字样,拿它当判据。
+    #[cfg(windows)]
     fn require_ours(capture: &ClipboardCapture, canary: &str, test_name: &str) -> bool {
         if capture.html.as_deref().is_some_and(|h| h.contains(canary)) {
             return true;
@@ -706,6 +707,7 @@ mod tests {
     /// 不能报成断言失败**——测试接着读回来拿到的是上一次的残留内容,
     /// 报出来的是「`left == right` failed」,把环境问题说成了代码问题,
     /// 排查的人得先怀疑半天自己的代码,方向从一开始就错了。
+    #[cfg(windows)]
     fn require_written(written: bool, test_name: &str) -> bool {
         if written {
             return true;

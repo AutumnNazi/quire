@@ -13,9 +13,20 @@ import { resolve } from "node:path";
  * 哪一段没接上,运行时看着完全正常:用户照常用,只在真冲突那天才发现
  * 数据被吃掉了。而那种情况要等用户碰上才暴露,那时候已经晚了
  */
+/**
+ * 读源码并**把换行统一成 `\n`**。
+ *
+ * 仓库没有 `.gitattributes`,Windows 上 git 默认 `core.autocrlf=true`:
+ * 全新检出的工作副本是 CRLF,而本地编辑器写出来的那份是 LF。跨行锚点
+ * 写的是 `\n`,于是同一份代码本地绿、CI 红——而这条测试要验的是接线,
+ * 不是换行风格,拿 `\n` 当锚点等于在断言它并不想断言的东西
+ */
+const readSrc = (rel: string): string =>
+  readFileSync(resolve(process.cwd(), rel), "utf8").replace(/\r\n/g, "\n");
+
 describe("冲突守卫接上了没有", () => {
-  const mainSrc = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
-  const apiSrc = readFileSync(resolve(process.cwd(), "src/api.ts"), "utf8");
+  const mainSrc = readSrc("src/main.ts");
+  const apiSrc = readSrc("src/api.ts");
   /** 掐出某一段,免得"全文里有"被别处的同名调用蒙过去 */
   const section = (anchor: string, len: number): string =>
     mainSrc.slice(mainSrc.indexOf(anchor), mainSrc.indexOf(anchor) + len);

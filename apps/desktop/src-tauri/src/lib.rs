@@ -1401,8 +1401,14 @@ pub(crate) fn on_clipboard_changed(app: &AppHandle, state: &Arc<WatchState>) {
 
 /// 监听窗口的过程要拿到 `AppHandle`。**存成全局**是因为窗口过程是
 /// 一个 `extern "system"` 函数,拿不到任何闭包里的东西
+///
+/// **只有 Windows 用得上。** 消息窗口那套是 Win32 专有的,别的平台
+/// 走轮询那条路、压根不碰这个全局;不加 cfg 门的话它在 Linux/macOS 上
+/// 就是死代码,而 CI 的 clippy 是 `-D warnings`
+#[cfg(windows)]
 static CLIP_APP: Mutex<Option<AppHandle>> = Mutex::new(None);
 
+#[cfg(windows)]
 pub(crate) fn clip_app() -> Option<AppHandle> {
     CLIP_APP.lock().ok().and_then(|a| a.clone())
 }
