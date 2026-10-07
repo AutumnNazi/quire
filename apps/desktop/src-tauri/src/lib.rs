@@ -698,35 +698,6 @@ fn export_vault(app: AppHandle, state: State<AppState>) -> Result<Option<String>
     Ok(Some(path.display().to_string()))
 }
 
-/// 导出**选中的**那几篇。和 [`export_vault`] 走同一个保存对话框,
-/// 但只拼名单里的那些——用户挑三篇发给别人,导出文件里塞两百篇的话,
-/// 他得回去手工删干净,那还不如没有这个功能
-#[tauri::command]
-fn export_selected(
-    app: AppHandle,
-    state: State<AppState>,
-    filenames: Vec<String>,
-) -> Result<Option<String>, WireError> {
-    let vault = current_vault(&state)?;
-    let markdown = vault.export_selected(&filenames).map_err(|e| e.wire())?;
-
-    let picked = app
-        .dialog()
-        .file()
-        .set_file_name(default_selected_export_name(filenames.len()))
-        .add_filter("Markdown", &["md"])
-        .blocking_save_file();
-    let Some(picked) = picked else {
-        return Ok(None); // 用户点了取消,不是故障
-    };
-    let Some(path) = picked.into_path().ok() else {
-        return Err(WireError::new("export.badPath"));
-    };
-    std::fs::write(&path, markdown)
-        .map_err(|e| WireError::new("export.writeFailed").with("detail", e.to_string()))?;
-    Ok(Some(path.display().to_string()))
-}
-
 /// 导出成一个**文件夹**,图片跟着走。
 ///
 /// 走"选目录"而不是"选文件":导出来是一个目录。替用户先建好目录再往里写,
@@ -759,15 +730,6 @@ async fn export_folder(
         .export_folder(&path, filenames.as_deref())
         .map_err(|e| e.wire())?;
     Ok(Some(report))
-}
-
-/// 选中了 1 篇就别写"1 篇",写得更像个人话一些
-fn default_selected_export_name(n: usize) -> String {
-    if n == 1 {
-        format!("Quire-剪藏-{}.md", Local::now().format("%Y-%m-%d"))
-    } else {
-        format!("Quire-剪藏-{n}篇-{}.md", Local::now().format("%Y-%m-%d"))
-    }
 }
 
 /// 导出文件名带上日期。同一周导两次不会互相覆盖,而用户回头翻的时候
@@ -808,6 +770,24 @@ fn save_clip(
         spawn_image_localization(app, vault, filename.clone());
     }
     Ok(outcome)
+}
+
+/// 把剪藏库目录加进 WebView 的 asset 白名单。
+///
+/// 图片本地化之后,正文里写的是 `assets/<id>/0.png` 这种**相对路径**,
+/// 渲染时前端把它转成 asset 地址去读本地文件。asset 协议默认一个目录都
+/// 不许读,库目录不在白名单里的话,下载越成功裂图越彻底——图已经躺在
+/// 硬盘上了,WebView 却一个都看不见。
+///
+/// 启动恢复和换库两条路都得调:scope 是运行时状态,换库不重挂的话,
+/// 新库的图全是裂的。库目录用户可以指到任何地方,所以只能运行时放行,
+/// 没法在配置里写死。挂不上就打日志——图片会裂,但那是可见的故障,
+/// 好过静默失败让人以为图本来就没存。
+fn allow_vault_assets(app: &AppHandle, root: &std::path::Path) {
+    use tauri::Manager;
+    if let Err(reason) = app.asset_protocol_scope().allow_directory(root, true) {
+        eprintln!("[quire] asset 白名单挂不上:{reason}");
+    }
 }
 
 /// 后台把文章里的图片下到本地,下完再发一次 `clip-saved-images`。
@@ -861,6 +841,18 @@ fn spawn_image_localization(app: AppHandle, vault: Arc<Vault>, filename: String)
     });
 }
 
+/// 把剪贴板里现有的内容记成"已见"。
+///
+/// 开启监控或随启动恢复监控时都要做这一步,否则监控睁眼的第一次就会
+/// 把用户几分钟前(甚至昨天)复制的东西弹成新剪藏——平白觉得这东西
+/// 在窥探。手动开启和启动恢复是同一件事的两条路径,忘了任何一条都
+/// 会在那一条上天天重演;测试锁着两处调用点。
+fn seed_last_hash(watch: &WatchState) {
+    if let Ok(capture) = clipboard::capture_clipboard() {
+        watch.last_hash.store(hash_of(&capture), Ordering::Relaxed);
+    }
+}
+
 /// 开关剪贴板监控。默认关闭:被动监听会连你复制的密码、验证码、快递单号
 /// 一起捕获,当默认行为太吵,得由用户自己决定要不要。
 #[tauri::command]
@@ -875,14 +867,7 @@ fn set_clipboard_watch(enabled: bool, state: State<AppState>) -> Result<VaultInf
     }
 
     if enabled {
-        // 开启的瞬间把剪贴板里现有的内容记成"已见"。否则用户刚打开开关,
-        // 就会被自己几分钟前复制的东西弹一次提示,平白觉得这东西在窥探。
-        if let Ok(capture) = clipboard::capture_clipboard() {
-            state
-                .watch
-                .last_hash
-                .store(hash_of(&capture), Ordering::Relaxed);
-        }
+        seed_last_hash(&state.watch);
     }
     state.watch.enabled.store(enabled, Ordering::Relaxed);
     // 开关也记下来。用户明确开过一次,每次启动都弹回"关"是在替他做决定
@@ -981,6 +966,7 @@ async fn pick_vault(
 
     let vault = Vault::new(&path);
     vault.ensure_dirs().map_err(|e| e.wire())?;
+    allow_vault_assets(&app, vault.root());
     // **记下来。** 不记的话用户每次重启都要重指一遍,而剪藏好好地
     // 躺在那儿——对一个 local-first 工具来说这是最伤的一处
     let mut cfg = settings::Settings::load(&state.config_dir);
@@ -1004,6 +990,105 @@ async fn pick_vault(
     Ok(Some(info))
 }
 
+/// 选一个新目录,**只选不切**。设置页拿它先问一句「现有的迁不迁」,
+/// 用户答了再走 migrate_vault。别学 pick_vault 选完就切:切了再问要不要
+/// 迁移,答案就成了马后炮
+#[tauri::command]
+async fn choose_vault_target(app: AppHandle) -> Result<Option<String>, WireError> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.dialog().file().pick_folder(move |picked| {
+        let _ = tx.send(picked);
+    });
+    // recv 会一直阻塞到用户做出选择,而这是 async 命令,跑在 tokio 上。
+    // 挪进阻塞线程池去等,这边只 await 一次(同 pick_vault 的处理)
+    let received = tauri::async_runtime::spawn_blocking(move || rx.recv())
+        .await
+        .map_err(|e| WireError::internal(e.to_string()))?
+        .map_err(|_| WireError::new("app.pickerFailed"))?;
+    let Some(picked) = received else {
+        return Ok(None); // 取消就是没选,什么都没发生
+    };
+    picked
+        .into_path()
+        .map(|p| Some(p.display().to_string()))
+        .map_err(|e| WireError::internal(e.to_string()))
+}
+
+/// 迁移剪藏库到新目录:可选地把现有剪藏拷过去,然后切过去。
+///
+/// **拷完再切。** 拷贝失败(只读盘、网盘掉线)就整个不动——半个库切过去,
+/// 用户回来看到剪藏少了一半,比迁移失败本身糟糕得多
+#[tauri::command]
+async fn migrate_vault(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    target: String,
+    copy_existing: bool,
+) -> Result<VaultInfo, WireError> {
+    let new_vault = Arc::new(Vault::new(&target));
+    new_vault.ensure_dirs().map_err(|e| e.wire())?;
+
+    if copy_existing {
+        let old = current_vault(&state)?;
+        let copied_target = new_vault.clone();
+        let moving = old.clone();
+        // **先全部拷过去,确认成功,再清空原目录。** 顺序反过来、或者
+        // 边拷边删,中途失败就是一半在这边一半在那边——而用户以为
+        // 自己只是换了个目录
+        let report = tauri::async_runtime::spawn_blocking(move || {
+            let report = moving.copy_clips_into(&copied_target)?;
+            // 拷成了才动原目录。迁移是搬家,不清空的话旧盘上还留着
+            // 一整份,用户换盘的本意(腾空间、彻底搬走)没有兑现
+            moving.clear_clips()?;
+            Ok::<_, vault::VaultError>(report)
+        })
+        .await
+        .map_err(|e| WireError::internal(e.to_string()))?
+        .map_err(|e| WireError::new("vault.migrateFailed").with("detail", e.to_string()))?;
+        let _ = app.emit(
+            "vault-migrated",
+            VaultMigrated {
+                clips: report.clips,
+                assets: report.assets,
+                skipped: report.skipped,
+            },
+        );
+    }
+
+    allow_vault_assets(&app, new_vault.root());
+    let mut cfg = settings::Settings::load(&state.config_dir);
+    cfg.vault_path = Some(std::path::PathBuf::from(&target));
+    if let Err(reason) = cfg.save(&state.config_dir) {
+        eprintln!("[quire] 配置存不进去:{reason}");
+    }
+    {
+        let mut guard = state
+            .vault
+            .write()
+            .map_err(|_| WireError::new("vault.poisoned"))?;
+        *guard = new_vault;
+    }
+    if let Ok(mut missing) = state.missing_vault.lock() {
+        *missing = None;
+    }
+    let info = info_of(&state);
+    let _ = app.emit("vault-changed", &info);
+    Ok(info)
+}
+
+/// 迁移完成后告诉前端的结果。「拷过去的 N 篇」要给用户看见:迁移是
+/// 数据级动作,用户有权知道新库里到底有多少自己的东西
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VaultMigrated {
+    /// 搬过去的剪藏篇数。**只数 `.md`**:用户问的是"几篇"
+    clips: usize,
+    /// 跟着走的图片和附件个数,单独报
+    assets: usize,
+    skipped: usize,
+}
+
 /// 在系统文件管理器里打开剪藏目录——这是"数据在你手上"最直观的一次兑现,
 /// 用户随时能看见、随时能拷走。
 #[tauri::command]
@@ -1022,6 +1107,40 @@ fn open_vault_folder(state: State<AppState>) -> Result<(), WireError> {
         .spawn()
         .map(|_| ())
         .map_err(|e| WireError::new("export.openFolderFailed").with("detail", e.to_string()))
+}
+
+/// 这是不是一条能交给系统浏览器打开的网页地址。
+///
+/// **scheme 白名单是安全闸,不是格式检查。** `explorer <url>` 走的是
+/// ShellExecute,给什么执行什么:`file:///C:/Windows/System32/cmd.exe`
+/// 会打开可执行文件,自定义 scheme 能唤起任意注册过的程序。正文里的
+/// 链接来自剪藏的网页,是不可信输入,所以除了 `http`/`https` 一律拒。
+fn is_web_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    (lower.starts_with("http://") && lower.len() > "http://".len())
+        || (lower.starts_with("https://") && lower.len() > "https://".len())
+}
+
+/// 用系统默认浏览器打开网页。正文里的「▶ 视频(到原文观看)」、
+/// 头部的「打开原文」、正文中所有外链都走这一条路——WebView 里点链接
+/// 的默认行为是把 Quire 自己的界面导航走,那不是打开文章,是丢掉 Quire。
+#[tauri::command]
+fn open_url(url: String) -> Result<(), WireError> {
+    if !is_web_url(&url) {
+        return Err(WireError::new("openUrlRejected").with("detail", url));
+    }
+
+    #[cfg(target_os = "windows")]
+    let mut cmd = std::process::Command::new("explorer");
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+
+    cmd.arg(url.trim())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| WireError::new("openUrlFailed").with("detail", e.to_string()))
 }
 
 /// 记下"上次打开的是哪一篇",下次启动放回原处
@@ -1336,11 +1455,18 @@ pub fn run() {
             // **这句报错由 `info_of` 兑现**:它每次被问都会真建一次目录,
             // 建不出来就把 WireError 带出去,前端弹红条。这里只是提前试一次
             let _ = vault.ensure_dirs();
+            allow_vault_assets(app.handle(), vault.root());
 
             let watch = Arc::new(WatchState::default());
             // 上次是开着的就接着开。用户明确开过一次,启动就弹回"关"
             // 是在替他做决定
             watch.enabled.store(cfg.watch_clipboard, Ordering::Relaxed);
+            // 恢复开着的话,把剪贴板里现有的内容记成"已见"。不播种的话,
+            // 30 秒内心跳第一次醒来,会把用户启动前就躺在剪贴板里的东西
+            // 弹成新剪藏——手动开监控防住的那个"窥探感",每天启动重演一遍
+            if cfg.watch_clipboard {
+                seed_last_hash(&watch);
+            }
 
             // 到期的隔离文件顺手清一遍。**放这儿,不放进扫库那条路**:
             // 扫库是用户看得见的动作(他在等列表出来),往里塞一段
@@ -1401,7 +1527,6 @@ pub fn run() {
             set_clip_flags_batch,
             list_trash,
             import_data_file,
-            export_selected,
             export_folder,
             read_trash_clip,
             search_trash,
@@ -1417,6 +1542,9 @@ pub fn run() {
             set_clipboard_watch,
             fetch_article,
             pick_vault,
+            choose_vault_target,
+            migrate_vault,
+            open_url,
             open_vault_folder,
             open_clip_file
         ])
@@ -1903,6 +2031,66 @@ mod tests {
         assert!(settings::Settings::load(d.path()).watch_clipboard);
     }
 
+    /// 监控恢复开着时**必须先播种已见哈希,再启动监控线程**。
+    /// 不播种的话,启动前就躺在剪贴板里的内容会在 30 秒内心跳第一次
+    /// 醒来时弹成新剪藏——手动开监控防住的"窥探感",每天启动重演一遍。
+    /// 这是同一件事的两条路径,手动开的那条已经播了,这条锁着别漏
+    #[test]
+    fn 启动恢复监控前先播种已见哈希() {
+        let p = prod_source();
+        let at = p
+            .find("watch.enabled.store(cfg.watch_clipboard, Ordering::Relaxed)")
+            .expect("启动恢复监控的那一行不在了");
+        let start = p
+            .find("start_clipboard_watch(handle")
+            .expect("监控线程的启动点不在了");
+        assert!(
+            at < start,
+            "播种必须发生在启动监控线程之前,否则有竞态"
+        );
+        let window = &p[at..start];
+        assert!(
+            window.contains("seed_last_hash(&watch)"),
+            "启动恢复开着监控时没有播种已见哈希——每次启动都会把旧剪贴板内容弹成新剪藏"
+        );
+    }
+
+    /// 手动开监控的那条路也要播种。两条路共用 `seed_last_hash`,
+    /// 哪条忘了,哪条就会把用户已有的剪贴板内容当成新剪藏弹出来
+    #[test]
+    fn 手动开监控也播种已见哈希() {
+        let p = prod_source();
+        let setter = body_of(p, "fn set_clipboard_watch");
+        assert!(
+            setter.contains("seed_last_hash(&state.watch)"),
+            "手动开监控时没有播种已见哈希"
+        );
+    }
+
+    /// 本地化图片之后正文里是 `assets/...` 相对路径,渲染时前端把它转成
+    /// asset 地址读盘上的文件;而 asset 协议默认一个目录都不许读,
+    /// 库目录不在白名单里,下载越成功裂图越彻底。
+    /// 启动恢复和换库**两条路都必须挂白名单**——scope 是运行时状态,
+    /// 换库不重挂的话新库的图全裂
+    #[test]
+    fn 库目录两条路都挂进asset白名单() {
+        let p = prod_source();
+        assert!(
+            p.contains("fn allow_vault_assets"),
+            "挂 asset 白名单的函数不在了"
+        );
+        assert!(
+            p.contains("asset_protocol_scope().allow_directory"),
+            "白名单函数得真的调 allow_directory"
+        );
+        // 一处是函数定义本身,另外两处是调用:启动恢复 + 换库
+        let calls = p.matches("allow_vault_assets(").count();
+        assert!(
+            calls == 4,
+            "asset 白名单的定义加调用共 {calls} 处——启动恢复、换库、迁移三条路各一处,多或少都说明挂错了"
+        );
+    }
+
     /// 配置读不出来时,监控**必须是关的**。这是隐私承诺的落点:
     /// 宁可每次都让用户重开一次,也不能因为配置坏了就开始读剪贴板
     #[test]
@@ -2101,6 +2289,88 @@ mod tests {
             "文件不在了还返回它,界面上会打不开"
         );
         assert!(body.contains("?;"), "读配置失败不该当错误抛出去");
+    }
+
+    /// scheme 白名单。**这不是格式检查,是安全闸**:explorer 走
+    /// ShellExecute,给什么执行什么。白名单漏一种 scheme,剪藏网页里的
+    /// 一条链接就能唤起任意本机程序
+    #[test]
+    fn 外链只放行http和https() {
+        assert!(is_web_url("https://example.com/a?b=1"));
+        assert!(is_web_url("http://example.com"));
+        assert!(is_web_url("  HTTPS://Example.com/路径  "), "大小写和前后空白不该挡");
+        // 剪藏正文里的链接是不可信输入,这些一个都不能过
+        assert!(!is_web_url("file:///C:/Windows/System32/cmd.exe"));
+        assert!(!is_web_url("javascript:alert(1)"));
+        assert!(!is_web_url("ms-settings:display"));
+        assert!(!is_web_url("http://"), "scheme 后面什么都不带不是地址");
+        assert!(!is_web_url(""));
+    }
+
+    /// 打开网页的命令必须是**真把地址交给浏览器的**。只拦不 open 的
+    /// 话,点了没反应,用户以为软件坏了
+    #[test]
+    fn open_url拦截后走系统浏览器() {
+        let body = body_of(prod_source(), "fn open_url(");
+        assert!(body.contains("is_web_url(&url)"), "没过白名单检查");
+        assert!(body.contains("openUrlRejected"), "拒绝得有代号,界面上要说得出原因");
+        assert!(
+            body.contains("cmd.arg(url"),
+            "得把地址作为参数交给系统打开器,而不是拼进 shell 字符串"
+        );
+    }
+
+    /// 注册了才能被前端 invoke。**这条要同时看两个方向**:命令在列表里、
+    /// 前端 api 里也有对应调用——只查一边,断的那一半没人知道
+    #[test]
+    fn open_url注册了且前端接了() {
+        let start = SOURCE
+            .find("tauri::generate_handler![")
+            .expect("源码里找不到 generate_handler");
+        let tail = &SOURCE[start..];
+        let end = tail.find("];").expect("generate_handler 没收尾");
+        assert!(tail[..end].contains("open_url,"), "open_url 没注册");
+        let web = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/api.ts"),
+        )
+        .expect("读不到 api.ts");
+        assert!(web.contains(r#""open_url""#), "前端没调 open_url");
+    }
+
+    /// 迁移是**搬家**:拷过去、确认成功、再清空原目录。
+    ///
+    /// 顺序错了后果不对称——先清后拷会直接丢数据,边拷边删中途失败
+    /// 就是一半在这边一半在那边。所以这里卡的是**顺序本身**,
+    /// 而不是"调了清空"这件事
+    #[test]
+    fn 迁移先拷完才清原目录() {
+        let body = body_of(prod_source(), "async fn migrate_vault(");
+        let copy_at = body
+            .find("copy_clips_into(&copied_target)?")
+            .expect("迁移没调拷贝");
+        let clear_at = body.find("clear_clips()?").expect("迁移没清空原目录——那是复制不是搬家");
+        assert!(clear_at > copy_at, "清空排在拷贝之前,会丢数据");
+        // 两步必须在同一个 `?` 链上:拷贝失败就不该走到清空
+        assert!(
+            body.contains("let report = moving.copy_clips_into(&copied_target)?;"),
+            "拷贝失败得当场返回,不能继续往下清"
+        );
+    }
+
+    /// 报给用户的是**篇数**,图片单独算。
+    ///
+    /// 混成一个数字的话,两篇剪藏加二十几张图会报成"搬过去了 26 篇",
+    /// 用户第一反应是"我的库里怎么凭空多出这么多东西"
+    #[test]
+    fn 迁移报的篇数和图片数分开() {
+        let body = body_of(prod_source(), "async fn migrate_vault(");
+        assert!(body.contains("clips: report.clips"), "篇数没单独报");
+        assert!(body.contains("assets: report.assets"), "图片数没单独报");
+        // 事件载荷也得是分开的三个字段,不能退回一个 copied
+        let event = body_of(prod_source(), "struct VaultMigrated");
+        assert!(event.contains("clips: usize"), "事件里没有篇数");
+        assert!(event.contains("assets: usize"), "事件里没有图片数");
+        assert!(!event.contains("copied:"), "还留着混在一起的 copied");
     }
 
 

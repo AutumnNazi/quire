@@ -26,6 +26,7 @@ const ctx: ClipItemContext = {
   isActive: () => false,
   isSelected: () => false,
   onOpen: () => {},
+  onContextMenu: () => {},
   onToggleRead: () => {},
   onToggleStar: () => {},
 };

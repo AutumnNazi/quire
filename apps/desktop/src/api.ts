@@ -165,5 +165,12 @@ export const api = {
   recentSearches: () => invoke<string[]>("recent_searches"),
 
   pickVault: () => invoke<VaultInfo | null>("pick_vault"),
+  /** 只选目录不切换——设置页拿它先问「现有的迁不迁」 */
+  chooseVaultTarget: () => invoke<string | null>("choose_vault_target"),
+  /** 迁移:可选地把现有剪藏拷过去,然后切到新目录 */
+  migrateVault: (target: string, copyExisting: boolean) =>
+    invoke<VaultInfo>("migrate_vault", { target, copyExisting }),
   openVaultFolder: () => invoke<void>("open_vault_folder"),
+  /** 用系统默认浏览器打开网页。正文里的外链全走这条,不让 WebView 自己导航 */
+  openUrl: (url: string) => invoke<void>("open_url", { url }),
 };

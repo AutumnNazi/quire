@@ -27,6 +27,8 @@ export interface ClipItemContext {
   isSelected: (filename: string) => boolean;
   /** 点了一下(已经是"普通点击"了,按下 Ctrl/Shift 的分支不归这里管)。 */
   onOpen: (event: MouseEvent, filename: string) => void;
+  /** 右键。弹什么菜单是列表的事,这一条只负责把点击位置和这一篇交过去。 */
+  onContextMenu: (event: MouseEvent, clip: ClipSummary) => void;
   onToggleRead: (clip: ClipSummary, next: boolean) => void;
   onToggleStar: (clip: ClipSummary, next: boolean) => void;
 }
@@ -89,6 +91,10 @@ export function clipItem(
   meta.append(site, when);
 
   item.append(title, meta);
+
+  // 右键菜单。**挂在这一条上,两个分支(回收站/普通)都走**——右键是
+  // 用户对"这一篇还能干什么"的预期,少挂一处,那一片的右键就是坏的
+  item.addEventListener("contextmenu", (e) => ctx.onContextMenu(e, clip));
 
   // 收藏的星。**挂成真按钮而不是一个静态符号**——用户在列表里一眼就想
   // 取消收藏,让他得先点开文章再找开关,那叫让人多绕两步

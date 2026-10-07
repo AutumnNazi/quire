@@ -20,7 +20,13 @@ export type MessageKey =
   | "toast_saved"
   | "error_no_content"
   | "error_clipboard"
-  | "error_page_blocked";
+  | "error_page_blocked"
+  | "media_video"
+  | "media_audio"
+  | "media_embed"
+  | "media_video_remote"
+  | "media_audio_remote"
+  | "media_embed_remote";
 
 /**
  * 取一句文案。

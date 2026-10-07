@@ -431,6 +431,22 @@ pub struct BatchReport {
     pub failed: Vec<PurgeFailure>,
 }
 
+/// 迁移拷了些什么。
+///
+/// **篇数和文件数分开。** 用户问的是"搬过去几篇",而 `clips/` 下面混着
+/// `.md`、图片、附件——一个数字全算进去的话,两篇剪藏报出二十几篇,
+/// 用户第一反应是"我的库里怎么多出这么多东西"
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopyReport {
+    /// 搬过去的剪藏篇数(只数 `.md`)。
+    pub clips: usize,
+    /// 跟着走的图片和附件个数。
+    pub assets: usize,
+    /// 那边已经有、没覆盖的剪藏篇数。
+    pub skipped: usize,
+}
+
 /// 标签改名的结果。**改了几篇 + 哪几篇没改成**
 ///
 /// 单独报 `changed` 而不是沿用 `BatchReport` 的成功列表:合并标签时
@@ -547,6 +563,82 @@ impl Vault {
 
     pub fn ensure_dirs(&self) -> Result<(), VaultError> {
         fs::create_dir_all(self.clips_dir())?;
+        Ok(())
+    }
+
+    /// 把整个剪藏目录(剪藏 + 本地化图片)拷进另一个库。
+    ///
+    /// **已存在的文件一律跳过不覆盖。** 目标目录里可能有用户自己放的东西,
+    /// 也可能是上次迁移到一半留下的——覆盖等于凭空少一篇,而用户根本
+    /// 无从察觉。回收站和隔离区不跟着迁:那半是「误删的暂时保管」,
+    /// 换机器没有意义,要留的话迁移前自己处理。
+    ///
+    /// 篇数和文件数**分开统计**:`.md` 是用户认知里的"一篇",图片和
+    /// 其他附件混进同一个数字,两篇剪藏能报出二十几篇
+    pub fn copy_clips_into(&self, target: &Vault) -> Result<CopyReport, VaultError> {
+        let mut report = CopyReport::default();
+        let src = self.clips_dir();
+        if !src.exists() {
+            return Ok(report);
+        }
+        // 目录树实际就两层(剪藏 + assets),写成通用的:剪藏目录里
+        // 用户自己塞过子目录,也不该在迁移时丢下
+        let mut pending = vec![(src, target.clips_dir())];
+        while let Some((from, to)) = pending.pop() {
+            for entry in fs::read_dir(&from)? {
+                let entry = entry?;
+                let from_path = entry.path();
+                let to_path = to.join(entry.file_name());
+                if from_path.is_dir() {
+                    // 回收站和隔离区是删掉的东西,不跟着搬家
+                    if from_path == self.trash_dir() || from_path == self.deleted_dir() {
+                        continue;
+                    }
+                    fs::create_dir_all(&to_path)?;
+                    pending.push((from_path, to_path));
+                } else if to_path.exists() {
+                    // 只把剪藏的跳过算进 skipped:那是用户语义里的"那篇已经有了";
+                    // 图片同名跳过是另一回事,混在一起数字就没法看了
+                    if from_path.extension().is_some_and(|e| e == "md") {
+                        report.skipped += 1;
+                    }
+                } else {
+                    fs::copy(&from_path, &to_path)?;
+                    if from_path.extension().is_some_and(|e| e == "md") {
+                        report.clips += 1;
+                    } else {
+                        report.assets += 1;
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// 搬走之后清空原库——迁移是搬家,不是复制。
+    ///
+    /// 两步,第二步是有条件的:
+    ///
+    /// 1. **删 `clips/`。** 回收站和隔离区的残留也在这棵树里,一起没了——
+    ///    那本来就是删掉的东西。
+    /// 2. **库根空了才连根删掉。** 空着说明这个目录是 Quire 自己建出来的、
+    ///    里面从来只有剪藏;留一个空壳在 `~/Documents/Quire` 看着就是没搬干净。
+    ///    但库根很可能就是用户自己的 Obsidian 库,旁边放着他的笔记和配置——
+    ///    那种情况下目录不是空的,这一步自己就不会动手。**用"空不空"当判据,
+    ///    而不是去猜这目录是谁建的**:猜错一次就是删别人的东西。
+    ///
+    /// 删库根失败不算失败。东西已经搬走了,剩一个空目录是碍眼,不是数据问题;
+    /// 为它把整个迁移报成失败,用户会以为剪藏没搬过去
+    pub fn clear_clips(&self) -> Result<(), VaultError> {
+        let dir = self.clips_dir();
+        if dir.exists() {
+            fs::remove_dir_all(dir)?;
+        }
+        if let Ok(mut entries) = fs::read_dir(&self.root) {
+            if entries.next().is_none() {
+                let _ = fs::remove_dir(&self.root);
+            }
+        }
         Ok(())
     }
 
@@ -1140,8 +1232,13 @@ impl Vault {
             }
             // 和「补全全文」那个按钮**同一条判据**。两处各写一份的话,
             // 迟早有一处说"这篇能补"而另一处说"这篇没问题"
+            //
+            // **读到末尾的不标。** 500 字以下是个猜测,不是断言:原文可能
+            // 本来就这么短。用户读到了底,说明这篇对他已经完整可用,再挂
+            // 一条"可能没抓全"就是把猜测当成事实喊出来
             let url = fm.url.trim();
             if crate::fetch::looks_fetchable(url)
+                && fm.progress < 1.0
                 && body.trim().chars().count() < crate::fetch::MIN_CLIP_CHARS_FOR_FETCH
             {
                 status.missing_fulltext.push(MissingFulltext {
@@ -1199,17 +1296,6 @@ impl Vault {
     /// 在别的 Markdown 工具里会被当成十几个文档的边界,标题层级全乱。
     pub fn export_markdown(&self) -> Result<String, VaultError> {
         let items = self.collect_export(None)?;
-        Ok(Self::render_export(&items))
-    }
-
-    /// 导出**指定的**几篇。
-    ///
-    /// 名单外的**读都不读**,不是读完了再扔:导出两百篇时白读一百九十九篇,
-    /// 是白花的时间。名单里的读不出来就当没这一篇,不报错也不提——那个文件
-    /// 此刻可能正被同步软件锁着,为它让整个导出失败,等于因为一个文件
-    /// 拿不回其余全部,而那个文件他本来就有,随时能再导一次
-    pub fn export_selected(&self, filenames: &[String]) -> Result<String, VaultError> {
-        let items = self.collect_export(Some(filenames))?;
         Ok(Self::render_export(&items))
     }
 
@@ -4170,6 +4256,15 @@ url: https://a.com/1
         let s = v.library_status().unwrap();
         assert_eq!(s.missing_fulltext.len(), 1, "数出来的不是 1 篇");
         assert_eq!(s.missing_fulltext[0].filename, short.filename);
+
+        // **读完的短文不算欠账。** 500 字以下是猜测不是断言,用户读到了
+        // 底就说明这篇对他完整可用,再提示"可能没抓全"是在跟读者抬杠
+        v.set_progress(&short.filename, 1.0).unwrap();
+        let s = v.library_status().unwrap();
+        assert!(
+            s.missing_fulltext.is_empty(),
+            "读完的短文不该再出现在欠账里"
+        );
         drop(dir);
     }
 
@@ -5643,7 +5738,10 @@ tags: [rust]
         let _b = v.save(&input("https://b.com", "乙", "正文乙")).unwrap();
         let c = v.save(&input("https://c.com", "丙", "正文丙")).unwrap();
 
-        let md = v.export_selected(&[a.filename.clone(), c.filename.clone()]).unwrap();
+        let out = TempDir::new().unwrap();
+        v.export_folder(out.path(), Some(&[a.filename.clone(), c.filename.clone()]))
+            .unwrap();
+        let md = std::fs::read_to_string(out.path().join("剪藏-2.md")).unwrap();
 
         assert!(md.contains("甲"), "选中的要导出来");
         assert!(md.contains("丙"), "选中的要导出来");
@@ -5667,7 +5765,10 @@ tags: [rust]
         let note = "下周组会要讲这篇";
         v.set_note(&saved.filename,  note, None).unwrap();
 
-        let md = v.export_selected(std::slice::from_ref(&saved.filename)).unwrap();
+        let out = TempDir::new().unwrap();
+        v.export_folder(out.path(), Some(std::slice::from_ref(&saved.filename)))
+            .unwrap();
+        let md = std::fs::read_to_string(out.path().join("剪藏.md")).unwrap();
 
         assert!(md.contains("重要"), "标签没进去:{}", md);
         assert!(md.contains("待读"));
@@ -5699,9 +5800,14 @@ tags: [rust]
         v.ensure_dirs().unwrap();
         let a = v.save(&input("https://a.com", "甲", "正文甲")).unwrap();
 
-        let md = v
-            .export_selected(&[a.filename.clone(), "压根不存在.md".to_string()])
-            .unwrap();
+        let out = TempDir::new().unwrap();
+        v.export_folder(
+            out.path(),
+            Some(&[a.filename.clone(), "压根不存在.md".to_string()]),
+        )
+        .unwrap();
+        // 名单里真实存在的是 1 篇,导出文件名按名单**长度**算,所以是「剪藏-2.md」
+        let md = std::fs::read_to_string(out.path().join("剪藏-2.md")).unwrap();
 
         assert!(md.contains("甲"), "能导的那篇得导出来");
         drop(dir);
@@ -5810,6 +5916,143 @@ tags: [rust]
         v.forget_all().unwrap();
 
         assert!(!v.deleted_dir().join(&a.filename).exists(), "还在");
+        drop(dir);
+    }
+
+    /// 迁移:整库拷进新目录,剪藏和本地化图片都得跟着走
+    #[test]
+    fn 迁移把剪藏和图片一起拷过去() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let a = v.save(&input("https://a.com", "甲", "正文")).unwrap();
+        let id = v.id_of(&a.filename).unwrap();
+        let img_dir = v.assets_dir().join(&id);
+        std::fs::create_dir_all(&img_dir).unwrap();
+        std::fs::write(img_dir.join("0.png"), b"PNG").unwrap();
+
+        let (tdir, target) = vault();
+        target.ensure_dirs().unwrap();
+        let report = v.copy_clips_into(&target).unwrap();
+
+        // **篇数和文件数分开报。** 用户问的是"几篇",把图片混进同一个
+        // 数字里,两篇剪藏能报出二十几篇
+        assert_eq!(report.clips, 1, "一篇剪藏");
+        assert_eq!(report.assets, 1, "一张图");
+        assert_eq!(report.skipped, 0);
+        assert!(
+            target.clips_dir().join(&a.filename).exists(),
+            "剪藏没拷过来"
+        );
+        assert_eq!(
+            std::fs::read(target.assets_dir().join(&id).join("0.png")).unwrap(),
+            b"PNG".to_vec(),
+            "图片没拷过来——正文还指着它,缺了就裂图"
+        );
+        drop(dir);
+        drop(tdir);
+    }
+
+    /// 目标目录里已有的文件**不许覆盖**:那边可能有用户自己放的东西,
+    /// 也有上一半次迁移留下的。覆盖了就凭空少一篇
+    #[test]
+    fn 迁移遇到同名文件跳过不覆盖() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let a = v.save(&input("https://a.com", "甲", "正文")).unwrap();
+
+        let (tdir, target) = vault();
+        target.ensure_dirs().unwrap();
+        let existing = target.clips_dir().join(&a.filename);
+        std::fs::write(&existing, "这里已经有一篇了").unwrap();
+
+        let report = v.copy_clips_into(&target).unwrap();
+
+        assert_eq!(report.clips, 0);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "这里已经有一篇了",
+            "覆盖了目标里已有的文件"
+        );
+        drop(dir);
+        drop(tdir);
+    }
+
+    /// 回收站和隔离区**不跟着迁移**——那是"误删的暂时保管",换机器没有
+    /// 意义。之前实现漏了这条:删过的文章全被算进"拷过去几篇"里,
+    /// 两篇剪藏能报出二十几篇
+    #[test]
+    fn 回收站和隔离区不跟着迁移() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        let a = v.save(&input("https://a.com", "甲", "正文")).unwrap();
+        // 模拟回收站和隔离区里各有一篇删掉的
+        std::fs::create_dir_all(v.trash_dir()).unwrap();
+        std::fs::write(v.trash_dir().join("trash-example.md"), "回收站里").unwrap();
+        std::fs::create_dir_all(v.deleted_dir()).unwrap();
+        std::fs::write(v.deleted_dir().join("gone-example.md"), "隔离区里").unwrap();
+
+        let (tdir, target) = vault();
+        target.ensure_dirs().unwrap();
+        let report = v.copy_clips_into(&target).unwrap();
+
+        assert_eq!(report.clips, 1, "只该有正常那篇,删过的不能混进来");
+        assert!(
+            !target.trash_dir().join("trash-example.md").exists(),
+            "回收站跟着迁了"
+        );
+        assert!(
+            !target.deleted_dir().join("gone-example.md").exists(),
+            "隔离区跟着迁了"
+        );
+        drop(dir);
+        drop(tdir);
+        let _ = a;
+    }
+
+    /// **搬走之后清空原库的剪藏目录**——迁移是搬家,不是复制。只删
+    /// `clips/`,库根不碰:那可能是用户自己的 Obsidian 库,里面另有他
+    /// 自己的东西
+    #[test]
+    fn 搬完清空原目录的剪藏但不动库根() {
+        let (dir, v) = vault();
+        v.ensure_dirs().unwrap();
+        v.save(&input("https://a.com", "甲", "正文")).unwrap();
+        // 库根里用户自己的文件(比如 Obsidian 的配置)
+        let user_file = v.root().join("我的笔记.md");
+        std::fs::write(&user_file, "用户的").unwrap();
+
+        v.clear_clips().unwrap();
+
+        assert!(!v.clips_dir().exists(), "剪藏目录还在,迁移成了复制");
+        assert!(user_file.exists(), "库根里用户自己的文件不能动");
+        drop(dir);
+    }
+
+    /// **库根空了就连根删掉。** 留一个空的 `Quire` 目录在原地,
+    /// 用户看到的就是"没搬干净"——而那个目录本来就是 Quire 自己建的,
+    /// 里面从来只有剪藏
+    #[test]
+    fn 库根除了剪藏没别的就连根删掉() {
+        let outer = TempDir::new().expect("建临时目录");
+        // 单独建一层当库根,这样删掉之后还能从外面验证它真没了
+        let root = outer.path().join("Quire");
+        let v = Vault::new(&root);
+        v.ensure_dirs().unwrap();
+        v.save(&input("https://a.com", "甲", "正文")).unwrap();
+
+        v.clear_clips().unwrap();
+
+        assert!(!root.exists(), "库根是空的却还留着,看着就是没搬干净");
+        assert!(outer.path().exists(), "只删库根,上一层不该被碰");
+        drop(outer);
+    }
+
+    /// 原目录本来就没有 clips(比如库还没建)时,清空不是错误
+    #[test]
+    fn 清空不存在的剪藏目录不算失败() {
+        let (dir, v) = vault();
+        v.clear_clips().unwrap();
         drop(dir);
     }
 

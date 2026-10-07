@@ -38,6 +38,7 @@ function ctx(over: Partial<ClipItemContext> = {}): ClipItemContext {
     isActive: () => false,
     isSelected: () => false,
     onOpen: () => {},
+    onContextMenu: () => {},
     onToggleRead: () => {},
     onToggleStar: () => {},
     ...over,

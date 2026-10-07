@@ -207,3 +207,37 @@ describe("快捷键面板接上了没有", () => {
     );
   });
 });
+
+describe("全局键在输入框里得让路", () => {
+  const mainSrc = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+
+  // document 级的 keydown 会吃到所有按键,包括打字时的。往输入框里
+  // 打字被全局键抢走,用户看到的是"这个软件连粘贴都干不了":
+  // 在批注框里按 Ctrl+V 想贴一段引用,引用没进批注,库里反而多出
+  // 一篇拿剪贴板内容当正文的剪藏。所以每个全局分支都得先问一句
+  // "他是不是在打字"。这条管的是**分支写法本身**,结构变了这里先红
+  it("Ctrl+V 在输入框里让给粘贴,框外才是剪藏", () => {
+    const at = mainSrc.indexOf('e.key.toLowerCase() === "v"');
+    expect(at, "Ctrl+V 的剪藏判定得还在").toBeGreaterThan(-1);
+    // 条件从 if( 到分支体第一句,豁免必须写在**这一段**里:
+    // 写在分支体里面就来不及了,preventDefault 已经把粘贴吃了
+    const branch = mainSrc.slice(
+      mainSrc.lastIndexOf("if (", at),
+      mainSrc.indexOf("e.preventDefault()", at),
+    );
+    expect(branch, "Ctrl+V 分支得带 isTyping 豁免").toContain("!isTyping(e.target)");
+  });
+
+  it("其余全局键的豁免没被顺手拆掉", () => {
+    // 这几条现在是对的,锁住现状:将来改键位的人看见四个分支里
+    // 只有一个带豁免,很容易当成不一致"统一"掉
+    expect(mainSrc).toContain('e.key.toLowerCase() === "a" && !isTyping(e.target)');
+    expect(mainSrc).toContain('e.key === "/" && !isTyping(e.target)');
+    expect(mainSrc).toContain('e.key === "?" && !isTyping(e.target)');
+    // Esc 有好几处(标签改名框自己的处理器也吞 Esc,那是框内该关框;
+    // 状态页还有一个命名函数的监听)。这条只认**全局那个**箭头函数处理器
+    const handler = mainSrc.indexOf('document.addEventListener("keydown", (e) => {');
+    const at = mainSrc.indexOf('e.key === "Escape") {', handler);
+    expect(mainSrc.slice(at, at + 120), "Esc 得先问是不是在打字").toContain("isTyping");
+  });
+});

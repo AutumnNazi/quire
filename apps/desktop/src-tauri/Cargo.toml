@@ -28,7 +28,10 @@ live-clipwatch = []
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# protocol-asset:asset 协议是图片本地化能显示出来的最后一环——正文里
+# 写的是 `assets/<id>/0.png` 相对路径,前端把它转成 asset 地址读盘上的
+# 文件;不开这个 feature,tauri 的 build script 直接拒绝配置
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 # 配置文件是三个标量的 JSON。**它早就编进二进制了**(Tauri 自己要用),

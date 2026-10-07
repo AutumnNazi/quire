@@ -192,7 +192,9 @@ body {
    那是在打开的一瞬间,不是读完之后。 */
 .note-editor {
   max-width: 42rem;
-  margin: 18px 0 4px;
+  /* 详情栏里标题、正文都是 42rem 居中,批注框必须跟它们对齐——
+     不居中的话宽屏上批注贴左、正文居中,看起来像两套布局 */
+  margin: 18px auto 4px;
 }
 
 .note-label {
@@ -249,7 +251,9 @@ body {
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  margin: 10px 0 4px;
+  max-width: 42rem;
+  /* 和标题、批注、正文同一个宽度、同一种居中——宽屏上才不会散架 */
+  margin: 10px auto 4px;
 }
 
 .tag-chips {
@@ -329,6 +333,83 @@ body {
 /* ── 这库里有什么 ── */
 .stats-panel {
   width: min(420px, 90vw);
+}
+
+/* ── 设置 ── */
+.settings-panel {
+  width: min(420px, 90vw);
+  padding: 18px 20px 28px;
+  overflow-y: auto;
+}
+
+.settings-title {
+  margin: 0 0 18px;
+  font-size: 15px;
+}
+
+.settings-section + .settings-section { margin-top: 22px; }
+
+.settings-section-title {
+  margin: 0 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* 一行 = 左边名字和后果,右边控件。**窄屏折成上下两块**——
+   挤在一行里的话控件会被压到只剩一个勾的宽度 */
+.settings-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.settings-row-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.settings-note {
+  margin: 3px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.settings-control {
+  flex: none;
+  padding-top: 2px;
+}
+
+.settings-buttons {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* 库路径。**用户要能一眼看出"就这个目录"**,所以等宽、不折行、
+   长了横向滚动——折行的话 `C:\Users\chenkaiyuan\Documents\Quire`
+   会断成两行,反而更难对 */
+.settings-path {
+  display: block;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  font-family: var(--mono, ui-monospace, Consolas, monospace);
+  font-size: 12px;
+  color: var(--text);
+  overflow-x: auto;
+  white-space: nowrap;
+  user-select: text;
+}
+
+@media (max-width: 560px) {
+  .settings-row { flex-direction: column; gap: 8px; }
 }
 
 .stats-grid {
@@ -615,24 +696,58 @@ button.stats-rank-row:hover {
 
 /* 监控开关。默认关闭的被动监听必须显眼地摆在那儿,
    用户随时看得到"它现在开没开"——这跟摄像头/麦克风开关是一个道理。 */
-.watch-toggle {
+.switch {
   display: flex;
   align-items: center;
   gap: 6px;
   font-size: 12.5px;
-  color: var(--text-muted);
+  color: var(--text);
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
 }
 
-.watch-toggle input {
+.switch input {
   margin: 0;
   cursor: pointer;
   accent-color: var(--accent);
 }
 
-.watch-toggle:hover { color: var(--text); }
+.switch:hover { color: var(--accent); }
+
+/* ── 右键菜单 ── */
+/* 固定定位:坐标由 JS 按点击位置算好写进 style,这里只管长相。
+   和设置/统计面板同一族:同底色、同圆角、同阴影,用户看不出这是
+   "另一个组件"——画风分家比少一个功能更让人出戏。 */
+.context-menu {
+  position: fixed;
+  z-index: 80;
+  min-width: 160px;
+  padding: 4px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 14%);
+}
+
+.context-menu-item {
+  display: block;
+  width: 100%;
+  padding: 7px 12px;
+  border: 0;
+  border-radius: calc(var(--radius) - 2px);
+  background: none;
+  font-size: 13px;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.context-menu-item:hover { background: var(--bg); }
+
+/* 删除这类不可逆动作:红字,而且 hover 底也是红的——颜色和后果一致 */
+.context-menu-item.danger { color: var(--danger, #c0392b); }
+.context-menu-item.danger:hover { background: rgb(192 57 43 / 8%); }
 
 /* ── 提示条 ── */
 .toast {
@@ -753,7 +868,24 @@ kbd {
   flex-direction: column;
 }
 
+/* 详情栏外壳:进度条和滚动区上下没关系——进度条是栏左边缘的竖线,
+   absolute 钉在壳上,滚动怎么滚它都不动 */
+.detail-side {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  /* **没有这一行,整页会跟着滚动**。它是 grid 子项,默认的最小高度
+     是"内容有多高就多高"——正文一长它就被撑高,撑出整页滚动条,
+     左侧列表跟着一起滚。原来的 .detail-pane 自己有 overflow 挡着,
+     包了这一层之后防线在外壳上断了,得在这里补上 */
+  min-height: 0;
+}
+
 .detail-pane {
+  flex: 1;
+  /* 不给 min-height:0 的话,flex 子项按内容撑高,overflow-y 永远不滚 */
+  min-height: 0;
   overflow-y: auto;
   padding: 32px 40px 80px;
 }
@@ -1119,6 +1251,10 @@ kbd {
 .prose a { color: var(--accent); }
 
 .prose img {
+  /* 插图块级居中:img 默认行内,宽图顶着左边、和上下文字挤在一起。
+     居中 + 与正文留间距,才是插图该有的排法 */
+  display: block;
+  margin: 14px auto;
   max-width: 100%;
   height: auto;
   border-radius: var(--radius);
@@ -1357,24 +1493,28 @@ kbd {
 
 /* ── 阅读进度 ── */
 
-/* 进度条压在详情页正文最上面,一条 3px 的线。不做成带百分比的大组件:
+/* 详情栏左边缘的竖线,3px 宽。不做成带百分比的大组件:
    那是"任务管理"的语气,这里是"读到哪儿了",一个记号就够。
-   用 accent 色的实心段,剩下的走轨道色。 */
+   **不进滚动内容**:sticky 的两版都翻过车——负 margin 把横线顶进标题区,
+   去掉负 margin 后滚动时又压住穿过来的正文。钉在壳上、长在栏边,
+   正文左侧留白 40px,永远碰不着;读多少长多少,方向和滚动同向。 */
 .read-progress {
-  position: sticky;
+  position: absolute;
   top: 0;
-  z-index: 2;
-  height: 3px;
-  margin: -32px -40px 0;
+  left: 0;
+  bottom: 0;
+  width: 3px;
   background: transparent;
 }
 
 .read-progress > i {
-  display: block;
-  height: 100%;
-  width: 0;
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 0;
   background: var(--accent);
-  transition: width 120ms linear;
+  transition: height 120ms linear;
 }
 
 /* 列表里的"读到一半"。标在右上角而不是做成底部进度条:列表项已经很密,

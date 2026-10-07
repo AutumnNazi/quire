@@ -1,5 +1,6 @@
 import "./style.css";
 import { listen } from "@tauri-apps/api/event";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { api } from "./api";
 import type { ClipboardCapture } from "./clipboard";
 import {
@@ -16,9 +17,11 @@ import { restorable, snapshotClips, undoBatch } from "./batch-undo";
 import type { BatchUndo, ClipSnapshot } from "./batch-undo";
 import { clipItem, formatWhen } from "./clip-item";
 import type { ClipItemContext } from "./clip-item";
+import { openContextMenuAt } from "./context-menu";
+import type { MenuItem } from "./context-menu";
 import { SHORTCUTS } from "./shortcuts";
 import { libraryStats } from "./stats";
-import { clipToMarkdown, MARKDOWN_PLACEHOLDER, renderMarkdown } from "./markdown";
+import { clipToMarkdown, MARKDOWN_PLACEHOLDER, renderMarkdown, resolveAssetImages } from "./markdown";
 import { startRename as renameTitle } from "./rename";
 import { attachNoteEditor } from "./note";
 import { afterRefresh } from "./refresh";
@@ -56,6 +59,7 @@ import type {
   SearchScope,
   TrashItem,
   VaultInfo,
+  VaultMigrated,
   TagCount,
 } from "./types";
 
@@ -99,10 +103,6 @@ root.innerHTML = `
       <button class="filter" id="filter-archived" role="tab" aria-selected="false" data-i18n="filter.archived" data-i18n-title="filter.archived.title"></button>
       <button class="filter" id="filter-trash" role="tab" aria-selected="false" data-i18n="filter.trash" data-i18n-title="filter.trash.title"></button>
     </div>
-    <label class="watch-toggle" data-i18n-title="watch.title">
-      <input type="checkbox" id="chk-watch" />
-      <span data-i18n="watch.label"></span>
-    </label>
     <!-- 不挂 data-i18n:那个键带 {n} 占位符,静态渲染出来会带着花括号。文案由 updateHistoryBadge 填 -->
     <button class="btn ghost" id="btn-history" hidden></button>
     <!-- 不挂 data-i18n:这个按钮只在真有欠账时才出现,文案带 {n} 占位符,静态渲染会带着花括号 -->
@@ -111,9 +111,10 @@ root.innerHTML = `
     <button class="btn" id="btn-import" data-i18n="toolbar.import" data-i18n-title="toolbar.import.title"></button>
     <button class="btn" id="btn-export" data-i18n="toolbar.export" data-i18n-title="toolbar.export.title"></button>
     <button class="btn" id="btn-open" data-i18n="toolbar.open"></button>
-    <button class="btn" id="btn-pick" data-i18n="toolbar.pick"></button>
     <button class="btn" id="btn-refresh" data-i18n="toolbar.refresh" data-i18n-title="toolbar.refresh.title"></button>
-    <button class="btn ghost lang" id="btn-lang" data-i18n="lang.name" data-i18n-title="lang.switch"></button>
+    <!-- 设置。剪贴板监控、界面语言、数据目录都在里面。工具栏只留
+         「每天都要按」的那些:剪藏、搜索、筛、导入导出、刷新 -->
+    <button class="btn ghost" id="btn-settings" data-i18n="toolbar.settings" data-i18n-title="toolbar.settings.title"></button>
     <!-- 这一行既是提示也是入口。**做成能点的**:不认识快捷键的人不会去按
          一个不认识的键,而认得几个的人想知道"还有没有别的"时,总得有个地方点 -->
     <button
@@ -142,7 +143,14 @@ root.innerHTML = `
       </div>
       <div class="batch-tag-panel" id="batch-tag-panel" hidden></div>
     </aside>
-    <section class="detail-pane" id="detail"></section>
+    <section class="detail-side">
+      <!-- 阅读进度是栏左边缘的竖线:**不进滚动内容**。放进内容流里的话,
+           要么靠负 margin 硬顶(横在标题区中间),要么 sticky(滚动时压住
+           穿过来的正文),两版都翻过车。竖线在栏边缘的 3px 里,正文左侧
+           留白 40px,永远碰不着;读多少长多少,方向和滚动同向 -->
+      <div class="read-progress" id="read-progress" data-i18n-title="detail.progress.title"><i id="read-progress-bar"></i></div>
+      <section class="detail-pane" id="detail"></section>
+    </section>
   </main>
   <div class="toast" id="toast" hidden>
     <span class="toast-text" id="toast-text"></span>
@@ -166,13 +174,29 @@ const batchBarEl = el<HTMLDivElement>("batch-bar");
 const batchCountEl = el<HTMLSpanElement>("batch-count");
 const batchTagPanelEl = el<HTMLDivElement>("batch-tag-panel");
 const detailEl = el<HTMLElement>("detail");
+const progressBarEl = el<HTMLElement>("read-progress-bar");
 const warnEl = el<HTMLDivElement>("warn");
 const tagBarEl = el<HTMLDivElement>("tag-bar");
 const vaultPathEl = el<HTMLSpanElement>("vault-path");
+// 当前剪藏库的根路径。本地化过的图片地址是相对路径,渲染时要拼成
+// 绝对路径再转 asset 地址;库没就绪(空态/报错)时是空串
+let vaultRoot = "";
+
+/** 正文里相对地址的基准目录:**md 所在的 clips 目录,不是库根**。
+ *  图片本地化把图下到 `<库>/clips/assets/<id>/`、正文里写 `assets/...`,
+ *  这个相对路径对 md 文件本身成立(任何 md 阅读器都能显示),
+ *  Quire 渲染时也得照同一个基准拼——拿库根拼的话永远 404 裂图。
+ *  `CLIPS_DIR` 在 Rust 侧 vault.rs,改名要两头一起。 */
+function clipsBase(): string {
+  const root = vaultRoot.trim().replace(/[\\/]+$/, "");
+  return root ? `${root}/clips` : "";
+}
 const toastEl = el<HTMLDivElement>("toast");
 const toastTextEl = el<HTMLSpanElement>("toast-text");
 const toastActionsEl = el<HTMLSpanElement>("toast-actions");
-const watchEl = el<HTMLInputElement>("chk-watch");
+// 剪贴板监控的当前状态。开关本体在设置面板里(每次打开重新构建),
+// 状态得存在模块这一层——多处逻辑要读它,存 DOM 上不方便
+let watchOn = false;
 
 /** **问过没有。** 空库那一屏上摆不摆「要不要开启」全看它——
  *  用户拒绝过一次之后再问,那是骚扰不是引导 */
@@ -185,7 +209,8 @@ const filterWeekEl = el<HTMLButtonElement>("filter-week");
 const filterStarredEl = el<HTMLButtonElement>("filter-starred");
 const filterArchivedEl = el<HTMLButtonElement>("filter-archived");
 const filterTrashEl = el<HTMLButtonElement>("filter-trash");
-const langBtn = el<HTMLButtonElement>("btn-lang");
+const settingsBtnEl = el<HTMLButtonElement>("btn-settings");
+let settingsPanelEl: HTMLElement | null = null;
 const refreshBtn = el<HTMLButtonElement>("btn-refresh");
 
 let clips: ClipSummary[] = [];
@@ -927,7 +952,7 @@ function buildFirstRunSteps(): HTMLElement[] {
   // **把「开启监控剪贴板」做成一个按钮,而不是一句让人去找的话。**
   // 空库这一屏是用户最愿意点东西的时候,让他自己跑去工具栏找那个
   // 小复选框,是把最简单的场景做成了最麻烦的
-  if (!watchEl.checked && !watchAsked) {
+  if (!watchOn && !watchAsked) {
     const ask = document.createElement("button");
     ask.className = "btn primary first-run-ask";
     ask.textContent = t("firstRun.askWatch");
@@ -950,9 +975,55 @@ const clipCtx: ClipItemContext = {
   isActive: (filename) => filename === activeFilename,
   isSelected: (filename) => selected.has(filename),
   onOpen: (event, filename) => onItemClick(event, filename),
+  onContextMenu: (event, clip) => openClipContextMenu(event, clip),
   onToggleRead: (clip, next) => void toggleRead(clip, next),
   onToggleStar: (clip, next) => void toggleStar(clip, next),
 };
+
+/** 列表右键菜单。
+ *
+ *  **低频动作全收在这里。** 列表项上已经有一个「已读」快捷按钮和收藏星,
+ *  再往卡片上摆归档、删除,用户扫列表时一眼全是按钮;右键是文件管理器
+ *  养出来的肌肉记忆,「这一篇还能干什么」的答案就该在右键里。
+ *
+ *  菜单项跟着这一篇的**当前状态**变:已读的显示「标未读」,收藏过的显示
+ *  「取消收藏」——菜单是状态的镜子,不是一排固定按钮。
+ *  「删除」排最后并标红:最危险的放最难点到的地方。 */
+function openClipContextMenu(event: MouseEvent, clip: ClipSummary): void {
+  event.preventDefault();
+  const done = clip.read || clip.archived;
+  const items: MenuItem[] = [
+    {
+      label: done ? t("batch.unread") : t("batch.read"),
+      title: done ? t("clip.markUnread.title") : t("clip.markRead.title"),
+      onClick: () => void toggleRead(clip, !clip.read),
+    },
+    {
+      label: clip.starred ? t("detail.unstar") : t("batch.star"),
+      onClick: () => void toggleStar(clip, !clip.starred),
+    },
+    {
+      label: clip.archived ? t("detail.unarchive") : t("detail.archive"),
+      onClick: () => void toggleArchive(clip.filename),
+    },
+  ];
+  if (/^https?:\/\//i.test(clip.url)) {
+    items.push({
+      label: t("detail.openOriginal"),
+      onClick: () => void api.openUrl(clip.url),
+    });
+  }
+  items.push({
+    label: t("detail.reveal"),
+    onClick: () => void openClipFile(clip.filename, true),
+  });
+  items.push({
+    label: t("batch.delete"),
+    danger: true,
+    onClick: () => void trashClip(clip.filename),
+  });
+  openContextMenuAt(event.clientX, event.clientY, items);
+}
 
 /** 列表项点击。`Ctrl`/`Cmd` 是加选减选,`Shift` 是连选,都不打开正文——
  *  用户按住这两个键是在"挑一堆",不是在"读一篇"。 */
@@ -1209,18 +1280,13 @@ function renderDetail(clip: ClipContent): void {
     meta.prepend(link);
   }
 
-  // 进度条。**放在正文最上面而不是文章末尾**:读到哪儿了这件事,
-  // 得在滚动时一眼看见,而不是滚到底才知道
-  const progress = document.createElement("div");
-  progress.className = "read-progress";
-  progress.title = t("detail.progress.title");
-  const bar = document.createElement("i");
-  progress.append(bar);
-
   const body = document.createElement("article");
   body.className = "prose";
   // 唯一使用 innerHTML 的地方,内容已过 DOMPurify
   body.innerHTML = renderMarkdown(clip.body);
+  // 本地化过的图片写的是相对路径,WebView 里直接用就是 404 裂图——
+  // 换成本地 asset 地址去读盘上的文件
+  resolveAssetImages(body, clipsBase(), convertFileSrc);
   for (const img of body.querySelectorAll("img")) {
     // 不发 Referer,免得用户读了什么被图片服务器记录去
     img.referrerPolicy = "no-referrer";
@@ -1232,6 +1298,10 @@ function renderDetail(clip: ClipContent): void {
       },
       { once: true },
     );
+    // 图片加载会**撑高正文**,可滚空间跟着变——不重算的话,进度条停在
+    // 图片加载前算出的旧值上,明明拉到了底,线还差一截。只重算显示,
+    // 不写盘:存进度是滚动的事,图片加载不该替用户记一笔
+    img.addEventListener("load", recalibrateRestore, { once: true });
   }
 
   const actions = document.createElement("div");
@@ -1274,9 +1344,11 @@ function renderDetail(clip: ClipContent): void {
   syncArchiveButton(clip);
 
   header.append(title, meta, actions);
-  detailEl.append(header, progress, tagEditor(clip), noteEditor(clip), body);
+  // 进度条在正文之前、批注编辑器之后:进度条之下就是正文,一条线
+  // 把"我写的"和"我读的"分开
+  detailEl.append(header, tagEditor(clip), noteEditor(clip), body);
   detailEl.scrollTop = 0;
-  trackReadingProgress(clip.filename, clip.progress, bar);
+  trackReadingProgress(clip.filename, clip.progress);
 }
 
 /* ── 批注 ── */
@@ -1559,10 +1631,22 @@ let progressScroll: { filename: string; onScroll: () => void } | null = null;
  *
  *  **一屏装得下就是 100%。** 短笔记没有"读一半"这回事,给它记 0.3 只会
  *  让列表里出现一条永远停在三分之一的长条。 */
+/** 进度条显示的是**滚动位置**,不是"读完了没有"。
+ *
+ *  两个语义差着一整个产品判断:不足一屏的文章按"完成度"理解就是打开即
+ *  100%,可用户拉一下滚轮发现线纹丝不动,那不是"读完了",是"坏了"。
+ *  位置语义下,不足一屏 = 没有可滚的空间 = 线留在 0%——和滚轮的手感一致。
+ *  写盘跟着这个值走,0 不进文件,短文不会有假进度 */
 function readingProgress(): number {
   const scrollable = detailEl.scrollHeight - detailEl.clientHeight;
-  if (scrollable <= 8) return 1;
+  if (scrollable <= 8) return 0;
   return Math.min(1, detailEl.scrollTop / scrollable);
+}
+
+/** 只重画进度条,不碰存盘。图片加载、窗口缩放这类**布局自己长高**的
+ *  时刻用:可滚空间变了,线该跟上;但用户没有滚,进度不该记一笔 */
+function syncProgressBarOnly(): void {
+  progressBarEl.style.height = `${Math.round(readingProgress() * 100)}%`;
 }
 
 /** 挂上滚动监听,停手 1.5 秒后把进度写盘。
@@ -1586,21 +1670,37 @@ function scheduleLastRead(filename: string): void {
   }, LAST_READ_AFTER_MS);
 }
 
-function trackReadingProgress(filename: string, saved: number, bar: HTMLElement): void {
+/** 打开时的位置恢复还欠着多少。**用户一滚就作废**——恢复只服务
+ *  "接着上次的读",用户自己动了滚动条,他的意图就比记录大 */
+let pendingRestore: number | null = null;
+/** 恢复滚动是程序自己改 `scrollTop`,会触发 scroll 事件。**不垫这个
+ *  标志,恢复的滚动会被当成用户滚动**,把「用户没滚过」的判定冲掉 */
+let restoringScroll = false;
+
+function trackReadingProgress(filename: string, saved: number): void {
   detachProgress();
   scheduleLastRead(filename);
-  bar.style.width = `${Math.round(saved * 100)}%`;
+  pendingRestore = saved > 0 ? saved : null;
+  // 竖线从栏顶往下长:读多少,线多长。方向和滚动同向,一眼能对上
+  progressBarEl.style.height = `${Math.round(saved * 100)}%`;
   if (saved > 0) {
-    requestAnimationFrame(() => {
-      const scrollable = detailEl.scrollHeight - detailEl.clientHeight;
-      if (scrollable > 8) detailEl.scrollTop = scrollable * saved;
-    });
+    restoreSavedPosition();
   }
 
   const onScroll = (): void => {
-    bar.style.width = `${Math.round(readingProgress() * 100)}%`;
+    // 恢复引发的滚动不算用户滚动:不记进度,也不作废待校准的恢复
+    if (restoringScroll) {
+      restoringScroll = false;
+      return;
+    }
+    pendingRestore = null;
+    const value = readingProgress();
+    progressBarEl.style.height = `${Math.round(value * 100)}%`;
+    // 角标显示的是**阅读位置**,是给眼睛看的——滚动当下就得跟上。
+    // 写盘另有 1.5 秒防抖,那管的是磁盘,不该让列表的百分比跟着等
+    syncClipProgressBadge(filename, value);
     // 写进队列的是**这一刻**的位置。定时器到点再取,取到的才是最后滚到的那儿
-    progressQueue.put({ filename, value: readingProgress() });
+    progressQueue.put({ filename, value });
     if (progressTimer) clearTimeout(progressTimer);
     progressTimer = setTimeout(() => {
       progressTimer = null;
@@ -1609,6 +1709,31 @@ function trackReadingProgress(filename: string, saved: number, bar: HTMLElement)
   };
   detailEl.addEventListener("scroll", onScroll, { passive: true });
   progressScroll = { filename, onScroll };
+}
+
+/** 把滚动位置放回 saved 比例处。**直接用的 scrollHeight 是图片没加载时
+ *  的**——懒加载图片一撑高正文,恢复到的位置就漂走(0.56 恢复到 75%
+ *  的位置实测过)。所以恢复要做两段:打开瞬间先放个大概,图片加载完
+ *  再校准;用户在这期间自己滚了,校准就作废 */
+function restoreSavedPosition(): void {
+  restoringScroll = true;
+  requestAnimationFrame(() => {
+    if (pendingRestore == null) return;
+    const saved = pendingRestore;
+    const scrollable = detailEl.scrollHeight - detailEl.clientHeight;
+    if (scrollable > 8) detailEl.scrollTop = scrollable * saved;
+    // rAF 里改 scrollTop 触发的 scroll 是异步派发的,标志得等下一帧再撤
+    requestAnimationFrame(() => {
+      restoringScroll = false;
+    });
+  });
+}
+
+/** 图片加载完把布局撑高了。**用户还没滚过的话,按最新的可滚空间把
+ *  位置重新校准一遍**;滚过了就什么都不做,用户的意图比记录大 */
+function recalibrateRestore(): void {
+  if (pendingRestore != null) restoreSavedPosition();
+  syncProgressBarOnly();
 }
 
 /** 摘掉进度监听和待写的定时器。**每个重画详情的地方都得调**:
@@ -1624,6 +1749,13 @@ function detachProgress(): void {
     detailEl.removeEventListener("scroll", progressScroll.onScroll);
     progressScroll = null;
   }
+  // 线归零必须跟着监听一起摘。**摘了监听不归零的话,回收站详情这类
+  // 没有滚动监听的页面会继承上一篇的线**,拉到顶也不动——看起来就是
+  // 进度条坏了。renderDetail 这条路紧接着 trackReadingProgress 会
+  // 重新赋值,这里归零不会造成闪烁
+  progressBarEl.style.height = "0%";
+  // 待校准的恢复也作废:上一篇的恢复重放到这一篇上就是乱跳
+  pendingRestore = null;
 }
 
 /** 把还挂在定时器上的那次进度立刻写出去。**没有待写的就什么都不做**——
@@ -1637,6 +1769,45 @@ function flushPendingProgress(): void {
   if (pending) void saveProgress(pending.filename, pending.value);
 }
 
+/** 把列表右上角的百分比同步成这一刻的阅读位置。
+ *
+ *  **列表只在重画时读 `clips`,而滚动写盘不触发重画**——不同步的话,
+ *  百分比冻在扫描那一刻的值上:用户明明拉回了开头,列表还挂着 100%,
+ *  怎么等都不动。这里两份都要跟上:内存里的 `clips` 是下一次重画的
+ *  来源,`.clip-half` 是此刻屏幕上挂着的那个角标。
+ *
+ *  滚动事件一秒几十次,而角标只在**跨过整数百分点**时才真的变——
+ *  同一格就整个短路,连内存都不改,不然两千篇的库每次滚动都要全表
+ *  find 加 querySelector */
+function syncClipProgressBadge(filename: string, progress: number): void {
+  const clip = clips.find((c) => c.filename === filename);
+  const shown = Math.round(progress * 100);
+  if (clip) {
+    if (Math.round(clip.progress * 100) === shown) return;
+    clip.progress = progress;
+  }
+
+  const item = listEl.querySelector<HTMLElement>(
+    `.clip[data-filename="${CSS.escape(filename)}"]`,
+  );
+  if (!item) return;
+  const half = item.querySelector<HTMLElement>(".clip-half");
+  if (progress > 0 && clip && !clip.read && !clip.archived) {
+    // 和 clip-item 的渲染条件一致:读了一半才挂角标。渲染时挂在末尾
+    // (读屏先念标题),这里补建也挂末尾,两边别长成两副样子
+    if (!half) {
+      const badge = document.createElement("span");
+      badge.className = "clip-half";
+      item.append(badge);
+      badge.textContent = `${shown}%`;
+    } else {
+      half.textContent = `${shown}%`;
+    }
+  } else {
+    half?.remove();
+  }
+}
+
 
 async function saveProgress(filename: string, progress: number): Promise<void> {
   // 已经读到 100% 的,以后再打开也不该被"读了一半"的进度条盖住。
@@ -1644,6 +1815,7 @@ async function saveProgress(filename: string, progress: number): Promise<void> {
   if (progress >= 0.999) progress = 1;
   try {
     await api.setClipProgress(filename, progress);
+    syncClipProgressBadge(filename, progress);
     const outcome = progressJudge.judge(true);
     if (outcome === "recovered") showToast(t("toast.progressRecovered"));
   } catch (err) {
@@ -1661,6 +1833,8 @@ async function saveProgress(filename: string, progress: number): Promise<void> {
 function renderEmptyDetail(): void {
   detachProgress();
   detailEl.replaceChildren();
+  // 进度条是栏边的全局元素,不随详情重建。空态时归零,别留着上一篇的长度
+  progressBarEl.style.height = "0%";
   archiveBtn = null; // 上一篇的按钮节点已经脱离文档,留着只会改空气
   const hint = document.createElement("div");
   hint.className = "empty";
@@ -1731,6 +1905,7 @@ function renderTrashDetail(clip: ClipContent): void {
   body.className = "prose";
   // 唯一使用 innerHTML 的地方,内容已过 DOMPurify
   body.innerHTML = renderMarkdown(clip.body);
+  resolveAssetImages(body, clipsBase(), convertFileSrc);
   for (const img of body.querySelectorAll("img")) {
     img.referrerPolicy = "no-referrer";
     img.loading = "lazy";
@@ -2160,9 +2335,10 @@ async function refreshList(): Promise<void> {
 async function loadVaultInfo(): Promise<void> {
   try {
     const info: VaultInfo = await api.vaultInfo();
+    vaultRoot = info.path;
     vaultPathEl.textContent = info.path;
     vaultPathEl.title = info.path;
-    watchEl.checked = info.watching;
+    watchOn = info.watching;
     watchAsked = info.watchAsked;
     // 剪藏库建不出来(只读盘、网盘掉线)时 `list_clips` 会返回一个空列表,
     // 界面上就是个干干净净的空库。**必须把真实原因摆出来**,否则用户
@@ -2838,6 +3014,141 @@ function closeStats(): void {
 statsEl.addEventListener("click", () => {
   if (statsPanelEl) closeStats();
   else openStats();
+});
+
+/* ── 设置 ── */
+
+/** 一行设置:左边是名字和后果,右边是控件。
+ *
+ *  说明写的是「关掉会怎样」而不是「这个开关是干什么的」——名字已经说了一遍,
+ *  用户真正要判断的是**动了它会怎样**,重复一遍名字只会让人更快地划过去 */
+function settingsRow(
+  titleKey: string,
+  noteKey: string,
+  control: HTMLElement,
+): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "settings-row";
+  const text = document.createElement("div");
+  text.className = "settings-text";
+  const title = document.createElement("h3");
+  title.className = "settings-row-title";
+  title.textContent = t(titleKey);
+  const note = document.createElement("p");
+  note.className = "settings-note";
+  note.textContent = t(noteKey);
+  text.append(title, note);
+
+  const slot = document.createElement("div");
+  slot.className = "settings-control";
+  slot.append(control);
+  row.append(text, slot);
+  return row;
+}
+
+function settingsSection(titleKey: string): HTMLElement {
+  const box = document.createElement("section");
+  box.className = "settings-section";
+  const h = document.createElement("h2");
+  h.className = "settings-section-title";
+  h.textContent = t(titleKey);
+  box.append(h);
+  return box;
+}
+
+/** 画设置面板。**每次状态变了就整个重画**,不做局部更新——
+ *  这里一共七八个元素,重画的代价是零,而局部更新意味着「改库路径忘了改
+ *  旁边那句说明」这类只有手动同步才躲得过的错 */
+function renderSettingsPanel(box: HTMLElement): void {
+  const title = document.createElement("h2");
+  title.className = "settings-title";
+  title.id = "settings-title";
+  title.textContent = t("settings.title");
+
+  const body = document.createElement("div");
+  body.className = "settings-body";
+
+  const vault = settingsSection("settings.vault");
+  const path = document.createElement("code");
+  path.className = "settings-path";
+  path.textContent = vaultRoot || t("settings.path.empty");
+  path.title = vaultRoot;
+
+  const vaultBtns = document.createElement("div");
+  vaultBtns.className = "settings-buttons";
+  const openBtn = document.createElement("button");
+  openBtn.className = "btn";
+  openBtn.textContent = t("toolbar.open");
+  openBtn.addEventListener("click", () => {
+    void api.openVaultFolder().catch((e) => showError(wireText(e)));
+  });
+  const changeBtn = document.createElement("button");
+  changeBtn.className = "btn";
+  changeBtn.textContent = t("settings.changeDir");
+  changeBtn.addEventListener("click", () => void changeVaultWithMigration());
+  vaultBtns.append(openBtn, changeBtn);
+  vault.append(path, vaultBtns);
+
+  const clip = settingsSection("settings.clipboard");
+  const watchBox = document.createElement("label");
+  watchBox.className = "switch";
+  const watchInput = document.createElement("input");
+  watchInput.type = "checkbox";
+  watchInput.checked = watchOn;
+  watchInput.addEventListener("change", () => {
+    void setWatchToggle(watchInput.checked);
+  });
+  const watchText = document.createElement("span");
+  watchText.textContent = t("settings.watch");
+  watchBox.append(watchInput, watchText);
+  clip.append(
+    settingsRow("settings.watch", "settings.watch.note", watchBox),
+  );
+
+  const lang = settingsSection("settings.lang");
+  const langBtn = document.createElement("button");
+  langBtn.className = "btn";
+  langBtn.textContent = localeName();
+  langBtn.title = t("lang.switch");
+  langBtn.addEventListener("click", () => {
+    setLocale(otherLocale());
+    applyLocale();
+  });
+  lang.append(langBtn);
+
+  body.append(vault, clip, lang);
+  box.replaceChildren(title, body);
+}
+
+function openSettings(): void {
+  closeSettings();
+  const box = document.createElement("aside");
+  box.className = "history-drawer settings-panel";
+  box.id = "settings-panel";
+  box.setAttribute("role", "dialog");
+  box.setAttribute("aria-label", t("settings.title"));
+  settingsPanelEl = box;
+  renderSettingsPanel(box);
+  document.body.append(box);
+  settingsBtnEl.setAttribute("aria-expanded", "true");
+}
+
+function closeSettings(): void {
+  settingsPanelEl?.remove();
+  settingsPanelEl = null;
+  settingsBtnEl.setAttribute("aria-expanded", "false");
+}
+
+/** 面板开着的时候把它重画一遍。**没开着就什么都不做**——
+ *  空面板被顺手清掉的话,用户刚点开设置它就消失了 */
+function syncSettingsPanel(): void {
+  if (!settingsPanelEl) return;
+  renderSettingsPanel(settingsPanelEl);
+}
+
+settingsBtnEl.addEventListener("click", () => {
+  if (settingsPanelEl) closeSettings();
+  else openSettings();
 });
 
 
@@ -3650,54 +3961,85 @@ async function exportSelected(): Promise<void> {
   await runExportFolder(filenames);
 }
 
-el<HTMLButtonElement>("btn-pick").addEventListener("click", async () => {
+/** 更改数据目录。选完先问一句「现有的迁不迁」,答了才动库——
+ *  不问就切走,等于替用户决定扔不扔他几千篇剪藏 */
+async function changeVaultWithMigration(): Promise<void> {
+  let target: string | null;
   try {
-    const info = await api.pickVault();
-    if (info) {
-      await loadVaultInfo();
-      await refreshList();
-    }
+    target = await api.chooseVaultTarget();
   } catch (err) {
     showBackendError("error.pickVaultFailed", err);
+    return;
   }
-});
+  if (!target) return; // 取消就是什么都没发生
+
+  // 三选一摆在 toast 上:迁移过去 / 空目录开始 / 取消。**主按钮给「取消」**
+  // ——回车和误触落到的都是它,想要迁移得明确点一下那个次要的按钮
+  hideToast();
+  showToast(t("settings.migrate.body", { n: String(clips.length) }), [
+    { label: t("settings.migrate.cancel"), primary: true, onClick: hideToast },
+    {
+      label: t("settings.migrate.copy"),
+      onClick: () => void finishMigration(target, true),
+    },
+    {
+      label: t("settings.migrate.empty"),
+      onClick: () => void finishMigration(target, false),
+    },
+  ]);
+}
+
+/** 真正切库。**只有这一处改 `config.json` 里的库路径**,面板上看到的路径
+ *  从这里回来,别在别处再改一遍——两处都改,迟早有一处漏了同步 */
+async function finishMigration(target: string, copyExisting: boolean): Promise<void> {
+  hideToast();
+  try {
+    await api.migrateVault(target, copyExisting);
+    await loadVaultInfo();
+    await refreshList();
+    syncSettingsPanel();
+    // 搬过去的篇数由 `vault-migrated` 事件报。**这里再报一遍就成了两条提示
+    // 互相顶掉**,用户看见的是后到的那条,篇数直接没了
+    if (!copyExisting) showToast(t("settings.migrate.switched"));
+  } catch (err) {
+    showBackendError("error.vault.migrateFailed", err);
+  }
+}
 
 /** 首次那一次问。**和工具栏上那个复选框走同一条路**——
  *  另开一条就会出现「从按钮开的没存好」「从复选框开的没判重」这类
  *  只在某个入口下才有的问题 */
 async function askWatchOnce(enable: boolean): Promise<void> {
   watchAsked = true;
-  watchEl.checked = enable;
+  watchOn = enable;
   try {
     await api.setClipboardWatch(enable);
     if (enable) showToast(t("toast.watchOn"));
     // 关着的时候**什么都不说**。用户刚点了"不用",再弹一条"已关闭"
     // 就是在确认他的决定——他刚才那一下点得还不够明确吗
   } catch (err) {
-    watchEl.checked = !enable;
+    watchOn = !enable;
     watchAsked = false; // 没改成就不算问过,下次还能问
     showBackendError("error.internal", err);
   }
 }
 
-watchEl.addEventListener("change", () => {
-  // 用户自己拨了开关,就算"已经回答过要不要开"了
-  watchAsked = true;
-  void api
-    .setClipboardWatch(watchEl.checked)
-    .then((info) => {
-      watchEl.checked = info.watching;
-      if (info.watching) {
-        showToast(t("toast.watchOn"));
-      } else {
-        hideToast();
-      }
-    })
-    .catch((err) => {
-      watchEl.checked = !watchEl.checked; // 状态没改成,把开关拨回去
-      showError(wireText(err));
-    });
-});
+/** 开关剪贴板监控。设置面板的开关和首次询问走同一条路——两处各写
+ *  一份,就会出现「面板里关不掉、首次询问能关」这种只在一边复现的问题 */
+async function setWatchToggle(next: boolean): Promise<void> {
+  watchOn = next;
+  try {
+    const info = await api.setClipboardWatch(next);
+    watchOn = info.watching;
+    if (info.watching) showToast(t("toast.watchOn"));
+    else hideToast();
+    syncSettingsPanel();
+  } catch (err) {
+    watchOn = !next; // 状态没改成,拨回去
+    syncSettingsPanel();
+    showError(wireText(err));
+  }
+}
 
 /** 用户正在打字的话就别抢键。搜索框里敲 r 是搜索 r,不是标已读。 */
 function isTyping(target: EventTarget | null): boolean {
@@ -3722,9 +4064,27 @@ function advanceAfterRemoval(indexBefore: number): void {
   }
 }
 
+/** 正文里的链接不许 WebView 自己处理。详情页是整个应用的界面,在
+ *  这里点一条外链,默认行为是把 Quire 导航成那篇文章——软件就这样
+ *  "没了"。所以所有 http(s) 链接统一下放给系统默认浏览器;锚点、
+ *  相对路径这些页内的不拦。**挂在 document 上做委托**,正文每次重画
+ *  都换一批节点,挨个绑监听既漏又忘解绑 */
+document.addEventListener("click", (e) => {
+  const target = e.target as HTMLElement | null;
+  const anchor = target?.closest?.("a[href]");
+  if (!anchor) return;
+  const href = anchor.getAttribute("href") ?? "";
+  if (!/^https?:\/\//i.test(href)) return;
+  e.preventDefault();
+  void api.openUrl(href).catch((err) => showError(wireText(err)));
+});
+
 document.addEventListener("keydown", (e) => {
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v") {
-    // Ctrl+V 走的是系统剪贴板,不是往 DOM 里插文本,所以要拦下默认行为
+  // Ctrl+V 分两种语境。光标在输入框/批注框里,粘贴就是往框里放内容,
+  // 是输入框自己的本职;框外按 Ctrl+V 才是"把剪贴板里那篇存进来"。
+  // 不加豁免的话,往批注里贴一段引用,引用没贴进去,库里反而多出
+  // 一篇拿这段引用当正文的剪藏
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v" && !isTyping(e.target)) {
     e.preventDefault();
     void pasteNow();
     return;
@@ -3778,6 +4138,11 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && statsPanelEl) {
     e.preventDefault();
     closeStats();
+    return;
+  }
+  if (e.key === "Escape" && settingsPanelEl) {
+    e.preventDefault();
+    closeSettings();
     return;
   }
   if (e.key === "/" && !isTyping(e.target)) {
@@ -3838,9 +4203,8 @@ el<HTMLButtonElement>("toast-close").addEventListener("click", hideToast);
  *  为了改个语言把用户读到的位置弹回顶部,下次他就不切了。 */
 function applyLocale(): void {
   applyI18n(root);
-  langBtn.textContent = localeName();
-  langBtn.title = t("lang.switch");
-  langBtn.setAttribute("aria-label", t("lang.switch"));
+  // 面板是动态搭的,`applyI18n` 扫不到它,得自己重画一遍
+  syncSettingsPanel();
   hideToast();
   clearError();
   void reloadAfterLocale();
@@ -3898,10 +4262,7 @@ window.addEventListener("focus", () => {
   }, 300);
 });
 
-el<HTMLButtonElement>("btn-lang").addEventListener("click", () => {
-  setLocale(otherLocale());
-  applyLocale();
-});
+
 async function boot(): Promise<void> {
   // 先挂监听再拉列表。反过来的话,在这两步之间发生的剪藏不会触发任何事件,
   // 用户会看到"扩展显示剪藏成功,列表里却没有"
@@ -3910,6 +4271,23 @@ async function boot(): Promise<void> {
   // 这一次不跟着 vault-changed 走——那个事件是外部改动引起的,不产生新欠账
   await listen("clip-saved", () => void refreshStatus());
   await listen("vault-changed", () => void refreshList());
+  // 迁移搬了多少篇由这个事件带回来。**不在 `migrateVault` 的返回里**:
+  // 返回值只有库信息,篇数得单独算,而算出来的那一刻才是真的搬完了
+  await listen<VaultMigrated>("vault-migrated", (e) => {
+    const { clips, assets, skipped } = e.payload;
+    // 报的是**篇数**,图片跟在后面单独说。混成一个数字的话,两篇剪藏
+    // 加二十几张图会报成「搬过去了 26 篇」——用户第一反应是
+    // "我的库里怎么凭空多出这么多东西"
+    showToast(
+      skipped > 0
+        ? t("settings.migrate.doneSkipped", {
+            n: String(clips),
+            assets: String(assets),
+            skipped: String(skipped),
+          })
+        : t("settings.migrate.done", { n: String(clips), assets: String(assets) }),
+    );
+  });
   // 图片是后台下的,下完了才通知。这条提示是**特意要说出来的**:
   // Quire 一直说自己不联网,现在剪藏这一刻会真的去连图片服务器,
   // 悄悄做和写在脸上是两回事

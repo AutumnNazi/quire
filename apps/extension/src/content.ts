@@ -2,7 +2,7 @@
 // separateMarkdown 会静默失效、contentMarkdown 恒为 undefined,
 // 于是每一次剪藏都报"抽不出正文"。
 import Defuddle from "defuddle/full";
-import { buildPayload, type Extracted } from "./extract";
+import { buildPayload, prepareDocumentForExtraction, type Extracted } from "./extract";
 import { t } from "./i18n";
 
 interface ClipRequest {
@@ -29,10 +29,21 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
 });
 
 function clipCurrentPage(): ClipReply {
+  // 先在页面的克隆上做预处理(懒加载图片、媒体转链接),再交给 Defuddle。
+  // **不能把预处理做在页面本身上**:用户还开着这页,当着他的面把视频换成
+  // 一条链接是惊吓。Defuddle 拿到的是克隆,页面原样不动。
+  const prepared = prepareDocumentForExtraction(document, location.href, {
+    video: t("media_video"),
+    audio: t("media_audio"),
+    embed: t("media_embed"),
+    videoRemote: t("media_video_remote"),
+    audioRemote: t("media_audio_remote"),
+    embedRemote: t("media_embed_remote"),
+  });
   // separateMarkdown 一次给出两份:content 是干净 HTML,contentMarkdown 是
   // Markdown。**不能换成 markdown: true**——那样 content 变 Markdown,
   // 就拿不到给别的应用用的 HTML 了,两个一起开更会互相打架。
-  const result = new Defuddle(document, {
+  const result = new Defuddle(prepared, {
     url: location.href,
     separateMarkdown: true,
   }).parse();

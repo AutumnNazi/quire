@@ -30,7 +30,6 @@ const NAMES: Record<Locale, string> = {
 const CATALOG: Record<Locale, Record<string, string>> = {
   "zh-CN": {
     "lang.switch": "切换到 English",
-    "lang.name": "中文",
 
     "toolbar.paste": "粘贴剪藏",
     "toolbar.paste.title": "把剪贴板里的内容存成 Markdown(Ctrl+V)",
@@ -54,8 +53,9 @@ const CATALOG: Record<Locale, Record<string, string>> = {
     "toolbar.export": "导出",
     "toolbar.export.title": "把整个剪藏库导出成一个 Markdown 文件,Obsidian / Logseq 都能直接打开",
     "toolbar.open": "打开剪藏目录",
-    "toolbar.pick": "更换目录",
     "toolbar.refresh": "刷新",
+    "toolbar.settings": "设置",
+    "toolbar.settings.title": "数据目录、剪贴板监控、语言",
     "toolbar.stats": "统计",
     "toolbar.stats.title": "看看这库里都存了些什么",
     "toolbar.refresh.title": "重新读一遍剪藏库(快捷键 F5)。在别处改过文件之后用它。",
@@ -97,9 +97,7 @@ const CATALOG: Record<Locale, Record<string, string>> = {
     "filter.trash": "回收站",
     "filter.trash.title": "删掉的剪藏。放回来随时能翻回原位,彻底删除就没有了。",
 
-    "watch.label": "监控剪贴板",
     "watch.broken": "监控开着,但一直读不到剪贴板——可能是别的程序一直占着它。先关掉再打开试试",
-    "watch.title": "开启后,你在别处复制文章时会自动提示存到 Quire。默认关闭。",
 
     "batch.count": "已选 {n} 篇",
     // 报的是**做完了几篇**,不是选中了几篇——原来这里借用 `batch.count`,
@@ -160,6 +158,12 @@ const CATALOG: Record<Locale, Record<string, string>> = {
     "clip.markRead": "标已读",
     "clip.markUnread.title": "点一下标回未读",
     "clip.markRead.title": "读完了,点一下标已读",
+    "clip.mediaVideo": "▶ 视频",
+    "clip.mediaAudio": "▶ 音频",
+    "clip.mediaEmbed": "▶ 嵌入内容",
+    "clip.mediaVideoRemote": "▶ 视频(到原文观看)",
+    "clip.mediaAudioRemote": "▶ 音频(到原文观看)",
+    "clip.mediaEmbedRemote": "▶ 嵌入内容(到原文观看)",
 
     "trash.header": "{count} 篇 · 共 {size}",
     "trash.headerUnknown": "{count} 篇 · 至少 {size}({n} 篇量不出来)",
@@ -197,6 +201,7 @@ const CATALOG: Record<Locale, Record<string, string>> = {
     "detail.star": "收藏",
     "detail.star.title": "标个星,提醒自己这篇还值得回头看",
     "detail.starred": "已收藏",
+    "detail.unstar": "取消收藏",
     "detail.unstar.title": "取消收藏",
     "detail.openFile": "打开 .md",
     "detail.openFile.title": "用系统默认程序打开这一篇",
@@ -262,8 +267,8 @@ const CATALOG: Record<Locale, Record<string, string>> = {
     "status.allGood": "都收好了。库里的每一篇,图都在本地,正文都在手上。",
     "status.remoteImages": "图还指着外站",
     "status.remoteImages.item": "还有 {n} 张图没下下来。导到别的机器上这些是裂图",
-    "status.missingFulltext": "正文可能没抓全",
-    "status.missingFulltext.item": "有地址但正文很短,多半是当初没抓到。打开它可以重试一次",
+    "status.missingFulltext": "正文很短的文章",
+    "status.missingFulltext.item": "原文可能就这么短,也可能是当初没抓全。打开后可以重新抓一次对照",
     "status.unreadable": "读不出的文件",
     "status.more": "还有 {n} 条",
 
@@ -284,6 +289,23 @@ const CATALOG: Record<Locale, Record<string, string>> = {
     "stats.noTags": "还没打过标签。在详情页里加,或者左栏标签那儿右键改名。",
     "stats.moreTags": "还有 {n} 个标签没列出来",
     "stats.pickTag": "只看「{tag}」这 {n} 篇",
+
+    "settings.title": "设置",
+    "settings.vault": "数据目录",
+    "settings.path.empty": "(还没定下来)",
+    "settings.changeDir": "更换目录…",
+    "settings.migrate.body": "新目录已经选好了。现有这 {n} 篇搬过去(原目录会清空),还是从空目录开始?",
+    "settings.migrate.copy": "搬过去",
+    "settings.migrate.empty": "从空目录开始",
+    "settings.migrate.cancel": "先不换",
+    "settings.migrate.done": "搬过去了 {n} 篇、{assets} 个图片文件,原目录已清空",
+    "settings.migrate.doneSkipped":
+      "搬过去了 {n} 篇、{assets} 个图片文件;另有 {skipped} 篇那边已经有了,没覆盖。原目录已清空",
+    "settings.migrate.switched": "已经切到新目录",
+    "settings.clipboard": "剪贴板",
+    "settings.watch": "剪贴板监控",
+    "settings.watch.note": "复制一段网页正文,自动存成 Markdown。关掉就只能 Ctrl+V 手动存。",
+    "settings.lang": "语言",
     "history.close": "关掉",
     "history.empty": "没有漏下的",
     "history.more": "还有 {n} 条没摆出来",
@@ -372,6 +394,9 @@ const CATALOG: Record<Locale, Record<string, string>> = {
     "error.importAllDuplicate": "导的 {n} 篇库里都有了,一篇新的也没进来:{name}",
     "error.exportFailed": "导出失败:{detail}",
     "error.pickVaultFailed": "更换目录失败:{detail}",
+    "error.vault.migrateFailed": "换目录失败:{detail}",
+    "error.openUrlRejected": "这不是能打开的网页地址:{detail}",
+    "error.openUrlFailed": "浏览器没打开成:{detail}",
     "error.clipboardEmpty": "剪贴板是空的,先在别处复制点内容",
     "error.clipboardNoContent": "剪贴板里没有可保存的内容",
     "error.unreadableFiles": "有 {n} 个文件读不出元数据:{names}",
@@ -419,7 +444,6 @@ const CATALOG: Record<Locale, Record<string, string>> = {
 
   en: {
     "lang.switch": "Switch to 中文",
-    "lang.name": "English",
 
     "toolbar.paste": "Paste & save",
     "toolbar.paste.title": "Save whatever is on the clipboard as Markdown (Ctrl+V)",
@@ -445,8 +469,9 @@ const CATALOG: Record<Locale, Record<string, string>> = {
     "toolbar.export.title":
       "Export the whole library as one Markdown file. Obsidian and Logseq open it directly.",
     "toolbar.open": "Open folder",
-    "toolbar.pick": "Change folder",
     "toolbar.refresh": "Refresh",
+    "toolbar.settings": "Settings",
+    "toolbar.settings.title": "Library folder, clipboard watching, language",
     "toolbar.stats": "Stats",
     "toolbar.stats.title": "See what is actually in this library",
     "toolbar.refresh.title": "Re-read the clipping vault (F5). Use it after editing files elsewhere.",
@@ -488,10 +513,7 @@ const CATALOG: Record<Locale, Record<string, string>> = {
     "filter.trash": "Trash",
     "filter.trash.title": "Deleted clippings. Restoring puts them back exactly where they were.",
 
-    "watch.label": "Watch clipboard",
     "watch.broken": "Watching is on but the clipboard keeps coming back unreadable — something else may be holding it. Try switching it off and on again",
-    "watch.title":
-      "When on, copying an article elsewhere prompts you to save it to Quire. Off by default.",
 
     "batch.count": "{n} selected",
     "batch.flagsDone": "{action}: {n}",
@@ -550,6 +572,12 @@ const CATALOG: Record<Locale, Record<string, string>> = {
     "clip.markRead": "Mark read",
     "clip.markUnread.title": "Click to mark unread again",
     "clip.markRead.title": "Finished reading, click to mark it read",
+    "clip.mediaVideo": "▶ Video",
+    "clip.mediaAudio": "▶ Audio",
+    "clip.mediaEmbed": "▶ Embedded content",
+    "clip.mediaVideoRemote": "▶ Video (watch at the source)",
+    "clip.mediaAudioRemote": "▶ Audio (listen at the source)",
+    "clip.mediaEmbedRemote": "▶ Embedded content (view at the source)",
 
     "trash.header": "{count} items · {size}",
     "trash.headerUnknown": "{count} items · at least {size} ({n} could not be measured)",
@@ -590,6 +618,7 @@ const CATALOG: Record<Locale, Record<string, string>> = {
     "detail.star": "Star",
     "detail.star.title": "Mark it, so you remember this one is worth coming back to",
     "detail.starred": "Starred",
+    "detail.unstar": "Unstar",
     "detail.unstar.title": "Remove the star",
     "detail.openFile": "Open .md",
     "detail.openFile.title": "Open this clipping with the default app",
@@ -656,9 +685,9 @@ const CATALOG: Record<Locale, Record<string, string>> = {
     "status.remoteImages": "Images still pointing off-site",
     "status.remoteImages.item":
       "{n} images were not downloaded. These will be broken images on any other machine",
-    "status.missingFulltext": "Full text possibly not fetched",
+    "status.missingFulltext": "Very short articles",
     "status.missingFulltext.item":
-      "It has an address but the body is very short, so it probably failed to fetch back then. Open it to try again",
+      "The source may just be short, or the fetch back then was incomplete. Open it and re-fetch to compare",
     "status.unreadable": "Files that cannot be read",
     "status.more": "{n} more",
 
@@ -679,6 +708,26 @@ const CATALOG: Record<Locale, Record<string, string>> = {
     "stats.noTags": "No tags yet. Add them on the detail page, or right-click one in the sidebar to rename.",
     "stats.moreTags": "{n} more tags not listed",
     "stats.pickTag": "Show only these {n} tagged “{tag}”",
+
+    "settings.title": "Settings",
+    "settings.vault": "Library folder",
+    "settings.path.empty": "(not set yet)",
+    "settings.changeDir": "Change folder…",
+    "settings.migrate.body":
+      "New folder picked. Move the {n} clippings you already have over (the old folder gets emptied), or start empty?",
+    "settings.migrate.copy": "Move them over",
+    "settings.migrate.empty": "Start empty",
+    "settings.migrate.cancel": "Keep current",
+    "settings.migrate.done":
+      "Moved {n} clippings and {assets} image files over; the old folder is now empty",
+    "settings.migrate.doneSkipped":
+      "Moved {n} clippings and {assets} image files over; {skipped} were already there and were left alone. The old folder is now empty",
+    "settings.migrate.switched": "Now using the new folder",
+    "settings.clipboard": "Clipboard",
+    "settings.watch": "Watch the clipboard",
+    "settings.watch.note":
+      "Copy article text anywhere and it is saved as Markdown. Turn it off and you save manually with Ctrl+V.",
+    "settings.lang": "Language",
     "history.close": "Close",
     "history.empty": "Nothing was missed",
     "history.more": "{n} more not shown",
@@ -771,6 +820,9 @@ const CATALOG: Record<Locale, Record<string, string>> = {
       "All {n} were already in the library, so nothing new came in: {name}",
     "error.exportFailed": "Export failed: {detail}",
     "error.pickVaultFailed": "Could not change the folder: {detail}",
+    "error.vault.migrateFailed": "Could not move to the new folder: {detail}",
+    "error.openUrlRejected": "Not an openable web address: {detail}",
+    "error.openUrlFailed": "The browser did not open: {detail}",
     "error.clipboardEmpty": "The clipboard is empty. Copy something first.",
     "error.clipboardNoContent": "There is nothing on the clipboard worth saving.",
     "error.unreadableFiles": "{n} files have unreadable metadata: {names}",

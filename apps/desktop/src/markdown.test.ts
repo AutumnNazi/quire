@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { clipToMarkdown, renderMarkdown } from "./markdown";
+import { clipToMarkdown, renderMarkdown, resolveAssetImages } from "./markdown";
+import { t } from "./i18n";
 import type { ClipboardCapture } from "./clipboard";
 
 /** 一段真实的剪贴板 HTML 片段:带导航和页脚,正文在 <article> 里。 */
@@ -129,5 +130,117 @@ describe("renderMarkdown:渲染前必须消毒", () => {
     // markdown-it 拒了这个链接,剩下的只是转义后的纯文本,那是安全的
     const hrefs = [...doc.querySelectorAll("a")].map((a) => a.getAttribute("href") ?? "");
     expect(hrefs.some((h) => h.toLowerCase().startsWith("javascript:"))).toBe(false);
+  });
+});
+
+/**
+ * 媒体与懒加载:剪藏内容里的图片和视频,「没有链接」的两个根子。
+ *
+ * Defuddle 自己会认 data-src、data-srcset 并把相对地址绝对化(探针实测),
+ * 但 data-original / data-lazy-src 这些变体它不认——老 WordPress 站和部分
+ * 图床用的就是它们,整张图直接丢。<video>/<iframe> 则被它原样保留成 HTML,
+ * 到渲染侧 html:false + DOMPurify 两道防线(刻意不拆,剪藏是不可信输入)
+ * 只会被洗成一行字面代码。都得在交给 Defuddle **之前**处理。
+ */
+describe("clipToMarkdown:媒体与懒加载", () => {
+  it("data-original 懒加载变体提升成真地址,而不是整张丢掉", () => {
+    const { markdown } = clipToMarkdown(
+      capture({
+        html: `<html><body><article><p>正文</p><img data-original="https://cdn.example.com/real.jpg" alt="封面"></article></body></html>`,
+      }),
+    );
+    expect(markdown).toContain("![封面](https://cdn.example.com/real.jpg)");
+  });
+
+  it("埋点/统计的 iframe 直接剔除,连链接都不留", () => {
+    const { markdown } = clipToMarkdown(
+      capture({
+        html: `<html><body><iframe src="https://sbeacon.sina.com.cn/ckctl.html"></iframe><article><p>正文</p></article></body></html>`,
+      }),
+    );
+    expect(markdown).not.toContain("](https");
+    expect(markdown).not.toContain("iframe");
+  });
+
+  it("正文容器外的视频搬进正文——不搬会被 Defuddle 的正文选择剔掉", () => {
+    // 新浪这类视频新闻页:播放器在正文容器上方。转成链接后若留在原位,
+    // Defuddle 只认正文,链接等于不存在
+    const { markdown } = clipToMarkdown(
+      capture({
+        html: `<html><body><video src="https://m.example.com/clip.mp4"></video><article><p>正文</p></article></body></html>`,
+      }),
+    );
+    expect(markdown).toContain("](https://m.example.com/clip.mp4)");
+  });
+
+  it("视频变成一条可点的链接,而不是被洗掉", () => {
+    const { markdown } = clipToMarkdown(
+      capture({
+        html: `<html><body><article><p>正文</p><video src="https://m.example.com/clip.mp4" controls></video></article></body></html>`,
+      }),
+    );
+    expect(markdown).toContain("](https://m.example.com/clip.mp4)");
+    expect(markdown).not.toContain("<video");
+  });
+
+  it("blob: 流地址的视频链接指向原文页,文案如实标注到原文观看", () => {
+    // 新浪这类新闻页的播放器是 JS 注入的,src 全是 blob:,
+    // blob 只在原页面会话里有效,存下来就是死链;文案也不能骗人
+    const { markdown } = clipToMarkdown(
+      capture({
+        html: `<html><body><article><p>正文</p><video src="blob:https://video.example.com/abc-123"></video></article></body></html>`,
+      }),
+    );
+    // 文案不绑死语言:断言用与实现同源的 i18n 取值
+    expect(markdown).toContain(`${t("clip.mediaVideoRemote")}](https://example.com/p)`);
+    expect(markdown).not.toContain("blob:");
+  });
+});
+
+/**
+ * 本地化图片的渲染:localize 把远程图下到 md 旁边的 assets 目录,正文里
+ * 的地址重写成 `assets/<id>/0.png` 相对路径,基准是 **md 所在目录**——
+ * 任何 md 阅读器照这个基准都能显示。WebView 拿相对路径去请求自己的
+ * 页面地址,必然 404 裂图——得按同一基准拼绝对路径再转 asset 地址。
+ */
+describe("resolveAssetImages", () => {
+  const toAssetUrl = (p: string) => `asset://test/${p}`;
+  const WIN_ROOT = "D:" + String.fromCharCode(92) + "Quire";
+
+  it("assets/ 开头的相对地址拼上库根转成 asset 地址", () => {
+    const root = document.createElement("div");
+    root.innerHTML = '<img src="assets/m1/0.png" alt="a"><p>x</p>';
+    resolveAssetImages(root, WIN_ROOT, toAssetUrl);
+    const img = root.querySelector("img");
+    expect(img?.getAttribute("src")).toBe(`asset://test/${WIN_ROOT}/assets/m1/0.png`);
+  });
+
+  it("库根结尾的分隔符不叠两个", () => {
+    const root = document.createElement("div");
+    root.innerHTML = '<img src="assets/m1/0.png">';
+    resolveAssetImages(root, WIN_ROOT + String.fromCharCode(92), toAssetUrl);
+    expect(root.querySelector("img")?.getAttribute("src")).toBe(
+      `asset://test/${WIN_ROOT}/assets/m1/0.png`,
+    );
+  });
+
+  it("远程图和 data: 图不是本地化的产物,原样不动", () => {
+    const root = document.createElement("div");
+    root.innerHTML =
+      '<img src="https://cdn.example.com/a.jpg"><img src="data:image/png;base64,AAA"><img src="assets/m1/1.jpg">';
+    resolveAssetImages(root, WIN_ROOT, toAssetUrl);
+    const srcs = Array.from(root.querySelectorAll("img")).map((i) => i.getAttribute("src"));
+    expect(srcs).toEqual([
+      "https://cdn.example.com/a.jpg",
+      "data:image/png;base64,AAA",
+      `asset://test/${WIN_ROOT}/assets/m1/1.jpg`,
+    ]);
+  });
+
+  it("库路径还没就绪时不转换,别把地址改坏", () => {
+    const root = document.createElement("div");
+    root.innerHTML = '<img src="assets/m1/0.png">';
+    resolveAssetImages(root, "", toAssetUrl);
+    expect(root.querySelector("img")?.getAttribute("src")).toBe("assets/m1/0.png");
   });
 });

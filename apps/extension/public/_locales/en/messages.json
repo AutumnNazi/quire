@@ -15,7 +15,9 @@
     "message": "Copied to clipboard: $title$",
     "description": "剪藏成功。标题取自页面",
     "placeholders": {
-      "title": { "content": "$1" }
+      "title": {
+        "content": "$1"
+      }
     }
   },
   "error_no_content": {
@@ -27,7 +29,31 @@
     "description": "execCommand(\"copy\") 返回了 false"
   },
   "error_page_blocked": {
-    "message": "Extensions can't run on this page. Try a normal web page, not a chrome:// URL.",
+    "message": "The extension got no response on this page. Reload the page and try again; chrome:// and store pages are not supported.",
     "description": "内容脚本没注入:chrome:// 、扩展商店、PDF 查看器"
+  },
+  "media_video": {
+    "message": "▶ Video",
+    "description": "正文里的视频被换成一条链接时的链接文字"
+  },
+  "media_audio": {
+    "message": "▶ Audio",
+    "description": "正文里的音频被换成一条链接时的链接文字"
+  },
+  "media_embed": {
+    "message": "▶ Embedded content",
+    "description": "正文里的 iframe 嵌入被换成一条链接时的链接文字"
+  },
+  "media_video_remote": {
+    "message": "▶ Video (watch at the source)",
+    "description": "流媒体/动态注入的嵌入内容:本地播不了,链接指向原文页"
+  },
+  "media_audio_remote": {
+    "message": "▶ Audio (listen at the source)",
+    "description": "流媒体/动态注入的嵌入内容:本地播不了,链接指向原文页"
+  },
+  "media_embed_remote": {
+    "message": "▶ Embedded content (view at the source)",
+    "description": "流媒体/动态注入的嵌入内容:本地播不了,链接指向原文页"
   }
 }

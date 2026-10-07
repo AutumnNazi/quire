@@ -31,6 +31,7 @@ const ctx: ClipItemContext = {
   isActive: () => false,
   isSelected: () => false,
   onOpen: () => {},
+  onContextMenu: () => {},
   onToggleRead: () => {},
   onToggleStar: () => {},
 };
@@ -212,5 +213,98 @@ describe("hidden 属性", () => {
       fn,
       "renderUnreadBadge 里自己数了一遍 —— 两份判定迟早对不上,而用户看到的数字和点进去的条数对不上",
     ).not.toMatch(/clips\.filter\(/);
+  });
+});
+
+/**
+ * 阅读进度条的位置。它靠 sticky 贴在正文顶上,靠 DOM 顺序决定初始位置:
+ * 标签、批注编辑器在它之上,正文在它之下——一条线把"我写的"和"我读的"
+ * 分开。曾经靠负 margin 把它硬顶进标题区,那条线就横在标题和按钮中间,
+ * 看着像渲染坏了。
+ */
+describe("阅读进度条的位置", () => {
+  it("进度条是详情栏左边缘的竖线,不进滚动内容", () => {
+    const src = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    // 进度条**不在**详情滚动内容里。sticky 那条路试过两版都翻车:负 margin
+    // 把线顶进标题区,去掉负 margin 后滚动时又压着穿过来的正文。它必须是
+    // 详情栏左边缘一条竖线(阅读进度往下长,方向和滚动同向;栏内边距
+    // 40px,线宽 3px,零遮挡)
+    expect(
+      src.indexOf('id="read-progress"'),
+      "进度条得在骨架模板里、详情滚动区之外",
+    ).toBeGreaterThan(-1);
+    expect(
+      src.indexOf('id="read-progress"'),
+      "骨架里进度条得在详情滚动区之前",
+    ).toBeLessThan(src.indexOf('class="detail-pane"'));
+    expect(
+      src.indexOf("progress, body)"),
+      "进度条不许再被塞进详情滚动内容里",
+    ).toBe(-1);
+    // 竖线的长度是 height,不是 width——那是顶部横条的写法
+    expect(src, "竖线进度用 height 记进度").toContain("progressBarEl.style.height");
+    expect(src, "不许残留横条时代的 width 写法").not.toContain("progressBarEl.style.width");
+
+    const css = readFileSync(resolve(process.cwd(), "src/style.css"), "utf8");
+    const block = css.slice(
+      css.indexOf(".read-progress {"),
+      css.indexOf("}", css.indexOf(".read-progress {")),
+    );
+    expect(
+      block,
+      "进度条不许 sticky——悬在滚动内容上就会压住穿过来的正文",
+    ).not.toMatch(/sticky|z-index|margin:\s*-/);
+  });
+});
+
+/**
+ * 双栏高度链。详情栏外包了一层 .detail-side(钉进度竖线用的),grid 子项
+ * 的默认最小高度是内容高度——外壳没有 min-height:0 的话正文把它撑高,
+ * 整页出现滚动条,左侧列表跟着一起滚。这是包层那轮真踩过的坑。
+ */
+describe("双栏布局的高度链", () => {
+  it("详情外壳必须 min-height:0,不许把整页撑出滚动条", () => {
+    const css = readFileSync(resolve(process.cwd(), "src/style.css"), "utf8");
+    const start = css.indexOf(".detail-side {");
+    const block = css.slice(start, css.indexOf("}", start));
+    expect(block, "详情外壳缺 min-height:0,整页会被正文撑出滚动条").toContain(
+      "min-height: 0",
+    );
+  });
+});
+
+/**
+ * 本地化图片的路径基准。正文里的 `assets/...` 相对路径是相对 **md 所在
+ * 目录**(clips/)成立的——md 阅读器能显示而软件裂图,就是因为两边
+ * 用的基准不一样。渲染时必须拼 `库根/clips`,拿库根拼永远 404。
+ */
+describe("本地化图片的路径基准", () => {
+  it("渲染时以 clips 目录为基准,不是库根", () => {
+    const src = readFileSync(resolve(process.cwd(), "src/main.ts"), "utf8");
+    expect(src, "clipsBase 得真的拼上 /clips").toContain("`" + "${root}/clips" + "`");
+    const calls = src.match(/resolveAssetImages\(body, [^,]+, convertFileSrc\)/g) ?? [];
+    expect(
+      calls.length,
+      "两处渲染(详情+重抓全文)都得转本地图片地址",
+    ).toBe(2);
+    expect(
+      src.includes("resolveAssetImages(body, vaultRoot,"),
+      "不许拿库根当基准——那是 404 裂图的旧写法",
+    ).toBe(false);
+  });
+});
+
+/**
+ * 正文插图排版:img 默认行内,宽图顶左不居中。块级 + auto margin 是
+ * 插图的通用排法。这个类是对外承诺过的正文样式,别顺手拆。
+ */
+describe("正文插图排版", () => {
+  it("插图块级居中,并且不许超出正文宽度", () => {
+    const css = readFileSync(resolve(process.cwd(), "src/style.css"), "utf8");
+    const start = css.indexOf(".prose img {");
+    const block = css.slice(start, css.indexOf("}", start));
+    expect(block, "插图得 display:block 才能被 auto margin 居中").toContain("display: block");
+    expect(block, "居中靠 auto margin").toContain("margin: 14px auto");
+    expect(block, "图片不许把 42rem 的正文撑破").toContain("max-width: 100%");
   });
 });

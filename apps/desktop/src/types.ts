@@ -189,3 +189,13 @@ export interface ImportReport {
    *  以为全导完了,几天后才发现少了东西。 */
   unreadableDirs?: string[];
 }
+
+/** 迁移完成后后端告诉前端的结果。「拷过去多少、跳过多少」要如实给用户看:
+ *  迁移是数据级动作,用户有权知道新库里到底装了多少自己的东西 */
+export interface VaultMigrated {
+  /** 搬过去的剪藏篇数。**只数 `.md`**——用户问的是"几篇" */
+  clips: number;
+  /** 跟着走的图片和附件个数,单独报:混进篇数里两篇能报成二十几篇 */
+  assets: number;
+  skipped: number;
+}
