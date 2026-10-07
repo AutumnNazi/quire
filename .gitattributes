@@ -1,0 +1,27 @@
+# 换行风格统一成 LF,检出时不转 CRLF。
+#
+# 为什么要钉死:仓库里有一批「读自己的源码、断言接线在不在」的测试
+# (Rust 侧 include_str! 切 lib.rs,前端十几个 *.test.ts 读 main.ts)。
+# 这类断言里只要有一个跨行锚点,换行风格就成了它的隐含前提——
+# Windows 上 git 默认 core.autocrlf=true,CI 全新检出拿到 CRLF,
+# 而本地编辑器写出来的是 LF,于是同一份代码本地全绿、CI 全红,
+# 而且报错指向「找不到这段代码」,看着像代码真的没了。
+# 已经栽过两次:Rust 侧 27 条接线测试一起倒,前端 conflict.test.ts 一条。
+#
+# 钉死之后所有机器检出的都是 LF,跟 git 对象里存的一致。
+* text=auto eol=lf
+
+# 二进制别碰
+*.png binary
+*.ico binary
+*.icns binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.exe binary
+*.dll binary
+*.msi binary
+*.db binary
