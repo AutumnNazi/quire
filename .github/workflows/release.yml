@@ -70,7 +70,11 @@ jobs:
         include:
           - os: windows-latest
             name: Windows x64
-            args: --bundles nsis,msi
+            # **两个值用空格隔开,不写逗号。** `nsis,msi` 在 Linux/macOS 的 bash
+            # 里原样传给 tauri(它支持逗号分隔),但 Windows 上 pnpm 的脚本
+            # 最终走 cmd,逗号被当分隔符吃掉,传进去的变成一个带空格的
+            # "nsis msi",tauri 直接报 invalid value——第一次真跑 release 才暴露
+            args: --bundles nsis msi
           - os: macos-14
             name: macOS Apple Silicon
             target: aarch64-apple-darwin

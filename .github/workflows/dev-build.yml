@@ -43,7 +43,9 @@ jobs:
         include:
           - os: windows-latest
             name: Windows x64
-            args: --bundles nsis,msi
+            # 空格分隔,别写逗号——cmd 会把 `nsis,msi` 吃成一个 "nsis msi",
+            # 详见 release.yml 里同一处的那段注释
+            args: --bundles nsis msi
           - os: macos-14
             name: macOS Apple Silicon
             target: aarch64-apple-darwin
