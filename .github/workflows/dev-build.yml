@@ -114,7 +114,10 @@ jobs:
           OUT="artifacts-out"
           mkdir -p "$OUT"
           SHORT_SHA="${GITHUB_SHA::7}"
-          SLUG="dev-$SHORT_SHA-${{ matrix.name }}"
+          # **平台名里的空格要换成横线。** matrix.name 是 "Windows x64",
+          # 原样拼进文件名的话,release job 按横线 slug 找文件永远找不到
+          # (v1.0.0 那轮就栽在这:四个平台全"没有产物",其实是名字对不上)
+          SLUG="dev-$SHORT_SHA-$(echo "${{ matrix.name }}" | tr ' /' '--')"
           if [ -n "${{ matrix.target }}" ]; then
             SRC="apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
           else
