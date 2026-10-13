@@ -50,8 +50,9 @@ jobs:
             name: macOS Apple Silicon
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin --bundles dmg
-          - os: macos-13
+          - os: macos-14
             name: macOS Intel
+            # Intel 包交叉编译,别改回 macos-13——见 release.yml 同一处注释
             target: x86_64-apple-darwin
             args: --target x86_64-apple-darwin --bundles dmg
           - os: ubuntu-22.04
