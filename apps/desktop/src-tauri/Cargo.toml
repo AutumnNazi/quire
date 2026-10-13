@@ -1,6 +1,6 @@
 [package]
 name = "quire"
-version = "0.1.0"
+version = "1.0.0"
 description = "Local-first read-later. Clippings are plain Markdown on your own disk."
 authors = ["chenkaiyuan"]
 license = "MIT"
