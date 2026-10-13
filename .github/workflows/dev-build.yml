@@ -1,0 +1,239 @@
+# Dev Build:手动触发,出一个滚动更新的测试版 Release。
+#
+# ## 参照的是 GoNavi 的 dev 通道,触发方式不一样
+# GoNavi 每次 push dev 分支自动重建。Quire 是单人主干直推,没有 dev 分支;
+# 要是挂在 master 的 push 上,每推一次就要背一轮四平台 Tauri 构建(15 分钟起),
+# 连着改三次 CI 就是三遍。所以改成 **workflow_dispatch 手动触发**:想出一个
+# 测试包的时候去 Actions 页面点一下,或者 `gh workflow run dev-build.yml`。
+#
+# ## tag 是滚动的 `dev-latest`,Release 每次整个覆盖
+# 永远只有一份 dev release,正文里写清是哪个 commit 的构建。旧 release 和
+# tag 先删掉再重建,不然 gh release create 会往旧 release 上追加资产,
+# 三轮之后页面上就是三套包混在一起,没人分得清哪个是这次的。
+#
+# ## 版本号不动,靠文件名区分
+# dev 产物前面加 `dev-<短sha>-` 前缀。没把 tauri.conf.json 的版本改成
+# `1.0.0-dev.xxx`:MSI 的 ProductVersion 只吃三段纯数字,带后缀的 semver
+# 会被 Windows 安装器拒掉;为它维护两套版本号不值当。
+#
+# ## Pre-release,永远不抢 Latest
+# prerelease: true。GitHub 的 Latest 徽标留给稳定版,不然用户从 Releases
+# 页面进来第一眼看到的是测试包。
+
+name: Dev Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dev-build
+  # 手动连点两次的话,前一次直接作废——它构建的是旧 commit,发出去反而添乱
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      # 和 release.yml 同一套矩阵。有一个平台挂了也得知道,
+      # 悄悄少一个包等于让人以为没这平台的版本
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows x64
+            args: --bundles nsis,msi
+          - os: macos-14
+            name: macOS Apple Silicon
+            target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin --bundles dmg
+          - os: macos-13
+            name: macOS Intel
+            target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin --bundles dmg
+          - os: ubuntu-22.04
+            name: Linux x64
+            args: --bundles deb,appimage
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 Linux 系统依赖(Tauri 需要)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: 装 pnpm
+        run: corepack enable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.target == ''
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.target != ''
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+          key: dev-${{ matrix.target || 'host' }}
+
+      - name: 装依赖
+        run: pnpm install --frozen-lockfile
+
+      # 测试包也不能是"测试没过先发了再说",跟 release.yml 同一道闸
+      - name: 类型检查与测试
+        run: |
+          pnpm typecheck
+          pnpm test:web
+          pnpm clippy
+
+      - name: 打包
+        run: pnpm --filter @quire/desktop tauri build ${{ matrix.args }}
+
+      - name: 收集产物(带 dev-sha 前缀)
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="artifacts-out"
+          mkdir -p "$OUT"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          SLUG="dev-$SHORT_SHA-${{ matrix.name }}"
+          if [ -n "${{ matrix.target }}" ]; then
+            SRC="apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          else
+            SRC="apps/desktop/src-tauri/target/release/bundle"
+          fi
+          find "$SRC" -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' \
+            -o -name '*.deb' -o -name '*.AppImage' -o -name '*.app.tar.gz' \) \
+            -exec cp {} "$OUT/" \;
+          [ -n "$(ls -A "$OUT")" ] || { echo "::error::一个产物都没收到"; exit 1; }
+          ( cd "$OUT" && for f in *; do mv "$f" "$SLUG-$f"; done )
+          echo "收集完:" && ls -la "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dev-${{ matrix.name }}
+          path: artifacts-out/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHORT_SHA: dev-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        # changelog 要列"相对上一测试版"的提交,得拿得到完整历史和旧 tag
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+          merge-multiple: true
+
+      - name: 确认四平台都到齐了
+        run: |
+          set -euo pipefail
+          SHORT="${SHORT_SHA:4:7}"
+          MISSING=""
+          for slug in "dev-$SHORT-Windows-x64" "dev-$SHORT-macOS-Apple-Silicon" \
+                      "dev-$SHORT-macOS-Intel" "dev-$SHORT-Linux-x64"; do
+            ls all | grep -q "^$slug-" || MISSING="$MISSING $slug"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::这些平台没有产物:$MISSING"
+            exit 1
+          fi
+          echo "四个平台的产物都在。"
+
+      - name: 生成 SHA256SUMS
+        run: |
+          cd all
+          sha256sum * > SHA256SUMS
+          echo "校验和写完:$(wc -l < SHA256SUMS) 行"
+
+      # **先抓旧 sha 再删。** 删了才去解析,上一个版本指哪就永远不知道了,
+      # changelog 的 compare 链接也没得写
+      - name: 记下上一版 dev 指向的 commit
+        run: |
+          if git rev-parse -q --verify refs/tags/dev-latest >/dev/null 2>&1; then
+            PREV=$(git rev-parse refs/tags/dev-latest^{commit})
+            echo "prev_sha=$PREV" >> "$GITHUB_ENV"
+            echo "上一版 dev:$PREV"
+          else
+            echo "prev_sha=" >> "$GITHUB_ENV"
+            echo "第一次跑 dev 通道,没有上一版"
+          fi
+
+      # 滚动 tag 的关键:旧的整个删掉,不然 gh release create 只会往
+      # 旧 release 上追加资产,几轮之后就是三套包混在一起
+      - name: 删旧的 dev-latest(有才删)
+        run: |
+          if gh release view dev-latest >/dev/null 2>&1; then
+            gh release delete dev-latest --yes --cleanup-tag
+            echo "旧的 dev-latest 删掉了"
+          else
+            echo "没有旧 release,不用删"
+          fi
+
+      - name: 写发布说明
+        run: |
+          set -euo pipefail
+          SHORT="${SHORT_SHA:4:7}"
+          NOW=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          REPO_URL="https://github.com/${{ github.repository }}"
+          {
+            echo "## 🧪 测试版本 (Dev Build)"
+            echo ""
+            echo "**版本**: \`dev-$SHORT\`"
+            echo "**提交**: [\`${SHORT}\`]($REPO_URL/commit/${{ github.sha }})"
+            echo "**构建时间**: $NOW"
+            echo ""
+            echo "> ⚠️ 这是开发测试版本,不建议当日常稳定版用。"
+            echo "> macOS 和 Linux 的包没在真机上验证过,装之前先拿一篇网页试一下剪藏。"
+            echo ""
+            echo "## 更新日志(相对上一测试版)"
+            echo ""
+            if [ -n "$prev_sha" ] && [ "$prev_sha" != "${{ github.sha }}" ]; then
+              git log --pretty=format:"- %s" "$prev_sha..${{ github.sha }}" || true
+              echo ""
+              echo ""
+              echo "---"
+              echo "**完整变更**: [$prev_sha...${{ github.sha }}]($REPO_URL/compare/$prev_sha...${{ github.sha }})"
+            else
+              echo "没有可比对的上一版(第一次发布,或同一个 commit 重复构建)。"
+              echo ""
+              echo "### 最近的提交"
+              echo ""
+              git log --pretty=format:"- %s" -15 || true
+              echo ""
+            fi
+          } > release-notes.md
+          echo "---- 正文 ----" && cat release-notes.md
+
+      - name: 建 dev Release(Pre-release)
+        run: |
+          SHORT="${SHORT_SHA:4:7}"
+          gh release create dev-latest \
+            --target "${{ github.sha }}" \
+            --title "🧪 Dev Build (dev-$SHORT)" \
+            --notes-file release-notes.md \
+            --prerelease \
+            all/*
+          echo "dev-latest 发出去了,指向 $SHORT"
